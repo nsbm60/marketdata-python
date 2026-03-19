@@ -34,6 +34,17 @@ log = logging.getLogger(__name__)
 # Default discovery pub/sub port (matches SystemConfig.current.discovery.pubSubPort)
 DEFAULT_DISCOVERY_PORT = 6005
 
+# Topic prefix for service discovery (matches TopicBuilder.DomainService)
+SERVICE_TOPIC_PREFIX = "service."
+
+
+def _default_discovery_url() -> str:
+    """Get discovery URL from env or default to localhost."""
+    import os
+    host = os.environ.get("DISCOVERY_HOST", "localhost")
+    port = os.environ.get("DISCOVERY_PORT", str(DEFAULT_DISCOVERY_PORT))
+    return f"tcp://{host}:{port}"
+
 
 @dataclass(frozen=True)
 class ServiceEndpoint:
@@ -60,8 +71,10 @@ class DiscoverySubscriber:
         on_discovered: Callable[[ServiceEndpoint], None] = None,
     ):
         self.service_name = service_name
-        self.discovery_url = discovery_url or f"tcp://localhost:{DEFAULT_DISCOVERY_PORT}"
+        self.discovery_url = discovery_url or _default_discovery_url()
         self.on_discovered = on_discovered
+        # Topic format: "service.{servicename}" (from TopicBuilder.forService)
+        self._topic = f"{SERVICE_TOPIC_PREFIX}{service_name}"
 
         self._context: zmq.Context = None
         self._socket: zmq.Socket = None
@@ -89,13 +102,11 @@ class DiscoverySubscriber:
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.SUB)
         self._socket.connect(self.discovery_url)
-        # Subscribe to messages prefixed with the service name
-        self._socket.setsockopt_string(zmq.SUBSCRIBE, self.service_name)
-        # Also subscribe to unprefixed messages (some broadcasters send raw JSON)
-        self._socket.setsockopt_string(zmq.SUBSCRIBE, "{")
+        # Subscribe to messages with topic "service.{servicename}"
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, self._topic)
         self._socket.setsockopt(zmq.RCVTIMEO, 500)  # 500ms timeout for graceful shutdown
 
-        log.debug(f"Discovery subscriber connected to {self.discovery_url}, filtering for '{self.service_name}'")
+        log.info(f"Discovery subscriber connected to {self.discovery_url}, topic='{self._topic}'")
 
         while self._running:
             try:

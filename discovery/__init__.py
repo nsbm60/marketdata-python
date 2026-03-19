@@ -9,6 +9,7 @@ from .service_locator import (
     ServiceEndpoint,
     DiscoverySubscriber,
     DEFAULT_DISCOVERY_PORT,
+    SERVICE_TOPIC_PREFIX,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "ServiceEndpoint",
     "DiscoverySubscriber",
     "DEFAULT_DISCOVERY_PORT",
+    "SERVICE_TOPIC_PREFIX",
 ]
