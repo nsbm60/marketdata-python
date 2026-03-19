@@ -17,7 +17,7 @@ Environment variables (in .env or shell):
     CLICKHOUSE_HOST       (default: localhost)
     CLICKHOUSE_PORT       (default: 8123)
     CLICKHOUSE_USER       (default: default)
-    CLICKHOUSE_PASSWORD   (default: "")
+    CLICKHOUSE_PASSWORD   (default: Aector99)
     CLICKHOUSE_DATABASE   (default: trading)
 """
 
@@ -265,7 +265,7 @@ def main():
         host     = os.environ.get("CLICKHOUSE_HOST",     "localhost"),
         port     = int(os.environ.get("CLICKHOUSE_PORT", "8123")),
         username = os.environ.get("CLICKHOUSE_USER",     "default"),
-        password = os.environ.get("CLICKHOUSE_PASSWORD", ""),
+        password = os.environ.get("CLICKHOUSE_PASSWORD", "Aector99"),
         database = os.environ.get("CLICKHOUSE_DATABASE", "trading"),
     )
 
