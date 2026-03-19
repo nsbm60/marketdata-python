@@ -2,15 +2,23 @@
 build_feature_matrix.py
 
 Compute session-level features and labels from 1-minute OHLCV bars in ClickHouse.
-Outputs one row per trading session as a CSV file.
+Supports variable prediction windows: 15, 30, 45, or 60 minutes from open.
+
+The window determines the prediction cutoff time:
+  --window 15  ->  features known by 9:45am  (first 15 minutes only)
+  --window 30  ->  features known by 10:00am (first 30 minutes)
+  --window 45  ->  features known by 10:15am (first 45 minutes)
+  --window 60  ->  features known by 10:30am (full first hour, default)
+
+Use --all-windows to produce all four CSVs in a single run, for comparison.
 
 Usage:
     python build_feature_matrix.py --symbol NVDA
-    python build_feature_matrix.py --symbol NVDA --start 2023-01-01 --end 2024-12-31
-    python build_feature_matrix.py --symbol NVDA --out /path/to/output.csv
+    python build_feature_matrix.py --symbol NVDA --window 30
+    python build_feature_matrix.py --symbol NVDA --all-windows
 
 Dependencies:
-    pip install clickhouse-connect pandas python-dotenv pyzmq
+    pip install clickhouse-connect pandas numpy python-dotenv pyzmq
 
 Environment variables:
     CLICKHOUSE_USER       (default: default)
@@ -46,16 +54,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+VALID_WINDOWS = [15, 30, 45, 60]
 
-# ---------------------------------------------------------------------------
-# SQL: one row per session with raw aggregates
-# All time filtering is done here; feature math happens in Python below.
-# ---------------------------------------------------------------------------
 
 SESSION_AGG_SQL = """
 WITH
 
--- Regular session bars only
 regular AS (
     SELECT
         toDate(ts)              AS session_date,
@@ -67,277 +71,306 @@ regular AS (
         toMinute(ts)            AS mn
     FROM stock_bars_1m
     WHERE symbol    = %(symbol)s
-      AND session   = 1              -- regular session only
+      AND session   = 1
       AND toDate(ts) BETWEEN %(start)s AND %(end)s
 ),
 
--- Full session aggregates
 full_session AS (
     SELECT
         session_date,
-        argMin(open,  ts)       AS open_930,
-        argMax(close, ts)       AS close_400,
-        max(high)               AS session_high,
-        min(low)                AS session_low,
-        sum(volume)             AS session_volume
+        argMin(open,  ts)           AS open_930,
+        argMax(close, ts)           AS close_400,
+        max(high)                   AS session_high,
+        min(low)                    AS session_low,
+        sum(volume)                 AS session_volume
     FROM regular
     GROUP BY session_date
 ),
 
--- First hour: 9:30 through 10:29 inclusive (hr=9 OR hr=10,mn=0..29 --
--- actually 9:30-10:30 means bars where ts < 10:30, i.e. hr=9 or (hr=10 and mn < 30))
--- We use 9:30-10:30 window (60 minutes)
-first_hour AS (
+w15 AS (
     SELECT
         session_date,
-        max(high)               AS fh_high,
-        min(low)                AS fh_low,
-        argMax(close, ts)       AS fh_close,     -- close of 10:29 bar
-        sum(volume)             AS fh_volume,
-        sum(volume * vwap) / sum(volume) AS fh_vwap
+        max(high)                           AS w15_high,
+        min(low)                            AS w15_low,
+        argMax(close, ts)                   AS w15_close,
+        sum(volume)                         AS w15_volume,
+        sum(volume * vwap) / sum(volume)    AS w15_vwap,
+        dateDiff('minute',
+            toDateTime(session_date) + toIntervalHour(9) + toIntervalMinute(30),
+            argMax(ts, high))               AS mins_to_w15_high,
+        dateDiff('minute',
+            toDateTime(session_date) + toIntervalHour(9) + toIntervalMinute(30),
+            argMin(ts, low))                AS mins_to_w15_low
     FROM regular
-    WHERE (hr = 9) OR (hr = 10 AND mn < 30)
+    WHERE hr = 9 AND mn < 45
     GROUP BY session_date
 ),
 
--- First 15 minutes: 9:30 through 9:44 inclusive
-first_15 AS (
+w30 AS (
     SELECT
         session_date,
-        max(high)               AS f15_high,
-        min(low)                AS f15_low,
-        argMax(close, ts)       AS f15_close,
-        sum(volume)             AS f15_volume
+        max(high)                           AS w30_high,
+        min(low)                            AS w30_low,
+        argMax(close, ts)                   AS w30_close,
+        sum(volume)                         AS w30_volume,
+        sum(volume * vwap) / sum(volume)    AS w30_vwap
     FROM regular
-    WHERE hr = 9 AND mn < 45    -- 9:30..9:44
+    WHERE hr = 9
     GROUP BY session_date
 ),
 
--- Prior session close (last bar of each session)
--- We lag this: for each session_date, we want the close of the PREVIOUS session
-prior_close AS (
+w45 AS (
     SELECT
         session_date,
-        close_400,
-        session_high,
-        session_low,
-        session_volume,
-        lagInFrame(close_400)   OVER (ORDER BY session_date) AS prev_close,
-        lagInFrame(session_high) OVER (ORDER BY session_date) AS prev_high,
-        lagInFrame(session_low)  OVER (ORDER BY session_date) AS prev_low,
+        max(high)                           AS w45_high,
+        min(low)                            AS w45_low,
+        argMax(close, ts)                   AS w45_close,
+        sum(volume)                         AS w45_volume,
+        sum(volume * vwap) / sum(volume)    AS w45_vwap
+    FROM regular
+    WHERE hr = 9 OR (hr = 10 AND mn < 15)
+    GROUP BY session_date
+),
+
+w60 AS (
+    SELECT
+        session_date,
+        max(high)                           AS w60_high,
+        min(low)                            AS w60_low,
+        argMax(close, ts)                   AS w60_close,
+        sum(volume)                         AS w60_volume,
+        sum(volume * vwap) / sum(volume)    AS w60_vwap,
+        dateDiff('minute',
+            toDateTime(session_date) + toIntervalHour(9) + toIntervalMinute(30),
+            argMax(ts, high))               AS mins_to_w60_high,
+        dateDiff('minute',
+            toDateTime(session_date) + toIntervalHour(9) + toIntervalMinute(30),
+            argMin(ts, low))                AS mins_to_w60_low
+    FROM regular
+    WHERE hr = 9 OR (hr = 10 AND mn < 30)
+    GROUP BY session_date
+),
+
+prior AS (
+    SELECT
+        session_date,
+        lagInFrame(close_400)      OVER (ORDER BY session_date) AS prev_close,
+        lagInFrame(session_high)   OVER (ORDER BY session_date) AS prev_high,
+        lagInFrame(session_low)    OVER (ORDER BY session_date) AS prev_low,
         lagInFrame(session_volume) OVER (ORDER BY session_date) AS prev_volume
     FROM full_session
 )
 
 SELECT
-    fs.session_date     AS session_date,
-    fs.open_930         AS open_930,
-    fs.close_400        AS close_400,
-    fs.session_high     AS session_high,
-    fs.session_low      AS session_low,
-    fs.session_volume   AS session_volume,
-    pc.prev_close       AS prev_close,
-    pc.prev_high        AS prev_high,
-    pc.prev_low         AS prev_low,
-    pc.prev_volume      AS prev_volume,
-    fh.fh_high          AS fh_high,
-    fh.fh_low           AS fh_low,
-    fh.fh_close         AS fh_close,
-    fh.fh_volume        AS fh_volume,
-    fh.fh_vwap          AS fh_vwap,
-    f15.f15_high        AS f15_high,
-    f15.f15_low         AS f15_low,
-    f15.f15_close       AS f15_close,
-    f15.f15_volume      AS f15_volume
-FROM full_session     fs
-JOIN first_hour       fh  ON fs.session_date = fh.session_date
-JOIN first_15         f15 ON fs.session_date = f15.session_date
-JOIN prior_close      pc  ON fs.session_date = pc.session_date
-WHERE pc.prev_close IS NOT NULL   -- drop first session (no prior close)
+    fs.session_date         AS session_date,
+    fs.open_930             AS open_930,
+    fs.close_400            AS close_400,
+    fs.session_high         AS session_high,
+    fs.session_low          AS session_low,
+    fs.session_volume       AS session_volume,
+    p.prev_close            AS prev_close,
+    p.prev_high             AS prev_high,
+    p.prev_low              AS prev_low,
+    p.prev_volume           AS prev_volume,
+    w15.w15_high            AS w15_high,
+    w15.w15_low             AS w15_low,
+    w15.w15_close           AS w15_close,
+    w15.w15_volume          AS w15_volume,
+    w15.w15_vwap            AS w15_vwap,
+    w15.mins_to_w15_high    AS mins_to_w15_high,
+    w15.mins_to_w15_low     AS mins_to_w15_low,
+    w30.w30_high            AS w30_high,
+    w30.w30_low             AS w30_low,
+    w30.w30_close           AS w30_close,
+    w30.w30_volume          AS w30_volume,
+    w30.w30_vwap            AS w30_vwap,
+    w45.w45_high            AS w45_high,
+    w45.w45_low             AS w45_low,
+    w45.w45_close           AS w45_close,
+    w45.w45_volume          AS w45_volume,
+    w45.w45_vwap            AS w45_vwap,
+    w60.w60_high            AS w60_high,
+    w60.w60_low             AS w60_low,
+    w60.w60_close           AS w60_close,
+    w60.w60_volume          AS w60_volume,
+    w60.w60_vwap            AS w60_vwap,
+    w60.mins_to_w60_high    AS mins_to_w60_high,
+    w60.mins_to_w60_low     AS mins_to_w60_low
+FROM full_session fs
+JOIN w15  ON fs.session_date = w15.session_date
+JOIN w30  ON fs.session_date = w30.session_date
+JOIN w45  ON fs.session_date = w45.session_date
+JOIN w60  ON fs.session_date = w60.session_date
+JOIN prior p ON fs.session_date = p.session_date
+WHERE p.prev_close IS NOT NULL
 ORDER BY fs.session_date
 """
 
 
-# ---------------------------------------------------------------------------
-# Feature computation (Python / pandas)
-# ---------------------------------------------------------------------------
-
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     """
-    Takes the raw session aggregates from SQL and derives ML features.
-    All features use only information available by 10:30am on the session date.
-    Labels use full-session data (retrospective).
+    Compute session features using data available up to the prediction window.
+
+    window: minutes from open (15, 30, 45, or 60)
+
+    Labels are always defined relative to the full first hour (w60) extremes,
+    keeping them consistent across window comparisons.
     """
+    assert window in VALID_WINDOWS
 
-    out = pd.DataFrame()
-    out["date"] = df["session_date"]
+    w        = f"w{window}"
+    out      = pd.DataFrame()
+    out["date"]   = df["session_date"]
+    out["window"] = window
+    open_930 = df["open_930"]
 
-    # --- Gap features (known at 9:30) ---
+    # --- Pre-open features (known at 9:30, same for all windows) ---
 
-    # Gap as % of prior close.  Positive = gap up, negative = gap down.
-    out["gap_pct"] = (df["open_930"] - df["prev_close"]) / df["prev_close"]
-
-    # Prior day range normalized by prior close -- how volatile was yesterday?
+    out["gap_pct"]             = (open_930 - df["prev_close"]) / df["prev_close"]
     out["prior_day_range_pct"] = (df["prev_high"] - df["prev_low"]) / df["prev_close"]
 
-    # --- ATR20: 20-session rolling average of (high - low) ---
-    # Computed from session_high/low of prior sessions (no lookahead)
-    daily_range = df["session_high"] - df["session_low"]
-    # Shift by 1 so today's range doesn't contaminate today's ATR
-    out["atr20"] = daily_range.shift(1).rolling(20, min_periods=5).mean()
+    daily_range  = df["session_high"] - df["session_low"]
+    atr20        = daily_range.shift(1).rolling(20, min_periods=5).mean()
+    out["atr20"] = atr20
 
-    # --- First-hour range features (known at 10:30) ---
+    # --- Window price/volume features ---
 
-    fh_range = df["fh_high"] - df["fh_low"]
-    out["fh_range_abs"]  = fh_range
-    out["fh_range_pct"]  = fh_range / df["open_930"]          # normalized by open
-    out["fh_range_atr"]  = fh_range / out["atr20"]            # normalized by ATR20
+    w_high   = df[f"{w}_high"]
+    w_low    = df[f"{w}_low"]
+    w_close  = df[f"{w}_close"]
+    w_volume = df[f"{w}_volume"]
+    w_vwap   = df[f"{w}_vwap"]
+    w_range  = w_high - w_low
 
-    # VWAP deviation: where did the first hour close relative to its own VWAP?
-    # Positive = closed above VWAP (bullish), negative = below (bearish)
-    out["fh_vwap_dev"] = (df["fh_close"] - df["fh_vwap"]) / df["fh_vwap"]
+    out["w_range_pct"] = w_range / open_930
+    out["w_range_atr"] = w_range / atr20
+    out["w_vwap_dev"]  = (w_close - w_vwap) / w_vwap
 
-    # --- First-15-minute features (known at 9:45) ---
+    avg_vol_20         = df["session_volume"].shift(1).rolling(20, min_periods=5).mean()
+    out["avg_vol_20"]  = avg_vol_20
+    out["w_vol_ratio"] = w_volume / avg_vol_20
 
-    f15_range = df["f15_high"] - df["f15_low"]
-    # First 15 range as fraction of first hour range --
-    # high ratio = most of the day's volatility front-loaded, typical of sweep
-    out["f15_range_ratio"] = f15_range / fh_range.replace(0, float("nan"))
+    # --- First-15-minute sub-features ---
+    # Always from w15 regardless of prediction window.
+    # Measures how front-loaded the session was relative to the full window.
 
-    # First 15 volume as fraction of first hour volume --
-    # high ratio = volume front-loaded, another sweep indicator
-    out["f15_vol_ratio"] = df["f15_volume"] / df["fh_volume"].replace(0, float("nan"))
+    f15_high   = df["w15_high"]
+    f15_low    = df["w15_low"]
+    f15_volume = df["w15_volume"]
+    f15_range  = f15_high - f15_low
 
-    # --- Volume features ---
-
-    # 20-day rolling average daily volume (prior sessions, no lookahead)
-    avg_vol_20 = df["session_volume"].shift(1).rolling(20, min_periods=5).mean()
-    out["avg_vol_20"] = avg_vol_20
-
-    # First hour volume as multiple of average daily volume.
-    # > 0.4 = elevated (first hour normally ~25-30% of daily)
-    out["fh_vol_ratio"] = df["fh_volume"] / avg_vol_20
+    out["f15_range_ratio"] = f15_range / w_range.replace(0, float("nan"))
+    out["f15_vol_ratio"]   = f15_volume / w_volume.replace(0, float("nan"))
 
     # --- Sweep signal ---
-    # Definition: first 15 minutes makes a significant directional move from open,
-    # but the first hour CLOSES on the opposite side of open.
-    # This is the stop-hunt signature.
-    #
-    # "Significant" = f15 extreme is more than 25% of fh_range away from open
-    open_930 = df["open_930"]
-    f15_up_extent   = (df["f15_high"] - open_930)              # how far above open
-    f15_down_extent = (open_930 - df["f15_low"])               # how far below open
+    # f15 makes a significant move, window closes on the opposite side of open.
 
-    significance_threshold = fh_range * 0.25
+    f15_up_ext   = f15_high - open_930
+    f15_down_ext = open_930 - f15_low
+    significance = w_range * 0.25
 
-    # Upside sweep: price ran up significantly in first 15, then closed below open
-    sweep_up   = (f15_up_extent   > significance_threshold) & (df["fh_close"] < open_930)
-    # Downside sweep: price ran down significantly in first 15, then closed above open
-    sweep_down = (f15_down_extent > significance_threshold) & (df["fh_close"] > open_930)
+    sweep_up   = (f15_up_ext   > significance) & (w_close < open_930)
+    sweep_down = (f15_down_ext > significance) & (w_close > open_930)
 
-    out["sweep_signal"] = (sweep_up | sweep_down).astype(int)
-    out["sweep_direction"] = 0  # 0=none, 1=up sweep (fakeout high), -1=down sweep (fakeout low)
+    out["sweep_signal"]    = (sweep_up | sweep_down).astype(int)
+    out["sweep_direction"] = 0
     out.loc[sweep_up,   "sweep_direction"] =  1
     out.loc[sweep_down, "sweep_direction"] = -1
 
-    # --- Label computation (uses full session data -- retrospective only) ---
-    #
-    # Tolerance: first-hour extreme counts as "session extreme" if within 0.1% of
-    # the true session extreme. Handles floating point and micro-violations.
-    tol = 0.001
+    # --- Time-of-extreme features ---
+    # Minutes from open to when the window high/low was established.
+    # Available for w15 and w60; NaN for w30/w45 (would need additional SQL).
 
-    fh_high_is_session_high = df["fh_high"] >= df["session_high"] * (1 - tol)
-    fh_low_is_session_low   = df["fh_low"]  <= df["session_low"]  * (1 + tol)
+    if window in (15, 60):
+        out["mins_to_high"] = df[f"mins_to_{w}_high"]
+        out["mins_to_low"]  = df[f"mins_to_{w}_low"]
+        # Normalized: 0 = extreme at open, 1 = extreme at end of window
+        out["high_timing"]  = df[f"mins_to_{w}_high"] / window
+        out["low_timing"]   = df[f"mins_to_{w}_low"]  / window
+    else:
+        out["mins_to_high"] = np.nan
+        out["mins_to_low"]  = np.nan
+        out["high_timing"]  = np.nan
+        out["low_timing"]   = np.nan
+
+    # --- Confirmation signal features ---
+    # How much of the reversal has already happened by end of window?
+
+    # Reversal progress: how far has price retreated from the window high?
+    # 0 = price still at the high, 1 = fully retraced to the low
+    out["reversal_progress"] = (w_high - w_close) / w_range.replace(0, float("nan"))
+
+    # Close position: where within the window range did the window close?
+    # 0 = closed at low (bearish), 1 = closed at high (bullish)
+    out["close_position"]    = (w_close - w_low) / w_range.replace(0, float("nan"))
+
+    # --- Regime features (rolling, lagged -- no lookahead) ---
+
+    tol = 0.001
+    w60_high = df["w60_high"]
+    w60_low  = df["w60_low"]
+
+    fh_high_is_session_high = w60_high >= df["session_high"] * (1 - tol)
+    fh_low_is_session_low   = w60_low  <= df["session_low"]  * (1 + tol)
+
+    is_reversal = (fh_high_is_session_high | fh_low_is_session_low).astype(int)
+
+    out["rolling_reversal_rate"] = (
+        is_reversal.shift(1).rolling(30, min_periods=15).mean()
+    )
+    out["rolling_high_set_rate"] = (
+        fh_high_is_session_high.astype(int).shift(1).rolling(30, min_periods=15).mean()
+    )
+    out["directional_bias"]     = (out["rolling_high_set_rate"] - 0.5) * 2
+    out["gap_regime_alignment"] = out["gap_pct"] * out["directional_bias"]
+
+    # --- Labels (full session, retrospective -- same for all windows) ---
+
+    w60_range = w60_high - w60_low
 
     out["fh_high_is_session_high"] = fh_high_is_session_high.astype(int)
     out["fh_low_is_session_low"]   = fh_low_is_session_low.astype(int)
 
-    # --- Regime features (rolling, lagged -- no lookahead) ---
-    #
-    # These encode the current directional bias of the market for this stock.
-    # All are shifted by 1 so today's outcome does not contaminate today's feature.
-
-    # Rolling 30-session reversal rate (reversal + double_sweep combined)
-    # High value = market consistently reversing first-hour moves
-    is_reversal_or_sweep = (
-        fh_high_is_session_high | fh_low_is_session_low
-    ).astype(int)
-    out["rolling_reversal_rate"] = (
-        is_reversal_or_sweep
-        .shift(1)
-        .rolling(30, min_periods=15)
-        .mean()
-    )
-
-    # Rolling 30-session rate of HIGH-set reversals (first-hour high = session high)
-    # High value = bearish regime (breakouts being sold)
-    # Low value  = bullish regime (dips being bought)
-    out["rolling_high_set_rate"] = (
-        fh_high_is_session_high.astype(int)
-        .shift(1)
-        .rolling(30, min_periods=15)
-        .mean()
-    )
-
-    # Directional bias: rolling_high_set_rate recentered, normalized to [-1, 1]
-    # Positive = bearish bias (fading highs), negative = bullish bias (buying dips)
-    out["directional_bias"] = (out["rolling_high_set_rate"] - 0.5) * 2
-
-    # Gap direction alignment with current regime:
-    # In a bearish regime, a gap UP aligns with the dominant reversal direction
-    # Positive = gap direction matches regime (reversal more likely)
-    # Negative = gap direction opposes regime (potential trend day)
-    out["gap_regime_alignment"] = out["gap_pct"] * out["directional_bias"]
-
-    # Session extension beyond first-hour range (as multiple of fh_range)
-    # Used to distinguish trend days from containment days
-    upside_extension   = (df["session_high"] - df["fh_high"]) / fh_range.replace(0, float("nan"))
-    downside_extension = (df["fh_low"] - df["session_low"])   / fh_range.replace(0, float("nan"))
-    max_extension = upside_extension.combine(downside_extension, max)
-
-    # Label:
-    #   3 = Double sweep: first hour captures both session extremes (chop / pin)
-    #   2 = Reversal: one first-hour extreme is session extreme (stop hunt then trend)
-    #   1 = Containment: session stays close to first-hour range (no extension)
-    #   0 = Trend: session extends significantly beyond first-hour range
-
-    TREND_EXTENSION_THRESHOLD = 0.75  # session extends > 75% of fh_range beyond it
+    upside_ext   = (df["session_high"] - w60_high) / w60_range.replace(0, float("nan"))
+    downside_ext = (w60_low - df["session_low"])   / w60_range.replace(0, float("nan"))
+    max_ext      = upside_ext.combine(downside_ext, max)
 
     conditions = [
-        fh_high_is_session_high & fh_low_is_session_low,          # 3: double sweep
-        fh_high_is_session_high | fh_low_is_session_low,          # 2: reversal (one side)
-        max_extension <= TREND_EXTENSION_THRESHOLD,                # 1: containment
+        fh_high_is_session_high & fh_low_is_session_low,
+        fh_high_is_session_high | fh_low_is_session_low,
+        max_ext <= 0.75,
     ]
-    choices = [3, 2, 1]
-    out["label"] = pd.Series(
-        np.select(conditions, choices, default=0),
-        index=df.index
-    )
+    out["label"]      = pd.Series(np.select(conditions, [3, 2, 1], default=0), index=df.index)
+    out["label_name"] = out["label"].map({0: "trend", 1: "containment", 2: "reversal", 3: "double_sweep"})
+    out["binary_label"] = out["label"].isin([2, 3]).astype(int)
 
-    # Readable label name for inspection
-    label_names = {0: "trend", 1: "containment", 2: "reversal", 3: "double_sweep"}
-    out["label_name"] = out["label"].map(label_names)
+    directional = pd.Series(np.nan, index=df.index)
+    directional[fh_high_is_session_high & ~fh_low_is_session_low] = 1
+    directional[fh_low_is_session_low   & ~fh_high_is_session_high] = 0
+    out["directional_label"] = directional
 
-    # Drop rows where ATR or avg_vol couldn't be computed (insufficient history)
     out = out.dropna(subset=["atr20", "avg_vol_20"])
 
     return out
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="Build ML feature matrix from ClickHouse bars")
-    parser.add_argument("--symbol",  required=True,  help="Ticker symbol, e.g. NVDA")
-    parser.add_argument("--start",   default="2023-01-01", help="Start date YYYY-MM-DD")
-    parser.add_argument("--end",     default=date.today().isoformat(), help="End date YYYY-MM-DD")
-    parser.add_argument("--out",     default=None, help="Output CSV path (default: <symbol>_features.csv)")
+    parser = argparse.ArgumentParser(
+        description="Build ML feature matrix from ClickHouse bars"
+    )
+    parser.add_argument("--symbol",      required=True,  help="Ticker symbol, e.g. NVDA")
+    parser.add_argument("--start",       default="2023-01-01", help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",         default=date.today().isoformat(), help="End date YYYY-MM-DD")
+    parser.add_argument("--window",      type=int, default=60, choices=VALID_WINDOWS,
+                        help="Prediction window in minutes (default: 60)")
+    parser.add_argument("--all-windows", action="store_true",
+                        help="Produce CSVs for all four windows in one run")
+    parser.add_argument("--out",         default=None,
+                        help="Output CSV path (ignored with --all-windows)")
     args = parser.parse_args()
 
-    symbol   = args.symbol.upper()
-    out_path = args.out or f"{symbol.lower()}_features.csv"
+    symbol  = args.symbol.upper()
+    windows = VALID_WINDOWS if args.all_windows else [args.window]
 
     # --- ClickHouse client (discovered via ZMQ) ---
     log.info("Discovering ClickHouse...")
@@ -354,7 +387,7 @@ def main():
         database = os.environ.get("CLICKHOUSE_DATABASE", "trading"),
     )
 
-    log.info(f"Querying session aggregates for {symbol} ({args.start} → {args.end})")
+    log.info(f"Querying session aggregates for {symbol} ({args.start} -> {args.end})")
     result = ch_client.query(
         SESSION_AGG_SQL,
         parameters={"symbol": symbol, "start": args.start, "end": args.end},
@@ -365,23 +398,27 @@ def main():
     log.info(f"  {len(df_raw)} sessions retrieved from ClickHouse")
 
     if df_raw.empty:
-        log.error("No data returned — check symbol and date range")
+        log.error("No data returned -- check symbol and date range")
         sys.exit(1)
 
-    log.info("Computing features and labels...")
-    df_features = compute_features(df_raw)
+    for w in windows:
+        log.info(f"Computing features for window={w}min...")
+        df_features = compute_features(df_raw, window=w)
+        log.info(f"  {len(df_features)} sessions after dropping warm-up rows")
 
-    log.info(f"  {len(df_features)} sessions after dropping warm-up rows")
+        label_counts = df_features["label_name"].value_counts()
+        log.info("  Label distribution:")
+        for name, count in label_counts.items():
+            pct = 100 * count / len(df_features)
+            log.info(f"    {name:<15} {count:>4}  ({pct:.1f}%)")
 
-    # Summary
-    label_counts = df_features["label_name"].value_counts()
-    log.info("Label distribution:")
-    for name, count in label_counts.items():
-        pct = 100 * count / len(df_features)
-        log.info(f"  {name:<15} {count:>4}  ({pct:.1f}%)")
+        if args.all_windows:
+            out_path = f"{symbol.lower()}_features_w{w}.csv"
+        else:
+            out_path = args.out or f"{symbol.lower()}_features_w{w}.csv"
 
-    df_features.to_csv(out_path, index=False)
-    log.info(f"Written to {out_path}")
+        df_features.to_csv(out_path, index=False)
+        log.info(f"  Written to {out_path}")
 
 
 if __name__ == "__main__":
