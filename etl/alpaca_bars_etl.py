@@ -9,16 +9,16 @@ Usage:
     python alpaca_bars_etl.py --symbol AMD --start 2023-06-01
 
 Dependencies:
-    pip install alpaca-py clickhouse-connect python-dotenv
+    pip install alpaca-py clickhouse-connect python-dotenv pyzmq
 
 Environment variables (in .env or shell):
     ALPACA_API_KEY
     ALPACA_API_SECRET
-    CLICKHOUSE_HOST       (default: localhost)
-    CLICKHOUSE_PORT       (default: 8123)
     CLICKHOUSE_USER       (default: default)
     CLICKHOUSE_PASSWORD   (default: Aector99)
     CLICKHOUSE_DATABASE   (default: trading)
+
+ClickHouse host/port are discovered automatically via ZMQ discovery bus.
 """
 
 import argparse
@@ -26,7 +26,11 @@ import logging
 import os
 import sys
 from datetime import datetime, date, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Add parent directory to path for discovery module
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import clickhouse_connect
 from alpaca.data.historical import StockHistoricalDataClient
@@ -34,6 +38,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment, DataFeed
 from dotenv import load_dotenv
+
+from discovery import ServiceLocator
 
 load_dotenv()
 
@@ -260,10 +266,16 @@ def main():
 
     alpaca_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
 
-    # --- ClickHouse client ---
+    # --- ClickHouse client (discovered via ZMQ) ---
+    log.info("Discovering ClickHouse...")
+    ch_endpoint = ServiceLocator.wait_for_service(
+        ServiceLocator.CLICKHOUSE,
+        timeout_sec=60,
+    )
+
     ch_client = clickhouse_connect.get_client(
-        host     = os.environ.get("CLICKHOUSE_HOST",     "localhost"),
-        port     = int(os.environ.get("CLICKHOUSE_PORT", "8123")),
+        host     = ch_endpoint.host,
+        port     = ch_endpoint.port,
         username = os.environ.get("CLICKHOUSE_USER",     "default"),
         password = os.environ.get("CLICKHOUSE_PASSWORD", "Aector99"),
         database = os.environ.get("CLICKHOUSE_DATABASE", "trading"),
