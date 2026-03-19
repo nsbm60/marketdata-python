@@ -2,3 +2,5 @@ pyzmq>=25.0.0
 alpaca-py>=0.20.0
 clickhouse-connect>=0.7.0
 python-dotenv>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
