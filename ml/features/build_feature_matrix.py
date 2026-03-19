@@ -130,25 +130,25 @@ prior_close AS (
 )
 
 SELECT
-    fs.session_date,
-    fs.open_930,
-    fs.close_400,
-    fs.session_high,
-    fs.session_low,
-    fs.session_volume,
-    pc.prev_close,
-    pc.prev_high,
-    pc.prev_low,
-    pc.prev_volume,
-    fh.fh_high,
-    fh.fh_low,
-    fh.fh_close,
-    fh.fh_volume,
-    fh.fh_vwap,
-    f15.f15_high,
-    f15.f15_low,
-    f15.f15_close,
-    f15.f15_volume
+    fs.session_date     AS session_date,
+    fs.open_930         AS open_930,
+    fs.close_400        AS close_400,
+    fs.session_high     AS session_high,
+    fs.session_low      AS session_low,
+    fs.session_volume   AS session_volume,
+    pc.prev_close       AS prev_close,
+    pc.prev_high        AS prev_high,
+    pc.prev_low         AS prev_low,
+    pc.prev_volume      AS prev_volume,
+    fh.fh_high          AS fh_high,
+    fh.fh_low           AS fh_low,
+    fh.fh_close         AS fh_close,
+    fh.fh_volume        AS fh_volume,
+    fh.fh_vwap          AS fh_vwap,
+    f15.f15_high        AS f15_high,
+    f15.f15_low         AS f15_low,
+    f15.f15_close       AS f15_close,
+    f15.f15_volume      AS f15_volume
 FROM full_session     fs
 JOIN first_hour       fh  ON fs.session_date = fh.session_date
 JOIN first_15         f15 ON fs.session_date = f15.session_date
