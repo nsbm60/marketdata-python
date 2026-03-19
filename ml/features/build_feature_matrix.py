@@ -252,6 +252,43 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["fh_high_is_session_high"] = fh_high_is_session_high.astype(int)
     out["fh_low_is_session_low"]   = fh_low_is_session_low.astype(int)
 
+    # --- Regime features (rolling, lagged -- no lookahead) ---
+    #
+    # These encode the current directional bias of the market for this stock.
+    # All are shifted by 1 so today's outcome does not contaminate today's feature.
+
+    # Rolling 30-session reversal rate (reversal + double_sweep combined)
+    # High value = market consistently reversing first-hour moves
+    is_reversal_or_sweep = (
+        fh_high_is_session_high | fh_low_is_session_low
+    ).astype(int)
+    out["rolling_reversal_rate"] = (
+        is_reversal_or_sweep
+        .shift(1)
+        .rolling(30, min_periods=15)
+        .mean()
+    )
+
+    # Rolling 30-session rate of HIGH-set reversals (first-hour high = session high)
+    # High value = bearish regime (breakouts being sold)
+    # Low value  = bullish regime (dips being bought)
+    out["rolling_high_set_rate"] = (
+        fh_high_is_session_high.astype(int)
+        .shift(1)
+        .rolling(30, min_periods=15)
+        .mean()
+    )
+
+    # Directional bias: rolling_high_set_rate recentered, normalized to [-1, 1]
+    # Positive = bearish bias (fading highs), negative = bullish bias (buying dips)
+    out["directional_bias"] = (out["rolling_high_set_rate"] - 0.5) * 2
+
+    # Gap direction alignment with current regime:
+    # In a bearish regime, a gap UP aligns with the dominant reversal direction
+    # Positive = gap direction matches regime (reversal more likely)
+    # Negative = gap direction opposes regime (potential trend day)
+    out["gap_regime_alignment"] = out["gap_pct"] * out["directional_bias"]
+
     # Session extension beyond first-hour range (as multiple of fh_range)
     # Used to distinguish trend days from containment days
     upside_extension   = (df["session_high"] - df["fh_high"]) / fh_range.replace(0, float("nan"))
