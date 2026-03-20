@@ -290,7 +290,7 @@ def main():
                         help="Model mode (default: directional)")
     parser.add_argument("--fold-size",  type=int, default=20,
                         help="Sessions per test fold (default: 20 ~ 1 month)")
-    parser.add_argument("--out-dir",    default=".",
+    parser.add_argument("--out-dir",    default="data",
                         help="Output directory for report and plot")
     args = parser.parse_args()
 
