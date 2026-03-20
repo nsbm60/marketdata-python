@@ -11,8 +11,8 @@ Labels:
     3 = double_sweep  : both first-hour extremes are session extremes
 
 Directional labels (for reversal sessions only):
-    1 = buy_the_dip   : first-hour high is session high (fade the early strength)
-    0 = fade_the_high : first-hour low is session low (buy the early weakness)
+    1 = fade_the_high : first-hour high is session high (stock ran up early then faded)
+    0 = buy_the_dip   : first-hour low is session low (stock dropped early then recovered)
 
 Usage:
     python label_session.py --symbol NVDA
@@ -58,8 +58,8 @@ LABEL_NAMES = {
 }
 
 DIRECTIONAL_NAMES = {
-    0: "fade_the_high",
-    1: "buy_the_dip",
+    0: "buy_the_dip",    # first-hour LOW is session low -- stock dropped early, recovered
+    1: "fade_the_high",  # first-hour HIGH is session high -- stock ran up early, faded
 }
 
 
@@ -161,8 +161,8 @@ def label_sessions(df: pd.DataFrame) -> pd.DataFrame:
 
     # Directional: only meaningful for pure reversals (label=2)
     directional = pd.Series(np.nan, index=df.index)
-    directional[w_high_is_session_high & ~w_low_is_session_low] = 1  # buy_the_dip
-    directional[w_low_is_session_low & ~w_high_is_session_high] = 0  # fade_the_high
+    directional[w_high_is_session_high & ~w_low_is_session_low] = 1  # fade_the_high
+    directional[w_low_is_session_low & ~w_high_is_session_high] = 0  # buy_the_dip
     df["directional_label"] = directional
     df["directional_name"] = directional.map(DIRECTIONAL_NAMES)
 
@@ -189,8 +189,8 @@ def print_distribution(df: pd.DataFrame, window: int):
     # Directional (only for reversals)
     reversals = df[df["label"] == 2]
     if len(reversals) > 0:
-        buy_dip = (reversals["directional_label"] == 1).sum()
-        fade_high = (reversals["directional_label"] == 0).sum()
+        buy_dip = (reversals["directional_label"] == 0).sum()
+        fade_high = (reversals["directional_label"] == 1).sum()
         print(f"\nDirectional (reversals only, n={len(reversals)}):")
         print(f"  buy_the_dip    {buy_dip:6}  ({100*buy_dip/len(reversals):5.1f}%)")
         print(f"  fade_the_high  {fade_high:6}  ({100*fade_high/len(reversals):5.1f}%)")

@@ -232,9 +232,9 @@ def fetch_correlation_features(ch_client, start: str, end: str) -> pd.DataFrame:
     """
     Compute rolling 60-session correlations of the target symbol with QQQ and SMH.
     Returns a DataFrame indexed by session_date with columns:
-        nvda_qqq_corr_60  -- rolling 60-session correlation with QQQ (lagged 1)
-        nvda_smh_corr_60  -- rolling 60-session correlation with SMH (lagged 1)
-        nvda_qqq_beta_60  -- rolling 60-session beta to QQQ (lagged 1)
+        target_qqq_corr_60  -- rolling 60-session correlation with QQQ (lagged 1)
+        target_smh_corr_60  -- rolling 60-session correlation with SMH (lagged 1)
+        target_qqq_beta_60  -- rolling 60-session beta to QQQ (lagged 1)
 
     Note: the correlation is computed from daily close returns, not intraday.
     All values are lagged by 1 session so there is no lookahead.
@@ -398,12 +398,12 @@ def compute_features(df: pd.DataFrame,
         merged = merged.join(benchmark_rets, how="left")
 
         # Rolling correlation -- shift(1) for no lookahead
-        nvda_qqq_corr = (
+        target_qqq_corr = (
             merged["target"].rolling(CORR_WINDOW, min_periods=20)
             .corr(merged["qqq_ret"])
             .shift(1)
         )
-        nvda_smh_corr = (
+        target_smh_corr = (
             merged["target"].rolling(CORR_WINDOW, min_periods=20)
             .corr(merged["smh_ret"])
             .shift(1)
@@ -415,23 +415,23 @@ def compute_features(df: pd.DataFrame,
             var = x.rolling(window, min_periods=20).var()
             return (cov / var).shift(1)
 
-        nvda_qqq_beta = rolling_beta(merged["target"], merged["qqq_ret"], CORR_WINDOW)
+        target_qqq_beta = rolling_beta(merged["target"], merged["qqq_ret"], CORR_WINDOW)
 
         # Correlation regime: how far is current correlation from its own
         # 252-session mean? Positive = more correlated than usual (macro fear).
-        corr_mean_252 = nvda_qqq_corr.rolling(252, min_periods=60).mean()
-        corr_dev      = nvda_qqq_corr - corr_mean_252
+        corr_mean_252 = target_qqq_corr.rolling(252, min_periods=60).mean()
+        corr_dev      = target_qqq_corr - corr_mean_252
 
-        out["nvda_qqq_corr"]     = nvda_qqq_corr.values
-        out["nvda_smh_corr"]     = nvda_smh_corr.values
-        out["nvda_qqq_beta"]     = nvda_qqq_beta.values
+        out["target_qqq_corr"]     = target_qqq_corr.values
+        out["target_smh_corr"]     = target_smh_corr.values
+        out["target_qqq_beta"]     = target_qqq_beta.values
         out["corr_regime_dev"]   = corr_dev.values  # deviation from long-run mean
 
         log.info("  Correlation features added.")
     else:
-        out["nvda_qqq_corr"]   = np.nan
-        out["nvda_smh_corr"]   = np.nan
-        out["nvda_qqq_beta"]   = np.nan
+        out["target_qqq_corr"]   = np.nan
+        out["target_smh_corr"]   = np.nan
+        out["target_qqq_beta"]   = np.nan
         out["corr_regime_dev"] = np.nan
         log.warning("  Correlation features unavailable (QQQ/SMH not in ClickHouse).")
 
@@ -540,11 +540,11 @@ def main():
             log.info(f"    {name:<15} {count:>4}  ({pct:.1f}%)")
 
         # Correlation feature summary
-        if "nvda_qqq_corr" in df_features and df_features["nvda_qqq_corr"].notna().any():
-            log.info(f"  nvda_qqq_corr mean: {df_features['nvda_qqq_corr'].mean():.3f}  "
-                     f"std: {df_features['nvda_qqq_corr'].std():.3f}")
-            log.info(f"  nvda_smh_corr mean: {df_features['nvda_smh_corr'].mean():.3f}  "
-                     f"std: {df_features['nvda_smh_corr'].std():.3f}")
+        if "target_qqq_corr" in df_features and df_features["target_qqq_corr"].notna().any():
+            log.info(f"  target_qqq_corr mean: {df_features['target_qqq_corr'].mean():.3f}  "
+                     f"std: {df_features['target_qqq_corr'].std():.3f}")
+            log.info(f"  target_smh_corr mean: {df_features['target_smh_corr'].mean():.3f}  "
+                     f"std: {df_features['target_smh_corr'].std():.3f}")
 
         if args.all_windows:
             out_path = Path(args.out_dir) / f"{symbol.lower()}_features_w{w}.csv"

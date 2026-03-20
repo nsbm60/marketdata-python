@@ -67,9 +67,9 @@ FEATURES = [
     # Correlation / market regime features (rolling 60-session, lagged)
     # Measure how macro-driven vs idiosyncratic the current environment is.
     # corr_regime_dev excluded -- too many nulls in early history.
-    "nvda_qqq_corr",
-    "nvda_smh_corr",
-    "nvda_qqq_beta",
+    "target_qqq_corr",
+    "target_smh_corr",
+    "target_qqq_beta",
 ]
 
 # Columns deliberately excluded and why:
@@ -107,7 +107,7 @@ def load_and_validate(path: str, label_col: str, directional: bool = False) -> p
 
     # Fill nulls in correlation features with column median before dropping.
     # These arise from rolling window warmup at the start of the dataset.
-    corr_features = ["nvda_qqq_corr", "nvda_smh_corr", "nvda_qqq_beta"]
+    corr_features = ["target_qqq_corr", "target_smh_corr", "target_qqq_beta"]
     for col in corr_features:
         if col in df.columns and df[col].isnull().any():
             median = df[col].median()

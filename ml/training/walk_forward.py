@@ -44,7 +44,7 @@ FEATURES = [
     "reversal_progress", "close_position",
     "rolling_reversal_rate", "rolling_high_set_rate",
     "directional_bias", "gap_regime_alignment",
-    "nvda_qqq_corr", "nvda_smh_corr", "nvda_qqq_beta",
+    "target_qqq_corr", "target_smh_corr", "target_qqq_beta",
 ]
 
 LABEL_COLS = {
@@ -68,7 +68,7 @@ def load(path: str, label_col: str, directional: bool) -> pd.DataFrame:
     df = df.sort_values("date").reset_index(drop=True)
 
     # Fill correlation feature nulls with median
-    for col in ["nvda_qqq_corr", "nvda_smh_corr", "nvda_qqq_beta"]:
+    for col in ["target_qqq_corr", "target_smh_corr", "target_qqq_beta"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
