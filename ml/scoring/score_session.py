@@ -11,8 +11,8 @@ the prediction back onto the bus.
 Advertises itself via UDP broadcast so the Scala layer can discover it.
 
 Service name:  mlScorer
-PUB port:      6010  (predictions)
-Router port:   6011  (control -- reserved for future use)
+PUB port:      6040  (predictions)
+Router port:   6041  (control -- reserved for future use)
 
 Published prediction topic: ml.session.prediction.{SYMBOL}
 
@@ -90,8 +90,8 @@ log = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
 
 SERVICE_NAME   = "mlScorer"
-PUB_PORT       = 6010
-ROUTER_PORT    = 6011
+PUB_PORT       = 6040   # Prediction PUB socket (6010/6011 used by IB service)
+ROUTER_PORT    = 6041   # Control router (reserved)
 DISCOVERY_PORT = 6001   # UDP broadcast port (matches SystemConfig.discovery.udpPort)
 BROADCAST_ADDR = "255.255.255.255"
 ADVERTISE_INTERVAL = 5  # seconds
