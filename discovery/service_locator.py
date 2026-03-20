@@ -185,6 +185,7 @@ class ServiceLocator:
     IB = "ib"
     CALC = "calc"
     ALPACA_TRADING = "alpaca"
+    ML_SCORER = "mlScorer"
 
     @staticmethod
     def wait_for_service(

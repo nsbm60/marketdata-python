@@ -19,6 +19,10 @@ Usage:
     python label_session.py --symbol NVDA --window 30
     python label_session.py --symbol NVDA --start 2024-01-01 --output labels.csv
 
+    # Write labels to ClickHouse session_labels table
+    python label_session.py --symbol NVDA --write-db
+    python label_session.py --symbol NVDA --start 2026-03-01 --write-db
+
 Dependencies:
     pip install clickhouse-connect pandas numpy python-dotenv pyzmq
 """
@@ -169,6 +173,63 @@ def label_sessions(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def write_to_clickhouse(ch_client, df: pd.DataFrame, symbol: str, window: int):
+    """
+    Write label data to the session_labels table in ClickHouse.
+    Safe to run multiple times -- ReplacingMergeTree deduplicates on
+    (symbol, session_date, window_minutes).
+    """
+    # Prepare rows for insertion
+    rows = []
+    for _, row in df.iterrows():
+        # Handle NaN in directional_label -> None
+        directional = row["directional_label"]
+        if pd.isna(directional):
+            directional = None
+        else:
+            directional = int(directional)
+
+        # Determine fh_high_is_session_high and fh_low_is_session_low
+        fh_high_is_session_high = int(np.isclose(
+            row["w_high"], row["session_high"], rtol=1e-6
+        ))
+        fh_low_is_session_low = int(np.isclose(
+            row["w_low"], row["session_low"], rtol=1e-6
+        ))
+
+        rows.append([
+            symbol,
+            pd.to_datetime(row["session_date"]).date(),
+            int(row["label"]),
+            row["label_name"],
+            int(row["binary_label"]),
+            directional,
+            fh_high_is_session_high,
+            fh_low_is_session_low,
+            window,
+        ])
+
+    columns = [
+        "symbol",
+        "session_date",
+        "label",
+        "label_name",
+        "binary_label",
+        "directional_label",
+        "fh_high_is_session_high",
+        "fh_low_is_session_low",
+        "window_minutes",
+    ]
+
+    ch_client.insert(
+        table="session_labels",
+        data=rows,
+        column_names=columns,
+    )
+
+    log.info(f"Written {len(rows)} label rows for {symbol} to session_labels")
+
+
 def print_distribution(df: pd.DataFrame, window: int):
     """Print label distribution summary."""
     print(f"\n{'='*60}")
@@ -215,6 +276,8 @@ def main():
     parser.add_argument("--window", type=int, default=60, choices=VALID_WINDOWS,
                         help="Prediction window in minutes (default: 60)")
     parser.add_argument("--output", "-o", help="Output CSV path (optional)")
+    parser.add_argument("--write-db", action="store_true",
+                        help="Write labels to ClickHouse session_labels table")
     args = parser.parse_args()
 
     # Discover ClickHouse
@@ -255,6 +318,10 @@ def main():
 
     # Print distribution
     print_distribution(df, args.window)
+
+    # Write to ClickHouse if requested
+    if args.write_db:
+        write_to_clickhouse(ch_client, df, args.symbol.upper(), args.window)
 
     # Output CSV if requested
     if args.output:
