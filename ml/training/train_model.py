@@ -7,8 +7,6 @@ first-hour session type: trend / containment / reversal / double_sweep.
 Usage:
     python train_model.py --features nvda_features.csv
     python train_model.py --features nvda_features.csv --test-sessions 110
-    python train_model.py --features nvda_features.csv --binary
-    python train_model.py --features nvda_features.csv --directional
 
 Outputs:
     <symbol>_model.json      -- trained XGBoost model
@@ -25,7 +23,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import classification_report, confusion_matrix, brier_score_loss
 from sklearn.utils.class_weight import compute_sample_weight
 
 # ---------------------------------------------------------------------------
@@ -39,21 +38,25 @@ FEATURES = [
     "prior_day_range_pct",
     "atr20",
 
-    # First-hour price structure (known at 10:30)
-    "fh_range_pct",
-    "fh_range_atr",
-    "fh_vwap_dev",
+    # Window price structure (known at 9:30 + window minutes)
+    "w_range_pct",
+    "w_range_atr",
+    "w_vwap_dev",
 
-    # First-15-minute structure (known at 9:45)
+    # First-15-minute sub-features
     "f15_range_ratio",
     "f15_vol_ratio",
 
     # Volume
-    "fh_vol_ratio",
+    "w_vol_ratio",
 
-    # Sweep signal (known at 10:30)
+    # Sweep signal
     "sweep_signal",
     "sweep_direction",
+
+    # Confirmation signal features
+    "reversal_progress",
+    "close_position",
 
     # Regime features (rolling, lagged -- no lookahead)
     "rolling_reversal_rate",
@@ -81,12 +84,7 @@ DIRECTIONAL_NAMES   = {0: "buy_the_dip", 1: "fade_the_high"}
 # Utilities
 # ---------------------------------------------------------------------------
 
-def load_and_validate(path: str, mode: str) -> pd.DataFrame:
-    """
-    Load feature CSV and compute derived labels.
-
-    mode: 'multiclass', 'binary', or 'directional'
-    """
+def load_and_validate(path: str, label_col: str, directional: bool = False) -> pd.DataFrame:
     df = pd.read_csv(path, parse_dates=["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
@@ -95,39 +93,22 @@ def load_and_validate(path: str, mode: str) -> pd.DataFrame:
         print(f"ERROR: Missing columns: {missing}")
         sys.exit(1)
 
-    if LABEL_COL not in df.columns:
-        print(f"ERROR: Label column '{LABEL_COL}' not found.")
+    if label_col not in df.columns:
+        print(f"ERROR: Label column '{label_col}' not found. Re-run build_feature_matrix.py to regenerate the CSV.")
         sys.exit(1)
-
-    # Compute derived labels
-    # Binary: 1 = reversal or double_sweep, 0 = trend or containment
-    df[BINARY_LABEL_COL] = df[LABEL_COL].isin([2, 3]).astype(int)
-
-    # Directional: for reversal sessions (label=2), predict direction
-    # 1 = fade_the_high (fh_high_is_session_high), 0 = buy_the_dip (fh_low_is_session_low)
-    df[DIRECTIONAL_LABEL_COL] = df["fh_high_is_session_high"]
-
-    # Determine which label column to use
-    if mode == "directional":
-        label_col = DIRECTIONAL_LABEL_COL
-    elif mode == "binary":
-        label_col = BINARY_LABEL_COL
-    else:
-        label_col = LABEL_COL
 
     before = len(df)
     df = df.dropna(subset=FEATURES + [label_col])
     dropped = before - len(df)
     if dropped:
-        print(f"Dropped {dropped} rows with nulls (rolling warmup)")
+        print(f"Dropped {dropped} rows with nulls (rolling warmup or non-directional sessions)")
 
-    if mode == "directional":
-        # Keep only reversal sessions (label=2) for directional prediction
+    if directional:
         before = len(df)
-        df = df[df[LABEL_COL] == 2].copy()
-        print(f"Directional mode: kept {len(df)} reversal sessions (dropped {before - len(df)} non-reversal)")
+        df = df[df[label_col].isin([0, 1])].copy()
+        print(f"Directional mode: kept {len(df)} reversal sessions (dropped {before - len(df)} double_sweep/trend/containment)")
 
-    return df, label_col
+    return df
 
 
 def chronological_split(df: pd.DataFrame, n_test: int):
@@ -191,25 +172,59 @@ def train(df_train: pd.DataFrame, label_col: str, binary: bool) -> xgb.XGBClassi
     )
 
     print(f"Best iteration: {model.best_iteration}  "
-          f"(val logloss: {model.best_score:.4f})")
+          f"(val mlogloss: {model.best_score:.4f})")
 
-    return model
+    # Return validation set for calibration -- not used for tree fitting
+    return model, X_val, y_val
+
+
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+def calibrate(model, X_cal, y_cal):
+    """
+    Fit an isotonic regression calibrator on top of the trained XGBoost model.
+    Uses the early-stopping validation set, which was not used for tree fitting.
+
+    Maps raw XGBoost class-1 probabilities to empirical probabilities so that
+    a predicted confidence of 0.75 actually corresponds to ~75% accuracy.
+    Returns the fitted IsotonicRegression object.
+    """
+    raw_probs = model.predict_proba(X_cal)
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(raw_probs[:, 1], y_cal.values.astype(int))
+    return iso
+
+
+def apply_calibration(model, iso: IsotonicRegression, X: pd.DataFrame):
+    """Apply calibration to get adjusted probabilities. Returns (class0_prob, class1_prob)."""
+    raw_probs = model.predict_proba(X)
+    cal_p1    = iso.predict(raw_probs[:, 1])
+    cal_p0    = 1 - cal_p1
+    return np.column_stack([cal_p0, cal_p1])
 
 
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model: xgb.XGBClassifier,
+def evaluate(model,
              df_test: pd.DataFrame,
              df_train: pd.DataFrame,
              label_col: str,
              binary: bool,
-             directional: bool = False) -> str:
+             directional: bool = False,
+             calibrated_model=None) -> str:
 
-    X_test = df_test[FEATURES]
-    y_test = df_test[label_col]
-    y_pred = model.predict(X_test)
+    X_test      = df_test[FEATURES]
+    y_test      = df_test[label_col]
+    # For predictions, use calibrated probabilities if available
+    if calibrated_model is not None:
+        cal_probs_pred = apply_calibration(model, calibrated_model, X_test)
+        y_pred = cal_probs_pred.argmax(axis=1)
+    else:
+        y_pred = model.predict(X_test)
 
     if directional:
         label_list = [0, 1]
@@ -268,6 +283,31 @@ def evaluate(model: xgb.XGBClassifier,
     lines.append(f"Baseline accuracy: {baseline_acc:.3f}  (always predict '{name_map[int(majority_class)]}')")
     lines.append(f"Lift over baseline: {model_acc - baseline_acc:+.3f}")
 
+    # Calibration quality section
+    if calibrated_model is not None:
+        raw_probs = model.predict_proba(X_test)
+        cal_probs = apply_calibration(model, calibrated_model, X_test)
+        y_arr     = y_test.values.astype(int)
+
+        raw_brier = brier_score_loss(y_arr, raw_probs[:, 1])
+        cal_brier = brier_score_loss(y_arr, cal_probs[:, 1])
+        lines.append(f"\nCalibration (Brier score -- lower is better):")
+        lines.append(f"  Raw model:   {raw_brier:.4f}")
+        lines.append(f"  Calibrated:  {cal_brier:.4f}  ({(raw_brier-cal_brier)/raw_brier*100:+.1f}%)")
+
+        confidence = cal_probs.max(axis=1)
+        predicted  = cal_probs.argmax(axis=1)
+        correct    = (predicted == y_arr)
+        lines.append(f"\nCalibrated confidence threshold analysis:")
+        lines.append(f"  {'Threshold':>10}  {'Sessions':>9}  {'Coverage':>9}  {'Accuracy':>9}")
+        lines.append("  " + "-" * 43)
+        for thr in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+            mask = confidence >= thr
+            n    = mask.sum()
+            cov  = n / len(y_arr)
+            acc  = correct[mask].mean() if n > 0 else float("nan")
+            lines.append(f"  {thr:>10.2f}  {n:>9}  {cov:>8.1%}  {acc:>8.1%}")
+
     return "\n".join(lines)
 
 
@@ -291,46 +331,50 @@ def main():
     # Infer symbol from filename
     symbol = Path(args.features).stem.replace("_features", "").upper()
 
-    # Determine mode
-    if args.directional:
-        mode = "directional"
-        mode_str = "DIRECTIONAL"
-    elif args.binary:
-        mode = "binary"
-        mode_str = "BINARY"
-    else:
-        mode = "multiclass"
-        mode_str = "4-CLASS"
-
     print(f"Loading features from {args.features}")
-    df, label_col = load_and_validate(args.features, mode)
+    _label = DIRECTIONAL_LABEL_COL if args.directional else (BINARY_LABEL_COL if args.binary else LABEL_COL)
+    df = load_and_validate(args.features, _label, directional=args.directional)
     print(f"  {len(df)} sessions loaded ({df['date'].min().date()} → {df['date'].max().date()})")
-    print(f"Mode: {mode_str}  (label column: {label_col})")
 
-    binary      = args.binary or args.directional  # both use binary classification
+    binary      = args.binary
     directional = args.directional
 
-    # Adjust test sessions for directional mode (fewer total sessions)
-    test_sessions = args.test_sessions
-    if directional and test_sessions > len(df) * 0.3:
-        test_sessions = int(len(df) * 0.25)
-        print(f"Adjusted test sessions to {test_sessions} (25% of reversal sessions)")
+    if directional:
+        label_col = DIRECTIONAL_LABEL_COL
+        mode_str  = "DIRECTIONAL"
+    elif binary:
+        label_col = BINARY_LABEL_COL
+        mode_str  = "BINARY"
+    else:
+        label_col = LABEL_COL
+        mode_str  = "4-CLASS"
+    print(f"Mode: {mode_str}  (label column: {label_col})")
 
-    print(f"\nSplitting: {len(df) - test_sessions} train / {test_sessions} test")
-    df_train, df_test = chronological_split(df, test_sessions)
+    print(f"\nSplitting: {len(df) - args.test_sessions} train / {args.test_sessions} test")
+    df_train, df_test = chronological_split(df, args.test_sessions)
 
     print("\nTraining...")
-    model = train(df_train, label_col, binary)
+    model, X_cal, y_cal = train(df_train, label_col, binary or directional)
+
+    print("\nCalibrating probabilities...")
+    calibrated = calibrate(model, X_cal, y_cal)
 
     print("\nEvaluating...")
-    report = evaluate(model, df_test, df_train, label_col, binary, directional)
+    report = evaluate(model, df_test, df_train, label_col, binary, directional,
+                      calibrated_model=calibrated)
     print("\n" + report)
 
-    # Save model
-    suffix     = "directional" if directional else ("binary" if args.binary else "multiclass")
+    # Save models
+    import pickle
+    suffix     = "directional" if directional else ("binary" if binary else "multiclass")
     model_path = out_dir / f"{symbol.lower()}_{suffix}_model.json"
     model.save_model(str(model_path))
-    print(f"\nModel saved to {model_path}")
+    print(f"\nXGBoost model saved to {model_path}")
+
+    cal_path = out_dir / f"{symbol.lower()}_{suffix}_calibrated.pkl"
+    with open(str(cal_path), "wb") as fh:
+        pickle.dump(calibrated, fh)
+    print(f"Calibrated model saved to {cal_path}")
 
     # Save report
     report_path = out_dir / f"{symbol.lower()}_{suffix}_report.txt"

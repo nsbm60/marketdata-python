@@ -16,6 +16,7 @@ Usage:
     python build_feature_matrix.py --symbol NVDA
     python build_feature_matrix.py --symbol NVDA --window 30
     python build_feature_matrix.py --symbol NVDA --all-windows
+    python build_feature_matrix.py --symbol NVDA --start 2021-01-01
 
 Dependencies:
     pip install clickhouse-connect pandas numpy python-dotenv pyzmq
@@ -55,6 +56,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 VALID_WINDOWS = [15, 30, 45, 60]
+
+# Rolling window for correlation features (sessions, not days)
+CORR_WINDOW = 60
 
 
 SESSION_AGG_SQL = """
@@ -207,11 +211,76 @@ ORDER BY fs.session_date
 """
 
 
-def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
+# Correlation SQL: daily closes for QQQ and SMH
+# We pull extra history (lookback buffer) so rolling correlation is available
+# from the start of the target symbol's date range.
+CORRELATION_SQL = """
+SELECT
+    symbol,
+    toDate(ts)          AS session_date,
+    argMax(close, ts)   AS close
+FROM stock_bars_1m
+WHERE symbol  IN ('QQQ', 'SMH')
+  AND session = 1
+  AND toDate(ts) BETWEEN %(start)s AND %(end)s
+GROUP BY symbol, session_date
+ORDER BY symbol, session_date
+"""
+
+
+def fetch_correlation_features(ch_client, start: str, end: str) -> pd.DataFrame:
+    """
+    Compute rolling 60-session correlations of the target symbol with QQQ and SMH.
+    Returns a DataFrame indexed by session_date with columns:
+        nvda_qqq_corr_60  -- rolling 60-session correlation with QQQ (lagged 1)
+        nvda_smh_corr_60  -- rolling 60-session correlation with SMH (lagged 1)
+        nvda_qqq_beta_60  -- rolling 60-session beta to QQQ (lagged 1)
+
+    Note: the correlation is computed from daily close returns, not intraday.
+    All values are lagged by 1 session so there is no lookahead.
+
+    We pull extra history before the start date to ensure the rolling window
+    is populated from session 1 of the target range.
+    """
+    # Pull from well before start to warm up the rolling window
+    import datetime
+    start_dt     = datetime.date.fromisoformat(start)
+    buffer_start = (start_dt - datetime.timedelta(days=120)).isoformat()
+
+    result = ch_client.query(
+        CORRELATION_SQL,
+        parameters={"start": buffer_start, "end": end},
+    )
+
+    df = pd.DataFrame(result.result_rows, columns=["symbol", "session_date", "close"])
+    df["session_date"] = pd.to_datetime(df["session_date"])
+    df = df.pivot(index="session_date", columns="symbol", values="close").sort_index()
+
+    missing = [s for s in ["QQQ", "SMH"] if s not in df.columns]
+    if missing:
+        log.warning(f"Correlation symbols missing from ClickHouse: {missing}. "
+                    f"Skipping correlation features.")
+        return pd.DataFrame()
+
+    # Daily returns
+    rets = df.pct_change().dropna()
+
+    # We need a target symbol return series -- build from the session_date index
+    # The caller will supply NVDA returns separately via merge.
+    # Return the benchmark returns so compute_features can merge them in.
+    return rets.rename(columns={"QQQ": "qqq_ret", "SMH": "smh_ret"})
+
+
+def compute_features(df: pd.DataFrame,
+                     window: int,
+                     benchmark_rets: pd.DataFrame = None) -> pd.DataFrame:
     """
     Compute session features using data available up to the prediction window.
 
-    window: minutes from open (15, 30, 45, or 60)
+    window:          minutes from open (15, 30, 45, or 60)
+    benchmark_rets:  DataFrame with columns [qqq_ret, smh_ret] indexed by date,
+                     from fetch_correlation_features(). Optional -- if None,
+                     correlation features are omitted.
 
     Labels are always defined relative to the full first hour (w60) extremes,
     keeping them consistent across window comparisons.
@@ -220,7 +289,7 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
 
     w        = f"w{window}"
     out      = pd.DataFrame()
-    out["date"]   = df["session_date"]
+    out["date"]   = pd.to_datetime(df["session_date"])
     out["window"] = window
     open_930 = df["open_930"]
 
@@ -251,8 +320,6 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out["w_vol_ratio"] = w_volume / avg_vol_20
 
     # --- First-15-minute sub-features ---
-    # Always from w15 regardless of prediction window.
-    # Measures how front-loaded the session was relative to the full window.
 
     f15_high   = df["w15_high"]
     f15_low    = df["w15_low"]
@@ -263,7 +330,6 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out["f15_vol_ratio"]   = f15_volume / w_volume.replace(0, float("nan"))
 
     # --- Sweep signal ---
-    # f15 makes a significant move, window closes on the opposite side of open.
 
     f15_up_ext   = f15_high - open_930
     f15_down_ext = open_930 - f15_low
@@ -278,13 +344,10 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out.loc[sweep_down, "sweep_direction"] = -1
 
     # --- Time-of-extreme features ---
-    # Minutes from open to when the window high/low was established.
-    # Available for w15 and w60; NaN for w30/w45 (would need additional SQL).
 
     if window in (15, 60):
         out["mins_to_high"] = df[f"mins_to_{w}_high"]
         out["mins_to_low"]  = df[f"mins_to_{w}_low"]
-        # Normalized: 0 = extreme at open, 1 = extreme at end of window
         out["high_timing"]  = df[f"mins_to_{w}_high"] / window
         out["low_timing"]   = df[f"mins_to_{w}_low"]  / window
     else:
@@ -294,19 +357,13 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
         out["low_timing"]   = np.nan
 
     # --- Confirmation signal features ---
-    # How much of the reversal has already happened by end of window?
 
-    # Reversal progress: how far has price retreated from the window high?
-    # 0 = price still at the high, 1 = fully retraced to the low
     out["reversal_progress"] = (w_high - w_close) / w_range.replace(0, float("nan"))
-
-    # Close position: where within the window range did the window close?
-    # 0 = closed at low (bearish), 1 = closed at high (bullish)
-    out["close_position"]    = (w_close - w_low) / w_range.replace(0, float("nan"))
+    out["close_position"]    = (w_close - w_low)  / w_range.replace(0, float("nan"))
 
     # --- Regime features (rolling, lagged -- no lookahead) ---
 
-    tol = 0.001
+    tol      = 0.001
     w60_high = df["w60_high"]
     w60_low  = df["w60_low"]
 
@@ -324,6 +381,60 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     out["directional_bias"]     = (out["rolling_high_set_rate"] - 0.5) * 2
     out["gap_regime_alignment"] = out["gap_pct"] * out["directional_bias"]
 
+    # --- Correlation / market regime features ---
+    # Rolling 60-session correlation with QQQ and SMH.
+    # High correlation = macro-driven environment.
+    # Low correlation  = idiosyncratic / stock-specific narrative.
+    # All values lagged by 1 session -- no lookahead.
+
+    if benchmark_rets is not None and not benchmark_rets.empty:
+        # Compute target symbol daily returns from session closes
+        target_ret = df["close_400"].pct_change()
+        target_ret.index = pd.to_datetime(df["session_date"].values)
+
+        # Merge benchmark returns onto target dates
+        merged = pd.DataFrame({"target": target_ret.values},
+                               index=pd.to_datetime(df["session_date"].values))
+        merged = merged.join(benchmark_rets, how="left")
+
+        # Rolling correlation -- shift(1) for no lookahead
+        nvda_qqq_corr = (
+            merged["target"].rolling(CORR_WINDOW, min_periods=20)
+            .corr(merged["qqq_ret"])
+            .shift(1)
+        )
+        nvda_smh_corr = (
+            merged["target"].rolling(CORR_WINDOW, min_periods=20)
+            .corr(merged["smh_ret"])
+            .shift(1)
+        )
+
+        # Beta to QQQ: covariance / variance (60-session rolling)
+        def rolling_beta(y, x, window):
+            cov = y.rolling(window, min_periods=20).cov(x)
+            var = x.rolling(window, min_periods=20).var()
+            return (cov / var).shift(1)
+
+        nvda_qqq_beta = rolling_beta(merged["target"], merged["qqq_ret"], CORR_WINDOW)
+
+        # Correlation regime: how far is current correlation from its own
+        # 252-session mean? Positive = more correlated than usual (macro fear).
+        corr_mean_252 = nvda_qqq_corr.rolling(252, min_periods=60).mean()
+        corr_dev      = nvda_qqq_corr - corr_mean_252
+
+        out["nvda_qqq_corr"]     = nvda_qqq_corr.values
+        out["nvda_smh_corr"]     = nvda_smh_corr.values
+        out["nvda_qqq_beta"]     = nvda_qqq_beta.values
+        out["corr_regime_dev"]   = corr_dev.values  # deviation from long-run mean
+
+        log.info("  Correlation features added.")
+    else:
+        out["nvda_qqq_corr"]   = np.nan
+        out["nvda_smh_corr"]   = np.nan
+        out["nvda_qqq_beta"]   = np.nan
+        out["corr_regime_dev"] = np.nan
+        log.warning("  Correlation features unavailable (QQQ/SMH not in ClickHouse).")
+
     # --- Labels (full session, retrospective -- same for all windows) ---
 
     w60_range = w60_high - w60_low
@@ -340,8 +451,11 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
         fh_high_is_session_high | fh_low_is_session_low,
         max_ext <= 0.75,
     ]
-    out["label"]      = pd.Series(np.select(conditions, [3, 2, 1], default=0), index=df.index)
-    out["label_name"] = out["label"].map({0: "trend", 1: "containment", 2: "reversal", 3: "double_sweep"})
+    out["label"]        = pd.Series(np.select(conditions, [3, 2, 1], default=0),
+                                     index=df.index)
+    out["label_name"]   = out["label"].map(
+        {0: "trend", 1: "containment", 2: "reversal", 3: "double_sweep"}
+    )
     out["binary_label"] = out["label"].isin([2, 3]).astype(int)
 
     directional = pd.Series(np.nan, index=df.index)
@@ -359,7 +473,7 @@ def main():
         description="Build ML feature matrix from ClickHouse bars"
     )
     parser.add_argument("--symbol",      required=True,  help="Ticker symbol, e.g. NVDA")
-    parser.add_argument("--start",       default="2023-01-01", help="Start date YYYY-MM-DD")
+    parser.add_argument("--start",       default="2021-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end",         default=date.today().isoformat(), help="End date YYYY-MM-DD")
     parser.add_argument("--window",      type=int, default=60, choices=VALID_WINDOWS,
                         help="Prediction window in minutes (default: 60)")
@@ -367,6 +481,8 @@ def main():
                         help="Produce CSVs for all four windows in one run")
     parser.add_argument("--out",         default=None,
                         help="Output CSV path (ignored with --all-windows)")
+    parser.add_argument("--no-corr",     action="store_true",
+                        help="Skip correlation features (faster, for quick iteration)")
     args = parser.parse_args()
 
     symbol  = args.symbol.upper()
@@ -387,6 +503,15 @@ def main():
         database = os.environ.get("CLICKHOUSE_DATABASE", "trading"),
     )
 
+    # --- Fetch correlation benchmarks (QQQ, SMH) ---
+    benchmark_rets = None
+    if not args.no_corr:
+        log.info("Fetching QQQ/SMH correlation data...")
+        benchmark_rets = fetch_correlation_features(ch_client, args.start, args.end)
+        if benchmark_rets.empty:
+            log.warning("No correlation data available -- continuing without it.")
+
+    # --- Fetch target symbol session aggregates ---
     log.info(f"Querying session aggregates for {symbol} ({args.start} -> {args.end})")
     result = ch_client.query(
         SESSION_AGG_SQL,
@@ -403,7 +528,7 @@ def main():
 
     for w in windows:
         log.info(f"Computing features for window={w}min...")
-        df_features = compute_features(df_raw, window=w)
+        df_features = compute_features(df_raw, window=w, benchmark_rets=benchmark_rets)
         log.info(f"  {len(df_features)} sessions after dropping warm-up rows")
 
         label_counts = df_features["label_name"].value_counts()
@@ -411,6 +536,13 @@ def main():
         for name, count in label_counts.items():
             pct = 100 * count / len(df_features)
             log.info(f"    {name:<15} {count:>4}  ({pct:.1f}%)")
+
+        # Correlation feature summary
+        if "nvda_qqq_corr" in df_features and df_features["nvda_qqq_corr"].notna().any():
+            log.info(f"  nvda_qqq_corr mean: {df_features['nvda_qqq_corr'].mean():.3f}  "
+                     f"std: {df_features['nvda_qqq_corr'].std():.3f}")
+            log.info(f"  nvda_smh_corr mean: {df_features['nvda_smh_corr'].mean():.3f}  "
+                     f"std: {df_features['nvda_smh_corr'].std():.3f}")
 
         if args.all_windows:
             out_path = f"{symbol.lower()}_features_w{w}.csv"
