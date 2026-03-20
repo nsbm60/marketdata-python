@@ -336,7 +336,7 @@ def main():
     parser.add_argument("--features",      required=True, help="Path to features CSV")
     parser.add_argument("--test-sessions", type=int, default=110,
                         help="Number of most-recent sessions to hold out for testing (default: 110)")
-    parser.add_argument("--out-dir",       default=".", help="Output directory for model and report")
+    parser.add_argument("--out-dir",       default="data", help="Output directory for model and report")
     parser.add_argument("--binary",        action="store_true", help="Use binary label (reversal vs non-reversal)")
     parser.add_argument("--directional",   action="store_true", help="Predict reversal direction: fade-the-high vs buy-the-dip (reversal sessions only)")
     args = parser.parse_args()

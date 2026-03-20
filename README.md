@@ -38,6 +38,26 @@ python tools/tick_injector.py AAPL 185.50 --bid 185.48 --ask 185.52
 python tools/tick_injector.py --simulate AAPL NVDA TSLA          # Continuous
 ```
 
+### tick_replay.py
+Replay historical Alpaca data for realistic testing.
+
+Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` environment variables.
+
+```bash
+# Bar-based replay (default: 1min bars)
+python tools/tick_replay.py AAPL NVDA --date 2024-12-30          # Specific date
+python tools/tick_replay.py AAPL --date 2024-12-30 --speed 10    # 10x speed
+python tools/tick_replay.py --watchlist --date 2024-12-30        # Active watchlist
+python tools/tick_replay.py AAPL --timeframe 5min --speed 60     # 5min bars at 60x
+
+# Tick-by-tick trades (most realistic)
+python tools/tick_replay.py AAPL --date 2024-12-30 --trades      # Every trade
+python tools/tick_replay.py AAPL --trades --speed 100            # 100x speed
+python tools/tick_replay.py AAPL --trades --limit 50000          # Cap at 50k trades
+```
+
+Note: Active symbols can have 100k+ trades per day. Use `--limit` or higher `--speed` for faster testing.
+
 ### zmq_subscriber.py
 Basic ZMQ subscriber for equity quotes.
 

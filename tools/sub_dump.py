@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-import zmq, time
+import zmq, time, sys
 
-PUB_ENDPOINT = "tcp://127.0.0.1:6006"   # must match your MarketDataPublisher bind
+# Default ports: 6006=MDS, 6020=CalcServer
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 6006
+PUB_ENDPOINT = f"tcp://127.0.0.1:{port}"
 
 ctx = zmq.Context.instance()
 sub = ctx.socket(zmq.SUB)

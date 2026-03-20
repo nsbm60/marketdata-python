@@ -481,6 +481,8 @@ def main():
                         help="Produce CSVs for all four windows in one run")
     parser.add_argument("--out",         default=None,
                         help="Output CSV path (ignored with --all-windows)")
+    parser.add_argument("--out-dir",     default="data",
+                        help="Output directory (default: data)")
     parser.add_argument("--no-corr",     action="store_true",
                         help="Skip correlation features (faster, for quick iteration)")
     args = parser.parse_args()
@@ -545,10 +547,11 @@ def main():
                      f"std: {df_features['nvda_smh_corr'].std():.3f}")
 
         if args.all_windows:
-            out_path = f"{symbol.lower()}_features_w{w}.csv"
+            out_path = Path(args.out_dir) / f"{symbol.lower()}_features_w{w}.csv"
         else:
-            out_path = args.out or f"{symbol.lower()}_features_w{w}.csv"
+            out_path = args.out or (Path(args.out_dir) / f"{symbol.lower()}_features_w{w}.csv")
 
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
         df_features.to_csv(out_path, index=False)
         log.info(f"  Written to {out_path}")
 
