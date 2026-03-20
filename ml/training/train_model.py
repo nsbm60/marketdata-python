@@ -63,12 +63,20 @@ FEATURES = [
     "rolling_high_set_rate",
     "directional_bias",
     "gap_regime_alignment",
+
+    # Correlation / market regime features (rolling 60-session, lagged)
+    # Measure how macro-driven vs idiosyncratic the current environment is.
+    # corr_regime_dev excluded -- too many nulls in early history.
+    "nvda_qqq_corr",
+    "nvda_smh_corr",
+    "nvda_qqq_beta",
 ]
 
 # Columns deliberately excluded and why:
 #   fh_high_is_session_high / fh_low_is_session_low -- used to compute the label
 #   fh_range_abs  -- redundant with fh_range_pct and fh_range_atr
-#   avg_vol_20    -- raw volume number, already normalized into fh_vol_ratio
+#   avg_vol_20    -- raw volume number, already normalized into w_vol_ratio
+#   corr_regime_dev -- 75 nulls from extended lookback; add back when dataset grows
 #   date          -- not a feature
 #   label / label_name -- target
 
@@ -96,6 +104,14 @@ def load_and_validate(path: str, label_col: str, directional: bool = False) -> p
     if label_col not in df.columns:
         print(f"ERROR: Label column '{label_col}' not found. Re-run build_feature_matrix.py to regenerate the CSV.")
         sys.exit(1)
+
+    # Fill nulls in correlation features with column median before dropping.
+    # These arise from rolling window warmup at the start of the dataset.
+    corr_features = ["nvda_qqq_corr", "nvda_smh_corr", "nvda_qqq_beta"]
+    for col in corr_features:
+        if col in df.columns and df[col].isnull().any():
+            median = df[col].median()
+            df[col] = df[col].fillna(median)
 
     before = len(df)
     df = df.dropna(subset=FEATURES + [label_col])
