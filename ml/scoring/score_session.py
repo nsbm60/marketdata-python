@@ -3,10 +3,13 @@ score_session.py
 
 ML session scorer for first-hour directional prediction.
 
-Subscribes to raw equity trades on the ZMQ market data bus, aggregates
-them into 1-minute OHLCV bars, and at the prediction window (default 10:30am)
+Subscribes to pre-built 1-minute bars from the Scala MDS (md.equity.bar.1m.*)
+and calendar events (cal.market.*). At the prediction window (default 10:30am)
 computes session features, scores the directional model, and publishes
 the prediction back onto the bus.
+
+IMPORTANT: Must be started BEFORE market open (9:30am ET). If started after
+market open, the scorer will skip today and wait for the next session.
 
 Advertises itself via UDP broadcast so the Scala layer can discover it.
 
@@ -97,7 +100,8 @@ BROADCAST_ADDR = "255.255.255.255"
 ADVERTISE_INTERVAL = 5  # seconds
 
 PREDICTION_TOPIC_PREFIX = "ml.session.prediction."
-TRADE_TOPIC_PREFIX      = "md.equity.trade."
+BAR_TOPIC_PREFIX        = "md.equity.bar.1m."
+CAL_TOPIC_PREFIX        = "cal.market."
 
 # Symbols needed for correlation features
 CORRELATION_SYMBOLS = ["QQQ"]   # SMH not in default feed; QQQ sufficient
@@ -128,79 +132,81 @@ TOP_FEATURES_TO_PUBLISH = [
 
 
 # ---------------------------------------------------------------------------
-# 1-Minute Bar Aggregator
+# 1-Minute Bar (received from Scala MDS)
 # ---------------------------------------------------------------------------
 
 class Bar:
-    """Single 1-minute OHLCV bar."""
-    __slots__ = ["ts", "open", "high", "low", "close", "volume", "trades"]
-
-    def __init__(self, ts: datetime, price: float, size: int):
-        self.ts     = ts
-        self.open   = price
-        self.high   = price
-        self.low    = price
-        self.close  = price
-        self.volume = size
-        self.trades = 1
-
-    def update(self, price: float, size: int):
-        self.high    = max(self.high, price)
-        self.low     = min(self.low,  price)
-        self.close   = price
-        self.volume += size
-        self.trades += 1
-
-    @property
-    def vwap(self) -> float:
-        # Simplified VWAP: use close as proxy within a single bar
-        # A real VWAP would require cumulative price*volume tracking
-        return self.close
-
-
-class BarAggregator:
     """
-    Aggregates raw trade prints into 1-minute bars per symbol.
-    Thread-safe for concurrent trade ingestion and bar reading.
+    Single 1-minute OHLCV bar received from Scala MDS.
+
+    Created from JSON payload:
+    {
+      "type": "bar_1m",
+      "symbol": "NVDA",
+      "data": {
+        "ts": "2026-03-28T10:30:00-04:00",
+        "open": 120.50, "high": 121.00, "low": 120.25, "close": 120.75,
+        "volume": 15000, "vwap": 120.62, "trade_count": 142, "session": "regular"
+      }
+    }
+    """
+    __slots__ = ["ts", "open", "high", "low", "close", "volume", "vwap", "trade_count", "session"]
+
+    def __init__(self, ts: datetime, open_: float, high: float, low: float,
+                 close: float, volume: int, vwap: float, trade_count: int,
+                 session: str):
+        self.ts          = ts
+        self.open        = open_
+        self.high        = high
+        self.low         = low
+        self.close       = close
+        self.volume      = volume
+        self.vwap        = vwap
+        self.trade_count = trade_count
+        self.session     = session
+
+    @classmethod
+    def from_json(cls, data: dict) -> "Bar":
+        """Create Bar from JSON payload."""
+        bar_data = data["data"]
+        ts_str = bar_data["ts"]
+        ts = datetime.fromisoformat(ts_str).astimezone(NY)
+        return cls(
+            ts          = ts,
+            open_       = float(bar_data["open"]),
+            high        = float(bar_data["high"]),
+            low         = float(bar_data["low"]),
+            close       = float(bar_data["close"]),
+            volume      = int(bar_data["volume"]),
+            vwap        = float(bar_data["vwap"]),
+            trade_count = int(bar_data["trade_count"]),
+            session     = bar_data.get("session", "regular"),
+        )
+
+
+class BarStore:
+    """
+    Stores 1-minute bars received from the Scala MDS.
+    Thread-safe for concurrent bar ingestion and reading.
     """
 
     def __init__(self):
         self._bars: dict[str, dict[datetime, Bar]] = defaultdict(dict)
         self._lock = threading.Lock()
 
-    def on_trade(self, symbol: str, price: float, size: int, ts: datetime):
-        """Ingest a trade print. ts should be timezone-aware (NY)."""
-        # Truncate to minute boundary
-        bar_ts = ts.replace(second=0, microsecond=0)
+    def add_bar(self, symbol: str, bar: Bar):
+        """Store a bar received from MDS."""
         with self._lock:
-            bars = self._bars[symbol]
-            if bar_ts in bars:
-                bars[bar_ts].update(price, size)
-            else:
-                bars[bar_ts] = Bar(bar_ts, price, size)
+            self._bars[symbol][bar.ts] = bar
 
     def get_bars(self, symbol: str) -> list[Bar]:
-        """Return sorted list of completed bars for the symbol."""
+        """Return sorted list of all bars for the symbol."""
         with self._lock:
             return sorted(self._bars[symbol].values(), key=lambda b: b.ts)
 
-    def get_session_bars(self, symbol: str,
-                          session_date: date) -> list[Bar]:
-        """Return bars for the regular session on a specific date."""
-        ro = datetime(session_date.year, session_date.month, session_date.day,
-                      9, 30, tzinfo=NY)
-        rc = datetime(session_date.year, session_date.month, session_date.day,
-                      16, 0, tzinfo=NY)
-        with self._lock:
-            return sorted(
-                [b for b in self._bars[symbol].values()
-                 if ro <= b.ts < rc],
-                key=lambda b: b.ts
-            )
-
     def get_window_bars(self, symbol: str,
-                         session_date: date,
-                         window_minutes: int) -> list[Bar]:
+                        session_date: date,
+                        window_minutes: int) -> list[Bar]:
         """Return bars within the prediction window from open."""
         ro = datetime(session_date.year, session_date.month, session_date.day,
                       9, 30, tzinfo=NY)
@@ -216,6 +222,11 @@ class BarAggregator:
         """Clear all bars (call at start of new session)."""
         with self._lock:
             self._bars.clear()
+
+    def symbol_count(self, symbol: str) -> int:
+        """Return count of bars for a symbol."""
+        with self._lock:
+            return len(self._bars[symbol])
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +451,8 @@ def compute_live_features(
     symbol: str,
     today: date,
     window_minutes: int,
-    aggregator: BarAggregator,
+    w_bars: list[Bar],
+    f15_bars: list[Bar],
     history_df: pd.DataFrame,
     prev_close: float,
     qqq_hist: pd.Series,
@@ -451,7 +463,8 @@ def compute_live_features(
 
     Uses:
       - history_df: last N completed sessions from ClickHouse
-      - today's bars from aggregator (in memory)
+      - w_bars: window bars from BarStore (pre-extracted)
+      - f15_bars: first 15-minute bars from BarStore (pre-extracted)
       - prev_close: yesterday's closing price
       - qqq_hist: QQQ close history for correlation
       - regime: dict with rolling_reversal_rate, rolling_high_set_rate,
@@ -459,10 +472,6 @@ def compute_live_features(
 
     Returns a pd.Series with all FEATURES, or None if insufficient data.
     """
-    # Get today's window bars and first-15 bars
-    w_bars   = aggregator.get_window_bars(symbol, today, window_minutes)
-    f15_bars = aggregator.get_window_bars(symbol, today, 15)
-
     if not w_bars:
         log.warning(f"No window bars for {symbol} yet")
         return None
@@ -606,13 +615,15 @@ class SessionScorer:
     Main scoring server.
 
     Lifecycle:
-      - Starts at market open (or before)
-      - Subscribes to raw trades on the ZMQ market data bus
-      - Accumulates 1-minute bars in memory
+      - MUST start BEFORE market open (9:30am ET)
+      - Subscribes to 1-minute bars (md.equity.bar.1m.*) from Scala MDS
+      - Subscribes to calendar events (cal.market.*) for open/close signals
+      - Stores bars in memory as they arrive
       - At prediction_time (10:30am NY): scores each configured symbol
       - Publishes predictions on ZMQ PUB socket
       - Advertises itself via UDP for service discovery
-      - Shuts down gracefully after predictions are published
+
+    If started after market open, skips today's session and waits for tomorrow.
     """
 
     def __init__(
@@ -627,10 +638,15 @@ class SessionScorer:
         self.model_dir      = model_dir
         self.dry_run        = dry_run
 
-        self.aggregator     = BarAggregator()
+        self.bar_store      = BarStore()
         self.models         = {}
         self._scored_today  = set()
         self._running       = False
+
+        # Market state from calendar events
+        self._market_open      = False
+        self._market_open_time: Optional[datetime] = None
+        self._skip_today       = False
 
         # ZMQ context and sockets (initialized in start())
         self._context:  Optional[zmq.Context] = None
@@ -659,14 +675,21 @@ class SessionScorer:
     def _setup_zmq(self, market_data_endpoint: str):
         self._context = zmq.Context()
 
-        # SUB socket -- subscribe to raw trades for all configured symbols
+        # SUB socket -- subscribe to 1-minute bars and calendar events
         self._sub = self._context.socket(zmq.SUB)
         self._sub.connect(market_data_endpoint)
+
+        # Subscribe to calendar events for market open/close
+        self._sub.setsockopt_string(zmq.SUBSCRIBE, CAL_TOPIC_PREFIX)
+        log.info(f"Subscribed to {CAL_TOPIC_PREFIX}*")
+
+        # Subscribe to bar topics for all configured symbols
         all_symbols = list(set(self.symbols + CORRELATION_SYMBOLS))
         for sym in all_symbols:
-            topic = f"{TRADE_TOPIC_PREFIX}{sym}"
+            topic = f"{BAR_TOPIC_PREFIX}{sym}"
             self._sub.setsockopt_string(zmq.SUBSCRIBE, topic)
             log.info(f"Subscribed to {topic}")
+
         self._sub.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
 
         # PUB socket -- publish predictions
@@ -714,12 +737,17 @@ class SessionScorer:
         # Regime features from session_labels
         regime = fetch_regime_features(ch, symbol)
 
+        # Get bars from store
+        w_bars = self.bar_store.get_window_bars(symbol, today, self.window_minutes)
+        f15_bars = self.bar_store.get_window_bars(symbol, today, 15)
+
         # Compute feature vector
         features = compute_live_features(
             symbol         = symbol,
             today          = today,
             window_minutes = self.window_minutes,
-            aggregator     = self.aggregator,
+            w_bars         = w_bars,
+            f15_bars       = f15_bars,
             history_df     = history_df,
             prev_close     = prev_close,
             qqq_hist       = qqq_hist,
@@ -821,11 +849,14 @@ class SessionScorer:
         while self._running:
             now = datetime.now(NY)
 
-            # Reset scored set at start of new day
+            # Reset state at start of new day
             if now.date() != today:
                 today = now.date()
                 self._scored_today.clear()
-                self.aggregator.clear()
+                self.bar_store.clear()
+                self._skip_today = False
+                self._market_open = False
+                self._market_open_time = None
                 log.info(f"New session: {today}")
 
             # Only process during market hours
@@ -833,12 +864,29 @@ class SessionScorer:
                 time.sleep(5)
                 continue
 
-            # Ingest incoming trade messages
+            # Late-start check: if we haven't seen market open but it's past 10am,
+            # we missed the open event -- skip today
+            if (self._market_open_time is None and
+                not self._skip_today and
+                now.hour >= 10):
+                log.warning("Started after market open -- skipping today's predictions, "
+                            "will score from tomorrow")
+                self._skip_today = True
+
+            # Ingest incoming bar/calendar messages
             try:
-                msg = self._sub.recv_string()
-                self._handle_trade_message(msg, now)
+                frames = self._sub.recv_multipart()
+                if len(frames) >= 2:
+                    topic = frames[0].decode("utf-8")
+                    payload = frames[1].decode("utf-8")
+                    self._handle_message(topic, payload)
             except zmq.Again:
                 pass  # No message -- check for scoring time
+
+            # Skip scoring if we missed market open
+            if self._skip_today:
+                time.sleep(1)
+                continue
 
             # Check if it's time to score
             if self._is_prediction_time(now):
@@ -860,33 +908,48 @@ class SessionScorer:
                 log.info("All symbols scored. Idling until market close.")
                 time.sleep(30)
 
-    def _handle_trade_message(self, msg: str, now: datetime):
-        """Parse and ingest a trade message from the market data bus."""
+    def _handle_message(self, topic: str, payload: str):
+        """Route message to appropriate handler based on topic."""
+        if topic.startswith(BAR_TOPIC_PREFIX):
+            self._handle_bar_message(topic, payload)
+        elif topic.startswith(CAL_TOPIC_PREFIX):
+            self._handle_calendar_event(topic, payload)
+
+    def _handle_bar_message(self, topic: str, payload: str):
+        """Parse and store a 1-minute bar from the Scala MDS."""
         try:
-            # Topic format: "md.equity.trade.SYMBOL {...json...}"
-            idx = msg.find("{")
-            if idx < 0:
-                return
-            json_str = msg[idx:]
-            data     = json.loads(json_str)
-
-            if data.get("type") != "trade":
+            data = json.loads(payload)
+            if data.get("type") != "bar_1m":
                 return
 
-            symbol    = data["symbol"]
-            price     = float(data["data"]["price"])
-            size      = int(data["data"]["size"])
-            ts_str    = data["data"]["timestamp"]
+            symbol = data["symbol"]
+            bar = Bar.from_json(data)
+            self.bar_store.add_bar(symbol, bar)
 
-            # Parse ISO8601 timestamp
-            ts = datetime.fromisoformat(
-                ts_str.replace("Z", "+00:00")
-            ).astimezone(NY)
-
-            self.aggregator.on_trade(symbol, price, size, ts)
+            # Log first bar of the day for each symbol
+            if self.bar_store.symbol_count(symbol) == 1:
+                log.info(f"First bar received for {symbol}: {bar.ts}")
 
         except (KeyError, ValueError, json.JSONDecodeError) as e:
-            log.debug(f"Trade parse error: {e} -- msg={msg[:80]}")
+            log.debug(f"Bar parse error: {e} -- payload={payload[:80]}")
+
+    def _handle_calendar_event(self, topic: str, payload: str):
+        """Handle calendar events (market open/close) from MDS."""
+        try:
+            data = json.loads(payload)
+            event_type = data.get("type", "")
+
+            if topic == "cal.market.open" or event_type == "open":
+                self._market_open = True
+                self._market_open_time = datetime.now(NY)
+                log.info("Market OPEN event received -- beginning bar accumulation")
+
+            elif topic == "cal.market.close" or event_type == "close":
+                self._market_open = False
+                log.info("Market CLOSE event received")
+
+        except (json.JSONDecodeError, KeyError) as e:
+            log.debug(f"Calendar event parse error: {e}")
 
     def stop(self):
         """Graceful shutdown."""
