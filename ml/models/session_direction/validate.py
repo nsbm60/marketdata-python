@@ -1,5 +1,5 @@
 """
-walk_forward.py
+validate.py
 
 Walk-forward validation of the directional session classifier.
 
@@ -8,13 +8,13 @@ up to each fold and testing on the next N sessions. Produces a fold-by-fold
 accuracy report and plots showing model consistency over time.
 
 Usage:
-    python walk_forward.py --features nvda_features_w60.csv
-    python walk_forward.py --features nvda_features_w60.csv --fold-size 20
-    python walk_forward.py --features nvda_features_w60.csv --mode directional
+    python -m ml.models.session_direction.validate --features data/features/NVDA/features_w60.csv
+    python -m ml.models.session_direction.validate --features data/features/NVDA/features_w60.csv --fold-size 20
+    python -m ml.models.session_direction.validate --features data/features/NVDA/features_w60.csv --mode directional
 
 Outputs:
-    <symbol>_walkforward_report.txt
-    <symbol>_walkforward.png
+    data/reports/{SYMBOL}/walkforward_report.txt
+    data/reports/{SYMBOL}/walkforward.png
 
 Dependencies:
     pip install xgboost scikit-learn pandas numpy matplotlib
@@ -24,6 +24,8 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -31,32 +33,26 @@ import xgboost as xgb
 from sklearn.metrics import accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
 
-# ---------------------------------------------------------------------------
-# Must match train_model.py exactly
-# ---------------------------------------------------------------------------
+# Import shared modules
+from ml.shared.features import FEATURES
+from ml.shared.constants import (
+    LABEL_COL, BINARY_LABEL_COL, DIRECTIONAL_LABEL_COL,
+    LABEL_NAMES, BINARY_NAMES, DIRECTIONAL_NAMES,
+)
+from ml.shared.paths import report_path, ensure_dirs
 
-FEATURES = [
-    "gap_pct", "prior_day_range_pct", "atr20",
-    "w_range_pct", "w_range_atr", "w_vwap_dev",
-    "f15_range_ratio", "f15_vol_ratio",
-    "w_vol_ratio",
-    "sweep_signal", "sweep_direction",
-    "reversal_progress", "close_position",
-    "rolling_reversal_rate", "rolling_high_set_rate",
-    "directional_bias", "gap_regime_alignment",
-    "target_qqq_corr", "target_smh_corr", "target_qqq_beta",
-]
-
+# Map mode names to label columns
 LABEL_COLS = {
-    "directional": "directional_label",
-    "binary":      "binary_label",
-    "multiclass":  "label",
+    "directional": DIRECTIONAL_LABEL_COL,
+    "binary":      BINARY_LABEL_COL,
+    "multiclass":  LABEL_COL,
 }
 
-LABEL_NAMES = {
-    "directional": {0: "buy_the_dip", 1: "fade_the_high"},
-    "binary":      {0: "non_reversal", 1: "reversal"},
-    "multiclass":  {0: "trend", 1: "containment", 2: "reversal", 3: "double_sweep"},
+# Map mode names to label name dictionaries
+LABEL_NAMES_MAP = {
+    "directional": DIRECTIONAL_NAMES,
+    "binary":      BINARY_NAMES,
+    "multiclass":  LABEL_NAMES,
 }
 
 # Minimum training sessions before we attempt the first fold
@@ -283,6 +279,8 @@ def plot_results(folds: list[dict], symbol: str, mode: str, out_path: str):
 
 
 def main():
+    import re
+
     parser = argparse.ArgumentParser(description="Walk-forward validation")
     parser.add_argument("--features",   required=True, help="Features CSV path")
     parser.add_argument("--mode",       default="directional",
@@ -290,18 +288,28 @@ def main():
                         help="Model mode (default: directional)")
     parser.add_argument("--fold-size",  type=int, default=20,
                         help="Sessions per test fold (default: 20 ~ 1 month)")
-    parser.add_argument("--out-dir",    default="data",
-                        help="Output directory for report and plot")
     args = parser.parse_args()
 
     label_col  = LABEL_COLS[args.mode]
     binary     = args.mode in ("directional", "binary")
     directional = args.mode == "directional"
-    symbol     = Path(args.features).stem.split("_features")[0].upper()
-    out_dir    = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Infer symbol and window from filename or path
+    features_path = Path(args.features)
+    filename = features_path.stem
+
+    # Try to extract window from filename (e.g., features_w60 -> 60)
+    match = re.search(r"_w(\d+)$", filename)
+    window = int(match.group(1)) if match else 60
+
+    # Extract symbol from parent dir or filename
+    if features_path.parent.name.upper() in ["NVDA", "AMD", "AAPL", "MSFT", "TSLA"]:
+        symbol = features_path.parent.name.upper()
+    else:
+        symbol = filename.split("_features")[0].upper()
 
     print(f"Loading {args.features}...")
+    print(f"Symbol: {symbol}, Window: {window}")
     df = load(args.features, label_col, directional)
     print(f"  {len(df)} sessions loaded "
           f"({df['date'].min().date()} -> {df['date'].max().date()})")
@@ -317,12 +325,17 @@ def main():
     report = format_report(folds, symbol, args.mode, args.fold_size)
     print("\n" + report)
 
-    report_path = out_dir / f"{symbol.lower()}_walkforward_report.txt"
-    report_path.write_text(report)
-    print(f"\nReport saved to {report_path}")
+    # Ensure output directories exist
+    ensure_dirs(symbol)
 
-    plot_path = str(out_dir / f"{symbol.lower()}_walkforward.png")
-    plot_results(folds, symbol, args.mode, plot_path)
+    # Save report using new path structure
+    report_file = report_path(symbol, "walkforward")
+    report_file.write_text(report)
+    print(f"\nReport saved to {report_file}")
+
+    # Save plot using new path structure
+    plot_file = report_path(symbol, "walkforward", "png")
+    plot_results(folds, symbol, args.mode, str(plot_file))
 
 
 if __name__ == "__main__":

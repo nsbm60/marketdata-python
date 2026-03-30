@@ -1,16 +1,17 @@
 """
-train_model.py
+train.py
 
 Train an XGBoost classifier on the session feature matrix to predict
 first-hour session type: trend / containment / reversal / double_sweep.
 
 Usage:
-    python train_model.py --features nvda_features.csv
-    python train_model.py --features nvda_features.csv --test-sessions 110
+    python -m ml.models.session_direction.train --features data/features/NVDA/features_w60.csv
+    python -m ml.models.session_direction.train --features data/features/NVDA/features_w60.csv --test-sessions 110
 
 Outputs:
-    <symbol>_model.json      -- trained XGBoost model
-    <symbol>_report.txt      -- evaluation report
+    data/models/{SYMBOL}/session_direction_w{window}.json  -- trained XGBoost model
+    data/models/{SYMBOL}/calibrated_w{window}.pkl          -- calibration model
+    data/reports/{SYMBOL}/directional_w{window}_report.txt -- evaluation report
 
 Dependencies:
     pip install xgboost scikit-learn pandas numpy
@@ -20,6 +21,8 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -27,65 +30,13 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import classification_report, confusion_matrix, brier_score_loss
 from sklearn.utils.class_weight import compute_sample_weight
 
-# ---------------------------------------------------------------------------
-# Feature configuration
-# ---------------------------------------------------------------------------
-
-# Features available by 10:30am on the session date -- no lookahead
-FEATURES = [
-    # Gap / prior session context (known at 9:30)
-    "gap_pct",
-    "prior_day_range_pct",
-    "atr20",
-
-    # Window price structure (known at 9:30 + window minutes)
-    "w_range_pct",
-    "w_range_atr",
-    "w_vwap_dev",
-
-    # First-15-minute sub-features
-    "f15_range_ratio",
-    "f15_vol_ratio",
-
-    # Volume
-    "w_vol_ratio",
-
-    # Sweep signal
-    "sweep_signal",
-    "sweep_direction",
-
-    # Confirmation signal features
-    "reversal_progress",
-    "close_position",
-
-    # Regime features (rolling, lagged -- no lookahead)
-    "rolling_reversal_rate",
-    "rolling_high_set_rate",
-    "directional_bias",
-    "gap_regime_alignment",
-
-    # Correlation / market regime features (rolling 60-session, lagged)
-    # Measure how macro-driven vs idiosyncratic the current environment is.
-    # corr_regime_dev excluded -- too many nulls in early history.
-    "target_qqq_corr",
-    "target_smh_corr",
-    "target_qqq_beta",
-]
-
-# Columns deliberately excluded and why:
-#   fh_high_is_session_high / fh_low_is_session_low -- used to compute the label
-#   fh_range_abs  -- redundant with fh_range_pct and fh_range_atr
-#   avg_vol_20    -- raw volume number, already normalized into w_vol_ratio
-#   corr_regime_dev -- 75 nulls from extended lookback; add back when dataset grows
-#   date          -- not a feature
-#   label / label_name -- target
-
-LABEL_COL           = "label"
-BINARY_LABEL_COL    = "binary_label"
-DIRECTIONAL_LABEL_COL = "directional_label"
-LABEL_NAMES         = {0: "trend", 1: "containment", 2: "reversal", 3: "double_sweep"}
-BINARY_NAMES        = {0: "non_reversal", 1: "reversal"}
-DIRECTIONAL_NAMES   = {0: "buy_the_dip", 1: "fade_the_high"}
+# Import shared modules
+from ml.shared.features import FEATURES
+from ml.shared.constants import (
+    LABEL_COL, BINARY_LABEL_COL, DIRECTIONAL_LABEL_COL,
+    LABEL_NAMES, BINARY_NAMES, DIRECTIONAL_NAMES,
+)
+from ml.shared.paths import model_path, calibration_path, report_path, ensure_dirs
 
 
 # ---------------------------------------------------------------------------
@@ -332,22 +283,35 @@ def evaluate(model,
 # ---------------------------------------------------------------------------
 
 def main():
+    import pickle
+    import re
+
     parser = argparse.ArgumentParser(description="Train XGBoost session classifier")
     parser.add_argument("--features",      required=True, help="Path to features CSV")
     parser.add_argument("--test-sessions", type=int, default=110,
                         help="Number of most-recent sessions to hold out for testing (default: 110)")
-    parser.add_argument("--out-dir",       default="data", help="Output directory for model and report")
     parser.add_argument("--binary",        action="store_true", help="Use binary label (reversal vs non-reversal)")
     parser.add_argument("--directional",   action="store_true", help="Predict reversal direction: fade-the-high vs buy-the-dip (reversal sessions only)")
     args = parser.parse_args()
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Infer symbol and window from filename or path
+    # Handles: data/features/NVDA/features_w60.csv or nvda_features_w60.csv
+    features_path = Path(args.features)
+    filename = features_path.stem
 
-    # Infer symbol from filename
-    symbol = Path(args.features).stem.replace("_features", "").upper()
+    # Try to extract window from filename (e.g., features_w60 -> 60)
+    match = re.search(r"_w(\d+)$", filename)
+    window = int(match.group(1)) if match else 60
+
+    # Extract symbol from parent dir or filename
+    if features_path.parent.name.upper() in ["NVDA", "AMD", "AAPL", "MSFT", "TSLA"]:
+        symbol = features_path.parent.name.upper()
+    else:
+        # Try to extract from filename: nvda_features_w60 -> NVDA
+        symbol = filename.replace(f"_w{window}", "").replace("features", "").replace("_", "").upper()
 
     print(f"Loading features from {args.features}")
+    print(f"Symbol: {symbol}, Window: {window}")
     _label = DIRECTIONAL_LABEL_COL if args.directional else (BINARY_LABEL_COL if args.binary else LABEL_COL)
     df = load_and_validate(args.features, _label, directional=args.directional)
     print(f"  {len(df)} sessions loaded ({df['date'].min().date()} → {df['date'].max().date()})")
@@ -380,22 +344,24 @@ def main():
                       calibrated_model=calibrated)
     print("\n" + report)
 
-    # Save models
-    import pickle
-    suffix     = "directional" if directional else ("binary" if binary else "multiclass")
-    model_path = out_dir / f"{symbol.lower()}_{suffix}_model.json"
-    model.save_model(str(model_path))
-    print(f"\nXGBoost model saved to {model_path}")
+    # Ensure output directories exist
+    ensure_dirs(symbol)
 
-    cal_path = out_dir / f"{symbol.lower()}_{suffix}_calibrated.pkl"
-    with open(str(cal_path), "wb") as fh:
+    # Save model using new path structure
+    model_file = model_path(symbol, "session_direction", window)
+    model.save_model(str(model_file))
+    print(f"\nXGBoost model saved to {model_file}")
+
+    # Save calibration model
+    cal_file = calibration_path(symbol, window)
+    with open(str(cal_file), "wb") as fh:
         pickle.dump(calibrated, fh)
-    print(f"Calibrated model saved to {cal_path}")
+    print(f"Calibrated model saved to {cal_file}")
 
     # Save report
-    report_path = out_dir / f"{symbol.lower()}_{suffix}_report.txt"
-    report_path.write_text(report)
-    print(f"Report saved to {report_path}")
+    report_file = report_path(symbol, f"directional_w{window}")
+    report_file.write_text(report)
+    print(f"Report saved to {report_file}")
 
 
 if __name__ == "__main__":

@@ -49,7 +49,6 @@ Environment variables:
     MARKET_DATA_HOST     ZMQ market data PUB host (default: discovered via UDP)
     MARKET_DATA_PORT     ZMQ market data PUB port (default: 6006)
     CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE
-    MODEL_DIR            Directory containing trained model .json files (default: data/)
 """
 
 import argparse
@@ -317,6 +316,7 @@ FROM stock_bars_1m
 WHERE symbol  = %(symbol)s
   AND session = 1
   AND toDate(ts) < today()
+GROUP BY session_date
 ORDER BY session_date DESC
 LIMIT %(n)s
 """
@@ -337,6 +337,7 @@ FROM stock_bars_1m
 WHERE symbol  = 'QQQ'
   AND session = 1
   AND toDate(ts) < today()
+GROUP BY session_date
 ORDER BY session_date DESC
 LIMIT %(n)s
 """
@@ -591,12 +592,15 @@ def compute_live_features(
 # Model loader
 # ---------------------------------------------------------------------------
 
-def load_model(symbol: str, model_dir: str) -> Optional[xgb.XGBClassifier]:
-    """Load the directional model for a symbol."""
-    path = Path(model_dir) / f"{symbol.lower()}_directional_model.json"
-    if not path.exists():
-        # Try w60 variant
-        path = Path(model_dir) / f"{symbol.lower()}_w60_directional_model.json"
+def load_model(symbol: str, window: int = 60) -> Optional[xgb.XGBClassifier]:
+    """
+    Load the directional model for a symbol using new path structure.
+
+    Looks for model at: data/models/{SYMBOL}/session_direction_w{window}.json
+    """
+    from ml.shared.paths import model_path
+
+    path = model_path(symbol, "session_direction", window)
     if not path.exists():
         log.warning(f"Model not found: {path}")
         return None
@@ -630,12 +634,10 @@ class SessionScorer:
         self,
         symbols: list[str],
         window_minutes: int,
-        model_dir: str,
         dry_run: bool = False,
     ):
         self.symbols        = symbols
         self.window_minutes = window_minutes
-        self.model_dir      = model_dir
         self.dry_run        = dry_run
 
         self.bar_store      = BarStore()
@@ -808,7 +810,7 @@ class SessionScorer:
 
         # Load models
         for sym in self.symbols:
-            model = load_model(sym, self.model_dir)
+            model = load_model(sym, self.window_minutes)
             if model:
                 self.models[sym] = model
             else:
@@ -977,8 +979,6 @@ def main():
                         help="Symbols to score (default: NVDA AMD)")
     parser.add_argument("--window",    type=int, default=60,
                         help="Prediction window minutes (default: 60)")
-    parser.add_argument("--model-dir", default="data",
-                        help="Directory containing model .json files (default: data/)")
     parser.add_argument("--dry-run",   action="store_true",
                         help="Compute and log predictions without publishing")
     args = parser.parse_args()
@@ -986,7 +986,6 @@ def main():
     scorer = SessionScorer(
         symbols        = [s.upper() for s in args.symbols],
         window_minutes = args.window,
-        model_dir      = args.model_dir,
         dry_run        = args.dry_run,
     )
 
