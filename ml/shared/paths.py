@@ -43,19 +43,24 @@ MODELS_DIR = DATA_DIR / "models"
 REPORTS_DIR = DATA_DIR / "reports"
 
 
-def features_path(symbol: str, window: int = 60) -> Path:
+def features_path(symbol: str, window: int = 60, prefix: str = "features") -> Path:
     """
     Get path to features CSV for a symbol.
 
     Args:
         symbol: Stock symbol (e.g., "NVDA")
         window: Prediction window in minutes (default: 60)
+        prefix: Filename prefix (default: "features")
 
     Returns:
-        Path to features CSV, e.g., data/features/NVDA/features_w60.csv
+        Path to features CSV.
+
+    Examples:
+        prefix="features"          -> data/features/NVDA/features_w60.csv
+        prefix="session_direction" -> data/features/NVDA/session_direction_w60.csv
     """
     symbol = symbol.upper()
-    return FEATURES_DIR / symbol / f"features_w{window}.csv"
+    return FEATURES_DIR / symbol / f"{prefix}_w{window}.csv"
 
 
 def model_path(symbol: str, model_type: str = "session_direction", window: int = 60) -> Path:

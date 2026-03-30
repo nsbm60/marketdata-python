@@ -311,6 +311,11 @@ def compute_features(df: pd.DataFrame,
     w_vwap   = df[f"{w}_vwap"]
     w_range  = w_high - w_low
 
+    # Raw price levels (needed for stage 2 models)
+    out["open_930"] = open_930
+    out["w_high"]   = w_high
+    out["w_low"]    = w_low
+
     out["w_range_pct"] = w_range / open_930
     out["w_range_atr"] = w_range / atr20
     out["w_vwap_dev"]  = (w_close - w_vwap) / w_vwap
@@ -546,12 +551,10 @@ def main():
             log.info(f"  target_smh_corr mean: {df_features['target_smh_corr'].mean():.3f}  "
                      f"std: {df_features['target_smh_corr'].std():.3f}")
 
-        if args.all_windows:
-            out_path = Path(args.out_dir) / f"{symbol.lower()}_features_w{w}.csv"
-        else:
-            out_path = args.out or (Path(args.out_dir) / f"{symbol.lower()}_features_w{w}.csv")
-
-        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+        # Use new path structure: data/features/{SYMBOL}/features_w{window}.csv
+        from ml.shared.paths import features_path, ensure_dirs
+        ensure_dirs(symbol)
+        out_path = args.out or features_path(symbol, w)
         df_features.to_csv(out_path, index=False)
         log.info(f"  Written to {out_path}")
 
