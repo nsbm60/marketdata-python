@@ -30,7 +30,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # Add parent directory to path for discovery module
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import clickhouse_connect
 from alpaca.data.historical import StockHistoricalDataClient

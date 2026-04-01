@@ -288,6 +288,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Train XGBoost session classifier")
     parser.add_argument("--features",      required=True, help="Path to features CSV")
+    parser.add_argument("--symbol",        help="Symbol (if not inferrable from path)")
     parser.add_argument("--test-sessions", type=int, default=110,
                         help="Number of most-recent sessions to hold out for testing (default: 110)")
     parser.add_argument("--binary",        action="store_true", help="Use binary label (reversal vs non-reversal)")
@@ -303,12 +304,18 @@ def main():
     match = re.search(r"_w(\d+)$", filename)
     window = int(match.group(1)) if match else 60
 
-    # Extract symbol from parent dir or filename
-    if features_path.parent.name.upper() in ["NVDA", "AMD", "AAPL", "MSFT", "TSLA"]:
-        symbol = features_path.parent.name.upper()
+    # Extract symbol: explicit arg > parent dir > filename
+    if args.symbol:
+        symbol = args.symbol.upper()
+    elif features_path.parent.name.isupper() and features_path.parent.name.isalpha():
+        # Parent directory looks like a symbol (e.g., NVDA, AMD, GOOGL)
+        symbol = features_path.parent.name
     else:
         # Try to extract from filename: nvda_features_w60 -> NVDA
         symbol = filename.replace(f"_w{window}", "").replace("features", "").replace("_", "").upper()
+        if not symbol:
+            print("ERROR: Could not determine symbol. Use --symbol argument.")
+            sys.exit(1)
 
     print(f"Loading features from {args.features}")
     print(f"Symbol: {symbol}, Window: {window}")

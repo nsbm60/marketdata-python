@@ -4,9 +4,10 @@ score_session.py
 ML session scorer for first-hour directional prediction.
 
 Subscribes to pre-built 1-minute bars from the Scala MDS (md.equity.bar.1m.*)
-and calendar events (cal.market.*). At the prediction window (default 10:30am)
-computes session features, scores the directional model, and publishes
-the prediction back onto the bus.
+and calendar events (cal.market.*). Uses per-symbol prediction windows from
+ml/config/prediction_windows.yaml. For symbols with early-fire windows (e.g., w15),
+attempts scoring at the primary window with a confidence threshold; if below
+threshold, falls back to scoring at w60. Publishes predictions back onto the bus.
 
 IMPORTANT: Must be started BEFORE market open (9:30am ET). If started after
 market open, the scorer will skip today and wait for the next session.
@@ -39,8 +40,8 @@ Prediction message format:
 
 Usage:
     python ml/scoring/score_session.py
-    python ml/scoring/score_session.py --symbols NVDA AMD --window 60
-    python ml/scoring/score_session.py --symbols NVDA --window 30 --dry-run
+    python ml/scoring/score_session.py --symbols NVDA AMD MU
+    python ml/scoring/score_session.py --symbols NVDA --dry-run
 
 Dependencies:
     pip install pyzmq xgboost pandas numpy python-dotenv
@@ -75,6 +76,7 @@ import zmq
 from dotenv import load_dotenv
 
 from discovery import ServiceLocator
+from ml.shared.config import load_prediction_config, PredictionWindowConfig
 
 load_dotenv()
 
@@ -633,22 +635,28 @@ class SessionScorer:
     def __init__(
         self,
         symbols: list[str],
-        window_minutes: int,
         dry_run: bool = False,
     ):
-        self.symbols        = symbols
-        self.window_minutes = window_minutes
-        self.dry_run        = dry_run
+        self.symbols = symbols
+        self.dry_run = dry_run
 
-        self.bar_store      = BarStore()
-        self.models         = {}
-        self._scored_today  = set()
-        self._running       = False
+        # Load per-symbol prediction window config
+        self.pred_config: PredictionWindowConfig = load_prediction_config()
+        log.info(f"Loaded prediction config with {len(self.pred_config.symbols)} symbols")
+
+        self.bar_store = BarStore()
+        # Models keyed by (symbol, window) tuple
+        self.models: dict[tuple[str, int], xgb.XGBClassifier] = {}
+        self._scored_today: set[str] = set()
+        # Symbols that attempted early-fire but didn't meet confidence threshold
+        self._early_attempted: set[str] = set()
+        self._idle_logged = False
+        self._running = False
 
         # Market state from calendar events
-        self._market_open      = False
+        self._market_open = False
         self._market_open_time: Optional[datetime] = None
-        self._skip_today       = False
+        self._skip_today = False
 
         # ZMQ context and sockets (initialized in start())
         self._context:  Optional[zmq.Context] = None
@@ -711,11 +719,21 @@ class SessionScorer:
                      f"{prediction['prediction']} "
                      f"(confidence={prediction['confidence']:.3f})")
 
-    def _score_symbol(self, symbol: str, today: date) -> Optional[dict]:
-        """Compute features and score for one symbol."""
-        model = self.models.get(symbol)
+    def _score_symbol(
+        self,
+        symbol: str,
+        today: date,
+        window_minutes: int,
+        min_confidence: float,
+    ) -> Optional[dict]:
+        """
+        Compute features and score for one symbol at a specific window.
+
+        Returns prediction dict if confidence >= min_confidence, else None.
+        """
+        model = self.models.get((symbol, window_minutes))
         if model is None:
-            log.warning(f"No model loaded for {symbol}")
+            log.warning(f"No model loaded for {symbol} w{window_minutes}")
             return None
 
         ch = self._get_ch_client()
@@ -740,14 +758,14 @@ class SessionScorer:
         regime = fetch_regime_features(ch, symbol)
 
         # Get bars from store
-        w_bars = self.bar_store.get_window_bars(symbol, today, self.window_minutes)
+        w_bars = self.bar_store.get_window_bars(symbol, today, window_minutes)
         f15_bars = self.bar_store.get_window_bars(symbol, today, 15)
 
         # Compute feature vector
         features = compute_live_features(
             symbol         = symbol,
             today          = today,
-            window_minutes = self.window_minutes,
+            window_minutes = window_minutes,
             w_bars         = w_bars,
             f15_bars       = f15_bars,
             history_df     = history_df,
@@ -765,17 +783,22 @@ class SessionScorer:
         label     = int(probs.argmax())
         confidence = float(probs.max())
 
+        # Check if confidence meets threshold
+        if confidence < min_confidence:
+            log.info(f"{symbol} w{window_minutes}: confidence {confidence:.3f} < {min_confidence:.2f} threshold")
+            return None
+
         # Build message
         now = datetime.now(NY)
         prediction = {
             "type":          "session_prediction",
             "symbol":        symbol,
             "timestamp":     now.isoformat(),
-            "window_minutes": self.window_minutes,
+            "window_minutes": window_minutes,
             "prediction":    DIRECTIONAL_NAMES[label],
             "label":         label,
             "confidence":    round(confidence, 4),
-            "model_version": f"{symbol.lower()}_directional_model",
+            "model_version": f"{symbol.lower()}_directional_model_w{window_minutes}",
             "features":      {k: round(float(features[k]), 6)
                                for k in TOP_FEATURES_TO_PUBLISH
                                if k in features},
@@ -783,10 +806,10 @@ class SessionScorer:
 
         return prediction
 
-    def _is_prediction_time(self, now: datetime) -> bool:
+    def _is_prediction_time(self, now: datetime, window_minutes: int) -> bool:
         """Check if it's time to score (within 30s after prediction window close)."""
-        target_hour   = 9 + self.window_minutes // 60
-        target_minute = 30 + self.window_minutes % 60
+        target_hour   = 9 + window_minutes // 60
+        target_minute = 30 + window_minutes % 60
         if target_minute >= 60:
             target_hour += 1
             target_minute -= 60
@@ -795,6 +818,16 @@ class SessionScorer:
             now.minute == target_minute and
             now.second < 30
         )
+
+    def _get_unique_windows(self) -> set[int]:
+        """Get all unique prediction windows needed for configured symbols."""
+        windows = set()
+        for sym in self.symbols:
+            cfg = self.pred_config.get(sym)
+            windows.add(cfg.window_minutes)
+            if cfg.fallback_window:
+                windows.add(cfg.fallback_window)
+        return windows
 
     def _is_market_hours(self, now: datetime) -> bool:
         """Check if we're in or near regular session hours."""
@@ -808,13 +841,20 @@ class SessionScorer:
         """Start the scoring server."""
         self._running = True
 
-        # Load models
+        # Load models for all required windows per symbol
         for sym in self.symbols:
-            model = load_model(sym, self.window_minutes)
-            if model:
-                self.models[sym] = model
-            else:
-                log.warning(f"No model for {sym} -- will skip scoring")
+            cfg = self.pred_config.get(sym)
+            windows_needed = [cfg.window_minutes]
+            if cfg.fallback_window and cfg.fallback_window != cfg.window_minutes:
+                windows_needed.append(cfg.fallback_window)
+
+            for w in windows_needed:
+                model = load_model(sym, w)
+                if model:
+                    self.models[(sym, w)] = model
+                    log.info(f"Loaded model for {sym} w{w}")
+                else:
+                    log.warning(f"No model for {sym} w{w}")
 
         if not self.models and not self.dry_run:
             log.error("No models loaded -- exiting")
@@ -838,8 +878,13 @@ class SessionScorer:
         )
         self._advertiser.start()
 
+        # Log per-symbol config
+        for sym in self.symbols:
+            cfg = self.pred_config.get(sym)
+            fb = f" -> w{cfg.fallback_window}" if cfg.fallback_window else ""
+            log.info(f"  {sym}: w{cfg.window_minutes} @ {cfg.confidence_threshold:.0%}{fb}")
+
         log.info(f"Session scorer started. Symbols: {self.symbols}  "
-                 f"Window: {self.window_minutes}min  "
                  f"{'DRY RUN' if self.dry_run else 'LIVE'}")
 
         self._run_loop()
@@ -855,10 +900,12 @@ class SessionScorer:
             if now.date() != today:
                 today = now.date()
                 self._scored_today.clear()
+                self._early_attempted.clear()
                 self.bar_store.clear()
                 self._skip_today = False
                 self._market_open = False
                 self._market_open_time = None
+                self._idle_logged = False
                 log.info(f"New session: {today}")
 
             # Only process during market hours
@@ -890,24 +937,67 @@ class SessionScorer:
                 time.sleep(1)
                 continue
 
-            # Check if it's time to score
-            if self._is_prediction_time(now):
-                unsettled = [s for s in self.symbols
-                             if s not in self._scored_today]
-                for symbol in unsettled:
-                    log.info(f"Scoring {symbol} at window={self.window_minutes}min")
+            # Check each unique window time
+            for window in self._get_unique_windows():
+                if not self._is_prediction_time(now, window):
+                    continue
+
+                # Find symbols whose primary window is this window (early-fire)
+                for symbol in self.symbols:
+                    if symbol in self._scored_today:
+                        continue
+                    cfg = self.pred_config.get(symbol)
+                    if cfg.window_minutes != window:
+                        continue
+                    if symbol in self._early_attempted:
+                        continue  # Already tried early, waiting for fallback
+
+                    log.info(f"Scoring {symbol} at w{window} (early-fire, threshold={cfg.confidence_threshold})")
                     try:
-                        prediction = self._score_symbol(symbol, today)
+                        prediction = self._score_symbol(
+                            symbol, today, window, cfg.confidence_threshold
+                        )
                         if prediction:
                             self._publish_prediction(symbol, prediction)
                             self._scored_today.add(symbol)
+                        elif cfg.fallback_window:
+                            log.info(f"{symbol}: early-fire below threshold, will retry at w{cfg.fallback_window}")
+                            self._early_attempted.add(symbol)
+                        else:
+                            # No fallback, must publish anyway with lower threshold
+                            log.info(f"{symbol}: no fallback, scoring with 0.5 threshold")
+                            prediction = self._score_symbol(symbol, today, window, 0.5)
+                            if prediction:
+                                self._publish_prediction(symbol, prediction)
+                            self._scored_today.add(symbol)
                     except Exception as e:
-                        log.error(f"Scoring failed for {symbol}: {e}",
-                                  exc_info=True)
+                        log.error(f"Scoring failed for {symbol}: {e}", exc_info=True)
+
+                # Find symbols whose fallback window is this window
+                for symbol in self.symbols:
+                    if symbol in self._scored_today:
+                        continue
+                    if symbol not in self._early_attempted:
+                        continue  # Didn't attempt early or doesn't have fallback
+                    cfg = self.pred_config.get(symbol)
+                    if cfg.fallback_window != window:
+                        continue
+
+                    log.info(f"Scoring {symbol} at w{window} (fallback)")
+                    try:
+                        # Fallback uses lower threshold (0.5) - always publish
+                        prediction = self._score_symbol(symbol, today, window, 0.5)
+                        if prediction:
+                            self._publish_prediction(symbol, prediction)
+                        self._scored_today.add(symbol)
+                    except Exception as e:
+                        log.error(f"Fallback scoring failed for {symbol}: {e}", exc_info=True)
 
             # If all symbols scored, idle until end of day
             if len(self._scored_today) == len(self.symbols):
-                log.info("All symbols scored. Idling until market close.")
+                if not hasattr(self, '_idle_logged'):
+                    log.info("All symbols scored. Idling until market close.")
+                    self._idle_logged = True
                 time.sleep(30)
 
     def _handle_message(self, topic: str, payload: str):
@@ -977,16 +1067,13 @@ def main():
     parser = argparse.ArgumentParser(description="ML session scoring server")
     parser.add_argument("--symbols",   nargs="+", default=["NVDA", "AMD"],
                         help="Symbols to score (default: NVDA AMD)")
-    parser.add_argument("--window",    type=int, default=60,
-                        help="Prediction window minutes (default: 60)")
     parser.add_argument("--dry-run",   action="store_true",
                         help="Compute and log predictions without publishing")
     args = parser.parse_args()
 
     scorer = SessionScorer(
-        symbols        = [s.upper() for s in args.symbols],
-        window_minutes = args.window,
-        dry_run        = args.dry_run,
+        symbols = [s.upper() for s in args.symbols],
+        dry_run = args.dry_run,
     )
 
     import signal
