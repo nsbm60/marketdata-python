@@ -73,7 +73,7 @@ regular AS (
         vwap,
         toHour(ts)              AS hr,
         toMinute(ts)            AS mn
-    FROM stock_bars_1m
+    FROM stock_bar_1m
     WHERE symbol    = %(symbol)s
       AND session   = 1
       AND toDate(ts) BETWEEN %(start)s AND %(end)s
@@ -219,7 +219,7 @@ SELECT
     symbol,
     toDate(ts)          AS session_date,
     argMax(close, ts)   AS close
-FROM stock_bars_1m
+FROM stock_bar_1m
 WHERE symbol  IN ('QQQ', 'SMH')
   AND session = 1
   AND toDate(ts) BETWEEN %(start)s AND %(end)s

@@ -96,7 +96,7 @@ log = logging.getLogger(__name__)
 
 INTRADAY_BARS_SQL = """
 SELECT ts, open, high, low, close, volume
-FROM stock_bars_1m
+FROM stock_bar_1m
 WHERE symbol     = %(symbol)s
   AND session    = 1
   AND toDate(ts) = %(session_date)s
@@ -113,7 +113,7 @@ FROM (
         toDate(ts)                    AS session_date,
         max(high) - min(low)          AS session_range,
         sum(volume)                   AS session_volume
-    FROM stock_bars_1m
+    FROM stock_bar_1m
     WHERE symbol   = %(symbol)s
       AND session  = 1
       AND toDate(ts) < %(session_date)s

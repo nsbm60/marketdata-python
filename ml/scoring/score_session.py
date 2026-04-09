@@ -9,8 +9,10 @@ ml/config/prediction_windows.yaml. For symbols with early-fire windows (e.g., w1
 attempts scoring at the primary window with a confidence threshold; if below
 threshold, falls back to scoring at w60. Publishes predictions back onto the bus.
 
-IMPORTANT: Must be started BEFORE market open (9:30am ET). If started after
-market open, the scorer will skip today and wait for the next session.
+NOTE: Can be started after market open as long as the prediction window hasn't
+passed. Health check backfills any missing bars from Alpaca. If started after
+the latest prediction window (w60 = 10:30am ET), skips today and waits for
+tomorrow.
 
 Advertises itself via UDP broadcast so the Scala layer can discover it.
 
@@ -40,8 +42,9 @@ Prediction message format:
 
 Usage:
     python ml/scoring/score_session.py
-    python ml/scoring/score_session.py --symbols NVDA AMD MU
-    python ml/scoring/score_session.py --symbols NVDA --dry-run
+    python ml/scoring/score_session.py --dry-run
+
+Symbols are fetched automatically from MDS "trading_universe" list at startup.
 
 Dependencies:
     pip install pyzmq xgboost pandas numpy python-dotenv
@@ -76,7 +79,7 @@ import zmq
 from dotenv import load_dotenv
 
 from discovery import ServiceLocator
-from ml.shared.config import load_prediction_config, PredictionWindowConfig
+from ml.shared.config import load_prediction_config, PredictionWindowConfig, fetch_symbol_list
 
 load_dotenv()
 
@@ -130,6 +133,11 @@ TOP_FEATURES_TO_PUBLISH = [
     "w_vwap_dev", "sweep_direction", "close_position",
     "directional_bias", "target_qqq_corr",
 ]
+
+# Health check settings
+HEALTH_CHECK_LOOKBACK_DAYS = 30   # How far back to check
+MIN_BARS_PER_SESSION       = 200  # Minimum bars for a complete session
+                                  # (accounts for early closes, halts)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +322,7 @@ SELECT
     min(low)                                AS session_low,
     sum(volume)                             AS session_volume,
     argMin(open, ts)                        AS open_930
-FROM stock_bars_1m
+FROM stock_bar_1m
 WHERE symbol  = %(symbol)s
   AND session = 1
   AND toDate(ts) < today()
@@ -325,7 +333,7 @@ LIMIT %(n)s
 
 PRIOR_CLOSE_SQL = """
 SELECT argMax(close, ts) AS prev_close
-FROM stock_bars_1m
+FROM stock_bar_1m
 WHERE symbol  = %(symbol)s
   AND session = 1
   AND toDate(ts) = %(prev_date)s
@@ -335,7 +343,7 @@ QQQ_HISTORY_SQL = """
 SELECT
     toDate(ts)          AS session_date,
     argMax(close, ts)   AS close
-FROM stock_bars_1m
+FROM stock_bar_1m
 WHERE symbol  = 'QQQ'
   AND session = 1
   AND toDate(ts) < today()
@@ -634,10 +642,9 @@ class SessionScorer:
 
     def __init__(
         self,
-        symbols: list[str],
         dry_run: bool = False,
     ):
-        self.symbols = symbols
+        self.symbols: list[str] = []  # Populated in start() from MDS
         self.dry_run = dry_run
 
         # Load per-symbol prediction window config
@@ -651,7 +658,11 @@ class SessionScorer:
         # Symbols that attempted early-fire but didn't meet confidence threshold
         self._early_attempted: set[str] = set()
         self._idle_logged = False
+        self._eod_done = False
         self._running = False
+
+        # Prediction log for outcome tracking
+        self._prediction_log: dict[str, dict] = {}  # symbol -> prediction dict
 
         # Market state from calendar events
         self._market_open = False
@@ -681,6 +692,285 @@ class SessionScorer:
                 database = os.environ.get("CLICKHOUSE_DATABASE", "trading"),
             )
         return self._ch_client
+
+    # -----------------------------------------------------------------------
+    # Startup Health Check
+    # -----------------------------------------------------------------------
+
+    def _startup_health_check(self, ch_client) -> None:
+        """
+        Verify session labels are complete for all symbols.
+
+        Bar backfill is now handled by MDS at startup (BarGapDetector).
+        This method only checks and backfills session_labels.
+
+        Checks from HEALTH_CHECK_LOOKBACK_DAYS ago through today.
+        """
+        today      = date.today()
+        start_date = today - timedelta(days=HEALTH_CHECK_LOOKBACK_DAYS)
+
+        # Get trading calendar from SPY session_labels
+        trading_days = self._get_trading_days(ch_client, start_date, today)
+        if not trading_days:
+            log.warning("Could not determine trading calendar -- skipping health check")
+            return
+
+        log.info(f"Health check: {len(trading_days)} trading days from "
+                 f"{start_date} to {today}")
+
+        # Check bar data status (MDS handles backfill, we just log)
+        all_symbols = list(set(self.symbols + CORRELATION_SYMBOLS))
+        for symbol in all_symbols:
+            gaps = self._find_gaps(ch_client, symbol, trading_days)
+            if gaps:
+                # MDS should have filled these - log for visibility
+                log.warning(f"{symbol}: {len(gaps)} gap days (MDS should have filled): "
+                           f"{gaps[:5]}{'...' if len(gaps) > 5 else ''}")
+            else:
+                log.info(f"{symbol}: bar data complete")
+
+        # Check session labels for scored symbols only
+        for symbol in self.symbols:
+            self._check_and_backfill_labels(ch_client, symbol, trading_days)
+
+    def _get_trading_days(
+        self, ch_client, start_date: date, end_date: date
+    ) -> list[date]:
+        """Get list of trading days using SPY session_labels as calendar."""
+        result = ch_client.query(
+            """
+            SELECT DISTINCT session_date
+            FROM session_labels
+            WHERE symbol         = 'SPY'
+              AND window_minutes = 60
+              AND session_date  >= %(start_date)s
+              AND session_date  <= %(end_date)s
+            ORDER BY session_date
+            """,
+            parameters={
+                "start_date": start_date.isoformat(),
+                "end_date":   end_date.isoformat(),
+            }
+        )
+        days = [row[0] for row in result.result_rows]
+
+        # Add today if it's a weekday and not already in the list
+        if (end_date.weekday() < 5 and
+            end_date not in days):
+            days.append(end_date)
+
+        return sorted(days)
+
+    def _find_gaps(
+        self, ch_client, symbol: str, trading_days: list[date]
+    ) -> list[date]:
+        """
+        Find trading days where bar data is missing or incomplete.
+        Returns list of dates that need backfill.
+        """
+        today      = date.today()
+        start_date = min(trading_days)
+        end_date   = today  # include today's partial session
+
+        # Get actual bar counts per session
+        result = ch_client.query(
+            """
+            SELECT
+                toDate(ts)  AS session_date,
+                count()     AS bar_count
+            FROM stock_bar_1m
+            WHERE symbol      = %(symbol)s
+              AND session     = 1
+              AND toDate(ts) >= %(start_date)s
+              AND toDate(ts) <= %(end_date)s
+            GROUP BY session_date
+            ORDER BY session_date
+            """,
+            parameters={
+                "symbol":     symbol,
+                "start_date": start_date.isoformat(),
+                "end_date":   end_date.isoformat(),
+            }
+        )
+
+        actual = {row[0]: row[1] for row in result.result_rows}
+
+        gaps = []
+        now  = datetime.now(NY)
+
+        for day in trading_days:
+            bar_count = actual.get(day, 0)
+
+            # For today's partial session, compute expected bars so far
+            if day == today and now.hour < 16:
+                minutes_elapsed = max(0,
+                    (now.hour - 9) * 60 + now.minute - 30
+                )
+                expected = min(minutes_elapsed, 390)
+                # Allow 10% tolerance for today's partial session
+                min_bars = max(1, int(expected * 0.90))
+            else:
+                # Completed sessions: expect ~390 bars
+                # Allow for early closes (minimum 200 bars)
+                min_bars = MIN_BARS_PER_SESSION
+
+            if bar_count < min_bars:
+                gaps.append(day)
+
+        return gaps
+
+    # NOTE: _backfill_symbol() removed - MDS now handles bar backfill via BarGapDetector
+
+    def _check_and_backfill_labels(
+        self, ch_client, symbol: str, trading_days: list[date]
+    ) -> None:
+        """
+        Check session_labels for completeness and compute any missing labels.
+        Only covers completed sessions (not today).
+        """
+        from ml.etl.label_session import compute_and_write_label
+
+        yesterday = date.today() - timedelta(days=1)
+        while yesterday.weekday() >= 5:
+            yesterday -= timedelta(days=1)
+
+        completed_days = [d for d in trading_days if d <= yesterday]
+        if not completed_days:
+            return
+
+        start_date = min(completed_days)
+
+        result = ch_client.query(
+            """
+            SELECT DISTINCT session_date
+            FROM session_labels
+            WHERE symbol         = %(symbol)s
+              AND window_minutes = 60
+              AND session_date  >= %(start_date)s
+            ORDER BY session_date
+            """,
+            parameters={
+                "symbol":     symbol,
+                "start_date": start_date.isoformat(),
+            }
+        )
+        existing_labels = {row[0] for row in result.result_rows}
+
+        missing = [d for d in completed_days if d not in existing_labels]
+        if not missing:
+            log.info(f"{symbol}: session labels complete")
+            return
+
+        log.info(f"{symbol}: computing {len(missing)} missing session labels")
+        for session_date in missing:
+            try:
+                compute_and_write_label(ch_client, symbol, session_date)
+            except Exception as e:
+                log.warning(f"Failed to compute label for {symbol} "
+                            f"{session_date}: {e}")
+
+    def _score_from_history(self, session_date: date) -> None:
+        """
+        Score today's session using backfilled bars from ClickHouse.
+
+        Called when scorer starts after the prediction window has passed.
+        Fetches bars from ClickHouse, populates the BarStore, then scores
+        each symbol using its configured window and publishes predictions.
+        """
+        ch = self._get_ch_client()
+
+        # Fetch today's regular session bars for all required symbols
+        all_symbols = list(set(self.symbols + CORRELATION_SYMBOLS))
+
+        log.info(f"Loading bars from ClickHouse for {len(all_symbols)} symbols...")
+
+        for symbol in all_symbols:
+            result = ch.query(
+                """
+                SELECT ts, open, high, low, close, volume, vwap, trade_count, session
+                FROM stock_bar_1m
+                WHERE symbol    = %(symbol)s
+                  AND session   = 1
+                  AND toDate(ts) = %(session_date)s
+                ORDER BY ts
+                """,
+                parameters={
+                    "symbol":       symbol,
+                    "session_date": session_date.isoformat(),
+                }
+            )
+
+            bar_count = 0
+            for row in result.result_rows:
+                ts_raw, open_, high, low, close, volume, vwap, trade_count, session = row
+                # Convert timestamp to datetime with NY timezone
+                if isinstance(ts_raw, datetime):
+                    ts = ts_raw.replace(tzinfo=NY) if ts_raw.tzinfo is None \
+                         else ts_raw.astimezone(NY)
+                else:
+                    ts = datetime.fromisoformat(str(ts_raw)).astimezone(NY)
+
+                bar = Bar(
+                    ts          = ts,
+                    open_       = float(open_),
+                    high        = float(high),
+                    low         = float(low),
+                    close       = float(close),
+                    volume      = int(volume),
+                    vwap        = float(vwap) if vwap else 0.0,
+                    trade_count = int(trade_count) if trade_count else 0,
+                    session     = "regular",
+                )
+                self.bar_store.add_bar(symbol, bar)
+                bar_count += 1
+
+            if bar_count > 0:
+                log.info(f"  {symbol}: loaded {bar_count} bars from ClickHouse")
+            else:
+                log.warning(f"  {symbol}: no bars found for {session_date}")
+
+        # Now score each symbol using its configured window
+        log.info("Scoring symbols from backfilled bars...")
+
+        for symbol in self.symbols:
+            if symbol in self._scored_today:
+                continue
+
+            cfg = self.pred_config.get(symbol)
+
+            # Try primary window first
+            window = cfg.window_minutes
+            bar_count = self.bar_store.symbol_count(symbol)
+            window_bars = self.bar_store.get_window_bars(symbol, session_date, window)
+
+            if len(window_bars) < window - 5:
+                # Not enough bars for this window, try fallback
+                if cfg.fallback_window:
+                    log.info(f"{symbol}: only {len(window_bars)} bars for w{window}, "
+                             f"trying fallback w{cfg.fallback_window}")
+                    window = cfg.fallback_window
+                    window_bars = self.bar_store.get_window_bars(
+                        symbol, session_date, window
+                    )
+
+            log.info(f"Scoring {symbol} at w{window} ({len(window_bars)} bars)")
+
+            try:
+                # Use lower threshold for historical scoring (0.5)
+                prediction = self._score_symbol(symbol, session_date, window, 0.5)
+                if prediction:
+                    self._publish_prediction(symbol, prediction)
+                    self._scored_today.add(symbol)
+                else:
+                    log.warning(f"{symbol}: scoring returned no prediction")
+                    self._scored_today.add(symbol)  # Mark as done anyway
+            except Exception as e:
+                log.error(f"Historical scoring failed for {symbol}: {e}",
+                          exc_info=True)
+                self._scored_today.add(symbol)  # Mark as done to avoid retry
+
+        scored_count = len(self._scored_today)
+        log.info(f"Historical scoring complete: {scored_count}/{len(self.symbols)} symbols")
 
     def _setup_zmq(self, market_data_endpoint: str):
         self._context = zmq.Context()
@@ -714,10 +1004,13 @@ class SessionScorer:
         if self.dry_run:
             log.info(f"[DRY RUN] Would publish to {topic}: {payload}")
         else:
-            self._pub.send_string(f"{topic} {payload}")
+            self._pub.send_string(topic, zmq.SNDMORE)
+            self._pub.send_string(payload)
             log.info(f"Published prediction for {symbol}: "
                      f"{prediction['prediction']} "
                      f"(confidence={prediction['confidence']:.3f})")
+        # Log for outcome tracking
+        self._log_prediction(symbol, prediction)
 
     def _score_symbol(
         self,
@@ -788,17 +1081,60 @@ class SessionScorer:
             log.info(f"{symbol} w{window_minutes}: confidence {confidence:.3f} < {min_confidence:.2f} threshold")
             return None
 
+        # Compute window aggregates for context
+        w_agg = bars_to_agg(w_bars)
+        w_high = w_agg["high"]
+        w_low = w_agg["low"]
+        w_range = w_high - w_low
+        open_930 = w_bars[0].open
+
+        # Compute entry quality (how much opportunity remains)
+        close_position = float(features["close_position"])
+        entry_quality = close_position if label == 1 else (1.0 - close_position)
+
+        # Build trade levels based on prediction
+        if label == 1:  # fade_the_high
+            entry_zone = (w_high - w_range * 0.1, w_high)
+            target = w_low + w_range * 0.2
+            stop = w_high + w_range * 0.15
+        else:  # buy_the_dip
+            entry_zone = (w_low, w_low + w_range * 0.1)
+            target = w_high - w_range * 0.2
+            stop = w_low - w_range * 0.15
+
         # Build message
-        now = datetime.now(NY)
+        window_close = datetime(today.year, today.month, today.day,
+                                9, 30, tzinfo=NY) + timedelta(minutes=window_minutes)
+        market_close = datetime(today.year, today.month, today.day,
+                                16, 0, tzinfo=NY)
+
         prediction = {
             "type":          "session_prediction",
             "symbol":        symbol,
-            "timestamp":     now.isoformat(),
+            "timestamp":     window_close.isoformat(),
             "window_minutes": window_minutes,
             "prediction":    DIRECTIONAL_NAMES[label],
             "label":         label,
             "confidence":    round(confidence, 4),
+            "entry_quality": round(entry_quality, 4),
             "model_version": f"{symbol.lower()}_directional_model_w{window_minutes}",
+            "session_context": {
+                "open_930":       round(open_930, 2),
+                "first_hour_high": round(w_high, 2),
+                "first_hour_low":  round(w_low, 2),
+                "first_hour_range": round(w_range, 2),
+                "close_position":  round(close_position, 4),
+            },
+            "trade_levels": {
+                "entry_low":  round(entry_zone[0], 2),
+                "entry_high": round(entry_zone[1], 2),
+                "target":     round(target, 2),
+                "stop":       round(stop, 2),
+            },
+            "validity": {
+                "expires": market_close.isoformat(),
+                "session_date": today.isoformat(),
+            },
             "features":      {k: round(float(features[k]), 6)
                                for k in TOP_FEATURES_TO_PUBLISH
                                if k in features},
@@ -841,6 +1177,32 @@ class SessionScorer:
         """Start the scoring server."""
         self._running = True
 
+        # Discover market data service first (needed for symbol list and bar subscription)
+        log.info("Discovering market data service...")
+        md_endpoint = ServiceLocator.wait_for_service(
+            ServiceLocator.MARKET_DATA, timeout_sec=60
+        )
+        market_data_url = md_endpoint.pubSub if hasattr(md_endpoint, 'pubSub') \
+                          else f"tcp://{md_endpoint.host}:6006"
+        router_url = md_endpoint.router if hasattr(md_endpoint, 'router') \
+                     else f"tcp://{md_endpoint.host}:6007"
+
+        # Fetch symbol list from MDS
+        log.info("Fetching trading universe from MDS...")
+        try:
+            self.symbols = fetch_symbol_list(router_url, "trading_universe")
+            log.info(f"Trading universe: {self.symbols}")
+        except RuntimeError as e:
+            log.error(f"Failed to fetch symbol list: {e}")
+            log.error("Cannot start scorer without symbol list")
+            return
+
+        # Run startup health check (backfill any missing bars/labels)
+        log.info("Running startup health check...")
+        ch = self._get_ch_client()
+        self._startup_health_check(ch)
+        log.info("Health check complete.")
+
         # Load models for all required windows per symbol
         for sym in self.symbols:
             cfg = self.pred_config.get(sym)
@@ -859,14 +1221,6 @@ class SessionScorer:
         if not self.models and not self.dry_run:
             log.error("No models loaded -- exiting")
             return
-
-        # Discover market data service
-        log.info("Discovering market data service...")
-        md_endpoint = ServiceLocator.wait_for_service(
-            ServiceLocator.MARKET_DATA, timeout_sec=60
-        )
-        market_data_url = md_endpoint.pubSub if hasattr(md_endpoint, 'pubSub') \
-                          else f"tcp://{md_endpoint.host}:6006"
 
         self._setup_zmq(market_data_url)
 
@@ -887,10 +1241,31 @@ class SessionScorer:
         log.info(f"Session scorer started. Symbols: {self.symbols}  "
                  f"{'DRY RUN' if self.dry_run else 'LIVE'}")
 
-        self._run_loop()
+        # Start bar ingestion in background thread
+        threading.Thread(target=self._bar_ingestion_loop, daemon=True).start()
 
-    def _run_loop(self):
-        """Main event loop."""
+        # Run scoring loop in main thread
+        self._scoring_loop()
+
+    def _bar_ingestion_loop(self):
+        """Continuously receive and store bars from ZMQ. Runs in background thread."""
+        log.info("Bar ingestion thread started")
+        while self._running:
+            try:
+                frames = self._sub.recv_multipart()
+                if len(frames) >= 2:
+                    topic = frames[0].decode("utf-8")
+                    payload = frames[1].decode("utf-8")
+                    self._handle_message(topic, payload)
+            except zmq.Again:
+                pass  # Timeout, loop continues
+            except Exception as e:
+                if self._running:
+                    log.warning(f"Bar ingestion error: {e}")
+        log.info("Bar ingestion thread stopped")
+
+    def _scoring_loop(self):
+        """Check scoring conditions and end-of-day. Can sleep freely."""
         today = date.today()
 
         while self._running:
@@ -906,6 +1281,7 @@ class SessionScorer:
                 self._market_open = False
                 self._market_open_time = None
                 self._idle_logged = False
+                self._eod_done = False
                 log.info(f"New session: {today}")
 
             # Only process during market hours
@@ -913,24 +1289,24 @@ class SessionScorer:
                 time.sleep(5)
                 continue
 
-            # Late-start check: if we haven't seen market open but it's past 10am,
-            # we missed the open event -- skip today
+            # Late-start check: if we missed market open, score from backfilled bars
+            market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
             if (self._market_open_time is None and
-                not self._skip_today and
-                now.hour >= 10):
-                log.warning("Started after market open -- skipping today's predictions, "
-                            "will score from tomorrow")
-                self._skip_today = True
-
-            # Ingest incoming bar/calendar messages
-            try:
-                frames = self._sub.recv_multipart()
-                if len(frames) >= 2:
-                    topic = frames[0].decode("utf-8")
-                    payload = frames[1].decode("utf-8")
-                    self._handle_message(topic, payload)
-            except zmq.Again:
-                pass  # No message -- check for scoring time
+                now >= market_open_time and
+                len(self._scored_today) == 0):
+                # Assume market opened at 9:30 if we missed the open event
+                self._market_open_time = market_open_time
+                # Check if latest prediction window (w60 = 10:30) has passed
+                latest_window = max(self._get_unique_windows())
+                prediction_cutoff = self._market_open_time + timedelta(minutes=latest_window)
+                if now > prediction_cutoff:
+                    # Score from backfilled ClickHouse bars
+                    log.info(f"Prediction window (w{latest_window}) passed -- "
+                             "scoring from backfilled bars")
+                    self._score_from_history(today)
+                else:
+                    log.info(f"Late start but prediction window still open "
+                             f"(w{latest_window} at {prediction_cutoff.strftime('%H:%M')})")
 
             # Skip scoring if we missed market open
             if self._skip_today:
@@ -993,12 +1369,19 @@ class SessionScorer:
                     except Exception as e:
                         log.error(f"Fallback scoring failed for {symbol}: {e}", exc_info=True)
 
+            # Time-based EOD fallback: trigger at 4:05pm if cal.market.close was missed
+            if (now.hour == 16 and now.minute >= 5 and not self._eod_done):
+                log.info("4:05pm ET reached -- triggering EOD flush (calendar event fallback)")
+                self._end_of_day()
+
             # If all symbols scored, idle until end of day
             if len(self._scored_today) == len(self.symbols):
-                if not hasattr(self, '_idle_logged'):
+                if not self._idle_logged:
                     log.info("All symbols scored. Idling until market close.")
                     self._idle_logged = True
                 time.sleep(30)
+            else:
+                time.sleep(1)  # Check scoring conditions every second
 
     def _handle_message(self, topic: str, payload: str):
         """Route message to appropriate handler based on topic."""
@@ -1016,6 +1399,11 @@ class SessionScorer:
 
             symbol = data["symbol"]
             bar = Bar.from_json(data)
+
+            # Only store regular session bars
+            if bar.session != "regular":
+                return
+
             self.bar_store.add_bar(symbol, bar)
 
             # Log first bar of the day for each symbol
@@ -1039,9 +1427,169 @@ class SessionScorer:
             elif topic == "cal.market.close" or event_type == "close":
                 self._market_open = False
                 log.info("Market CLOSE event received")
+                self._end_of_day()
 
         except (json.JSONDecodeError, KeyError) as e:
             log.debug(f"Calendar event parse error: {e}")
+
+    def _end_of_day(self):
+        """
+        End-of-day processing: flush accumulated bars to ClickHouse.
+
+        Called when market close event is received. Writes all bars
+        accumulated during the session to the stock_bar_1m table.
+        """
+        if self._eod_done:
+            return
+        self._eod_done = True
+
+        today = date.today()
+        ch = self._get_ch_client()
+
+        all_symbols = list(set(self.symbols + CORRELATION_SYMBOLS))
+        total_bars = 0
+
+        for symbol in all_symbols:
+            bars = self.bar_store.get_bars(symbol)
+            if not bars:
+                continue
+
+            # Filter to regular session bars only
+            regular_bars = [b for b in bars if b.session == "regular"]
+
+            rows = []
+            for bar in regular_bars:
+                rows.append([
+                    symbol,
+                    bar.ts,
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.volume,
+                    bar.vwap,
+                    bar.trade_count,
+                    1,  # session = regular
+                ])
+
+            if rows:
+                ch.insert(
+                    "stock_bar_1m",
+                    rows,
+                    column_names=[
+                        "symbol", "ts", "open", "high", "low", "close",
+                        "volume", "vwap", "trade_count", "session"
+                    ],
+                )
+                total_bars += len(rows)
+                log.info(f"  {symbol}: flushed {len(rows)} bars to ClickHouse")
+
+        log.info(f"End-of-day: flushed {total_bars} total bars for {today}")
+
+        # Update prediction outcomes
+        self._update_prediction_outcomes(today)
+
+    def _log_prediction(self, symbol: str, prediction: dict):
+        """
+        Log a prediction for later outcome tracking.
+
+        Stores prediction in memory; outcome is updated at EOD.
+        """
+        self._prediction_log[symbol] = {
+            "prediction": prediction.copy(),
+            "logged_at": datetime.now(NY).isoformat(),
+        }
+        log.debug(f"Logged prediction for {symbol}")
+
+    def _update_prediction_outcomes(self, session_date: date):
+        """
+        Update prediction outcomes at end of day.
+
+        Computes actual session high/low, determines if prediction was correct,
+        and writes results to ClickHouse prediction_log table.
+        """
+        if not self._prediction_log:
+            return
+
+        ch = self._get_ch_client()
+        rows = []
+
+        for symbol, entry in self._prediction_log.items():
+            pred = entry["prediction"]
+            bars = self.bar_store.get_bars(symbol)
+
+            if not bars:
+                log.warning(f"No bars for {symbol} -- cannot compute outcome")
+                continue
+
+            # Compute session high/low from all bars
+            session_high = max(b.high for b in bars)
+            session_low = min(b.low for b in bars)
+            session_close = bars[-1].close
+
+            # Get first-hour levels from prediction
+            ctx = pred.get("session_context", {})
+            fh_high = ctx.get("first_hour_high", 0)
+            fh_low = ctx.get("first_hour_low", 0)
+
+            # Determine actual outcome
+            fh_high_is_session_high = abs(fh_high - session_high) < 0.01
+            fh_low_is_session_low = abs(fh_low - session_low) < 0.01
+
+            # Predicted direction
+            predicted_label = pred.get("label", -1)
+
+            # Actual direction (1 = fade_the_high, 0 = buy_the_dip)
+            if fh_high_is_session_high and not fh_low_is_session_low:
+                actual_label = 1  # fade_the_high
+            elif fh_low_is_session_low and not fh_high_is_session_high:
+                actual_label = 0  # buy_the_dip
+            else:
+                actual_label = -1  # not a clean reversal
+
+            correct = (predicted_label == actual_label) if actual_label >= 0 else None
+
+            rows.append([
+                symbol,
+                session_date,
+                pred.get("window_minutes", 60),
+                predicted_label,
+                pred.get("prediction", ""),
+                pred.get("confidence", 0),
+                actual_label,
+                DIRECTIONAL_NAMES.get(actual_label, "none"),
+                1 if correct else (0 if correct is False else None),
+                fh_high,
+                fh_low,
+                session_high,
+                session_low,
+                session_close,
+                pred.get("timestamp", ""),
+            ])
+
+            outcome_str = "CORRECT" if correct else ("WRONG" if correct is False else "N/A")
+            log.info(f"  {symbol}: predicted={pred.get('prediction')} "
+                     f"actual={DIRECTIONAL_NAMES.get(actual_label, 'none')} "
+                     f"outcome={outcome_str}")
+
+        if rows:
+            try:
+                ch.insert(
+                    "prediction_log",
+                    rows,
+                    column_names=[
+                        "symbol", "session_date", "window_minutes",
+                        "predicted_label", "predicted_direction", "confidence",
+                        "actual_label", "actual_direction", "correct",
+                        "fh_high", "fh_low", "session_high", "session_low",
+                        "session_close", "prediction_timestamp",
+                    ],
+                )
+                log.info(f"Logged {len(rows)} prediction outcomes to ClickHouse")
+            except Exception as e:
+                log.warning(f"Failed to write prediction outcomes: {e}")
+
+        self._prediction_log.clear()
 
     def stop(self):
         """Graceful shutdown."""
@@ -1065,14 +1613,11 @@ class SessionScorer:
 
 def main():
     parser = argparse.ArgumentParser(description="ML session scoring server")
-    parser.add_argument("--symbols",   nargs="+", default=["NVDA", "AMD"],
-                        help="Symbols to score (default: NVDA AMD)")
     parser.add_argument("--dry-run",   action="store_true",
                         help="Compute and log predictions without publishing")
     args = parser.parse_args()
 
     scorer = SessionScorer(
-        symbols = [s.upper() for s in args.symbols],
         dry_run = args.dry_run,
     )
 

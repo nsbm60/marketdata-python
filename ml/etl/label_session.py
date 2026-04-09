@@ -78,7 +78,7 @@ regular AS (
         volume,
         toHour(ts)              AS hr,
         toMinute(ts)            AS mn
-    FROM stock_bars_1m
+    FROM stock_bar_1m
     WHERE symbol    = %(symbol)s
       AND session   = 1
       AND toDate(ts) BETWEEN %(start)s AND %(end)s
@@ -228,6 +228,35 @@ def write_to_clickhouse(ch_client, df: pd.DataFrame, symbol: str, window: int):
     )
 
     log.info(f"Written {len(rows)} label rows for {symbol} to session_labels")
+
+
+def compute_and_write_label(
+    ch_client, symbol: str, session_date: date, window: int = 60
+) -> None:
+    """
+    Compute and write a single session label to ClickHouse.
+
+    Used by the scorer's startup health check to backfill missing labels.
+    """
+    if window not in VALID_WINDOWS:
+        raise ValueError(f"Invalid window: {window}. Must be one of {VALID_WINDOWS}")
+
+    window_filter = WINDOW_FILTERS[window]
+    sql = SESSION_SQL.format(window_filter=window_filter)
+
+    result = ch_client.query(sql, parameters={
+        "symbol": symbol,
+        "start": session_date.isoformat(),
+        "end": session_date.isoformat(),
+    })
+
+    if not result.result_rows:
+        log.warning(f"No bar data for {symbol} on {session_date}")
+        return
+
+    df = pd.DataFrame(result.result_rows, columns=result.column_names)
+    df = label_sessions(df)
+    write_to_clickhouse(ch_client, df, symbol, window)
 
 
 def print_distribution(df: pd.DataFrame, window: int):

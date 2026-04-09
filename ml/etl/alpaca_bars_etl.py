@@ -59,9 +59,9 @@ REGULAR_END_HOUR = 16
 REGULAR_END_MINUTE = 0
 
 CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS stock_bars_1m (
+CREATE TABLE IF NOT EXISTS stock_bar_1m (
     symbol      LowCardinality(String),
-    ts          DateTime64(3, 'America/New_York'),
+    ts          DateTime64(3, 'UTC'),
     open        Float64,
     high        Float64,
     low         Float64,
@@ -95,7 +95,7 @@ def classify_session(ts: datetime) -> int:
 def get_last_stored_ts(ch_client, symbol: str) -> datetime | None:
     """Return the most recent timestamp already stored for this symbol, or None."""
     result = ch_client.query(
-        "SELECT max(ts) FROM stock_bars_1m WHERE symbol = %(symbol)s",
+        "SELECT max(ts) FROM stock_bar_1m WHERE symbol = %(symbol)s",
         parameters={"symbol": symbol},
     )
     val = result.first_item.get("max(ts)")
@@ -180,7 +180,7 @@ def pull_and_insert(
 
 def _insert_batch(ch_client, batch: list) -> None:
     ch_client.insert(
-        "stock_bars_1m",
+        "stock_bar_1m",
         batch,
         column_names=[
             "symbol", "ts", "open", "high", "low", "close",
@@ -203,7 +203,7 @@ def validate(ch_client, symbol: str, start: date, end: date) -> None:
             countIf(session = 1) / count(DISTINCT toDate(ts)) AS avg_regular_per_day,
             min(ts)                                         AS earliest,
             max(ts)                                         AS latest
-        FROM stock_bars_1m
+        FROM stock_bar_1m
         WHERE symbol = %(symbol)s
           AND toDate(ts) BETWEEN %(start)s AND %(end)s
         """,
@@ -221,7 +221,7 @@ def validate(ch_client, symbol: str, start: date, end: date) -> None:
     gap_result = ch_client.query(
         """
         SELECT toDate(ts) AS session_date, countIf(session = 1) AS regular_count
-        FROM stock_bars_1m
+        FROM stock_bar_1m
         WHERE symbol = %(symbol)s
           AND toDate(ts) BETWEEN %(start)s AND %(end)s
           AND toDayOfWeek(ts) NOT IN (6, 7)   -- exclude weekends
@@ -283,7 +283,7 @@ def main():
 
     # Ensure table exists
     ch_client.command(CREATE_TABLE_SQL)
-    log.info("Table stock_bars_1m ready")
+    log.info("Table stock_bar_1m ready")
 
     # Resumption: advance start date if data already exists
     last_ts = get_last_stored_ts(ch_client, symbol)

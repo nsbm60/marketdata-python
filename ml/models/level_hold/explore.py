@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 # SQL to get intraday bars after 10:30am for a session
 INTRADAY_SQL = """
 SELECT ts, open, high, low, close, volume
-FROM stock_bars_1m
+FROM stock_bar_1m
 WHERE symbol       = %(symbol)s
   AND session      = 1
   AND toDate(ts)   = %(session_date)s
