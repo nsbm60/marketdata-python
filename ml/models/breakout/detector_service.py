@@ -20,7 +20,7 @@ import zmq
 
 from discovery.service_locator import ServiceLocator
 from ml.shared.config import fetch_symbol_list
-from ml.shared.mds_client import get_bars, get_prior_session
+from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
 
 from ml.models.breakout.bar_aggregator import Bar5m, Bar5mAggregator
 from ml.models.breakout.ema_ribbon import EMARibbon
@@ -183,23 +183,22 @@ class BreakoutDetector:
             except Exception as e:
                 log.warning(f"Failed to fetch prior session for {symbol}: {e}")
 
-    def _warmup_from_history(self):
-        """Warm up indicators from today's bars fetched from MDS."""
-        # Use ET date explicitly
+    def _warmup_levels(self):
+        """Warm up LevelTracker from today's 5m bars fetched from MDS.
+
+        Indicator state comes from MDS via subscribe_with_backfill —
+        do not recompute locally.
+        """
         today_et = datetime.now(NY).date()
 
         for symbol in self.symbols:
             try:
-                # Fetch today's bars from MDS
-                bars_1m = get_bars(self._mds_router_url, symbol, bar_date=today_et, session=1)
+                bars = get_bars(self._mds_router_url, symbol,
+                                bar_date=today_et, period="5m", session=1)
 
-                if not bars_1m:
-                    log.debug(f"{symbol}: no MDS bars for warmup")
+                if not bars:
+                    log.debug(f"{symbol}: no 5m bars for level warmup")
                     continue
-
-                first_ts = bars_1m[0].ts.strftime("%H:%M")
-                last_ts = bars_1m[-1].ts.strftime("%H:%M")
-                log.info(f"{symbol}: fetched {len(bars_1m)} 1m bars ({first_ts}-{last_ts})")
 
                 # Re-initialize level tracker with prior session data
                 self.levels[symbol] = LevelTracker(
@@ -211,35 +210,63 @@ class BreakoutDetector:
                 )
 
                 # Track session open from first bar
-                if self.session_open[symbol] is None:
-                    self.session_open[symbol] = bars_1m[0].open
+                if self.session_open[symbol] is None and bars:
+                    self.session_open[symbol] = bars[0].open
                     if self.prior_close[symbol] is not None:
                         self.gap_pct[symbol] = (
-                            (bars_1m[0].open - self.prior_close[symbol])
+                            (bars[0].open - self.prior_close[symbol])
                             / self.prior_close[symbol]
                         )
 
-                # Feed bars through aggregator
-                bar5m_count = 0
-                for bar in bars_1m:
-                    bar5m = self.aggregators[symbol].add_bar(bar)
-                    if bar5m is not None:
-                        self._update_indicators(symbol, bar5m)
-                        bar5m_count += 1
+                # Replay 5m bars through level tracker only
+                for bar in bars:
+                    bar5m = Bar5m(
+                        ts=bar.ts, open=bar.open, high=bar.high,
+                        low=bar.low, close=bar.close, volume=bar.volume,
+                        vwap=bar.vwap,
+                    )
+                    self.levels[symbol].update(bar5m)
+                    self.volume_calcs[symbol].update(bar.volume)
 
-                if bar5m_count == 0:
-                    log.debug(f"{symbol}: no complete 5m bars for warmup")
-                    continue
-
-                ribbon = self.ribbons[symbol]
-                atr_val = self.atr_calcs[symbol].value or 0.0
-                log.info(f"{symbol}: warmed up with {bar5m_count} 5m bars "
-                         f"(ribbon={ribbon.state.value}, is_warm={ribbon.is_warm}, "
-                         f"high_age={self.levels[symbol].high_age_minutes()}min, "
-                         f"atr={atr_val:.2f})")
+                log.info(f"{symbol}: warmed levels from {len(bars)} 5m bars "
+                         f"(high_age={self.levels[symbol].high_age_minutes()}min)")
 
             except Exception as e:
-                log.warning(f"Failed to warmup {symbol}: {e}")
+                log.warning(f"Failed to warmup levels for {symbol}: {e}")
+
+    def _warmup_indicators(self):
+        """Seed indicator state from MDS via subscribe_with_backfill.
+
+        ZMQ SUB topics must already be subscribed (done in _setup_zmq)
+        before this is called — per subscribe_with_backfill ADR.
+        """
+        for symbol in self.symbols:
+            try:
+                snapshot = subscribe_with_backfill(
+                    self._mds_router_url, symbol, "indicators", timeframe="5m"
+                )
+                if snapshot and snapshot.get("ok"):
+                    snap = snapshot["snapshot"]
+                    state = self.indicators[symbol]
+                    ema = snap.get("ema", {})
+                    atr = snap.get("atr", {})
+                    state.ema10        = ema.get("ema10")
+                    state.ema15        = ema.get("ema15")
+                    state.ema20        = ema.get("ema20")
+                    state.ema25        = ema.get("ema25")
+                    state.ema30        = ema.get("ema30")
+                    state.ribbon_state = ema.get("ribbon_state", "WARMING")
+                    state.ema_warm     = ema.get("warm", False)
+                    state.atr          = atr.get("atr")
+                    state.atr_warm     = atr.get("warm", False)
+                    state.seq          = snapshot.get("seq", 0)
+                    log.info(f"{symbol} indicator snapshot: ribbon={state.ribbon_state} "
+                             f"warm={state.ema_warm} atr={state.atr:.4f if state.atr else 'N/A'}")
+                else:
+                    error = snapshot.get("error", "unknown") if snapshot else "timeout"
+                    log.warning(f"{symbol}: subscribe_with_backfill failed: {error}")
+            except Exception as e:
+                log.warning(f"Failed to seed indicators for {symbol}: {e}")
 
     def _setup_zmq(self, market_data_endpoint: str):
         """Setup ZMQ sockets.
