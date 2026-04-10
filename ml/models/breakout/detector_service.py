@@ -314,10 +314,18 @@ class BreakoutDetector:
 
     def _handle_message(self, topic: str, payload: str):
         """Route incoming ZMQ message."""
-        if topic.startswith(BAR_TOPIC_PREFIX):
-            symbol = topic[len(BAR_TOPIC_PREFIX):]
+        if topic.startswith(BAR_5M_TOPIC_PREFIX):
+            symbol = topic[len(BAR_5M_TOPIC_PREFIX):]
             if symbol in self.symbols:
-                self._handle_bar(symbol, payload)
+                self._handle_bar_5m(symbol, payload)
+        elif topic.startswith(IND_EMA_TOPIC_PREFIX):
+            symbol = topic[len(IND_EMA_TOPIC_PREFIX):]
+            if symbol in self.symbols:
+                self._handle_ema(symbol, payload)
+        elif topic.startswith(IND_ATR_TOPIC_PREFIX):
+            symbol = topic[len(IND_ATR_TOPIC_PREFIX):]
+            if symbol in self.symbols:
+                self._handle_atr(symbol, payload)
         elif topic.startswith(CAL_TOPIC_PREFIX):
             self._handle_calendar(topic, payload)
 
