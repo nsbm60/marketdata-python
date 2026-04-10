@@ -246,7 +246,11 @@ class BreakoutDetector:
                 log.warning(f"Failed to warmup {symbol}: {e}")
 
     def _setup_zmq(self, market_data_endpoint: str):
-        """Setup ZMQ sockets."""
+        """Setup ZMQ sockets.
+
+        Subscribes to all topics BEFORE any RPC calls — required by the
+        subscribe_with_backfill ADR for gap-free indicator seeding.
+        """
         self._context = zmq.Context()
         self._sub = self._context.socket(zmq.SUB)
         self._sub.connect(market_data_endpoint)
@@ -254,13 +258,14 @@ class BreakoutDetector:
         # Subscribe to calendar events
         self._sub.setsockopt_string(zmq.SUBSCRIBE, CAL_TOPIC_PREFIX)
 
-        # Subscribe to bars for all symbols
+        # Subscribe to 5m bars and indicators for all symbols
         for symbol in self.symbols:
-            topic = f"{BAR_TOPIC_PREFIX}{symbol}"
-            self._sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+            self._sub.setsockopt_string(zmq.SUBSCRIBE, f"{BAR_5M_TOPIC_PREFIX}{symbol}")
+            self._sub.setsockopt_string(zmq.SUBSCRIBE, f"{IND_EMA_TOPIC_PREFIX}{symbol}")
+            self._sub.setsockopt_string(zmq.SUBSCRIBE, f"{IND_ATR_TOPIC_PREFIX}{symbol}")
 
         self._sub.setsockopt(zmq.RCVTIMEO, 100)
-        log.info(f"Subscribed to {len(self.symbols)} symbols")
+        log.info(f"Subscribed to {len(self.symbols)} symbols (5m bars + EMA + ATR)")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
