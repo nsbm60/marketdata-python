@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from ml.models.breakout.bar_aggregator import Bar5m
+from ml.models.breakout.bar_aggregator import Bar
 from ml.models.breakout.ema_ribbon import RibbonState
 
 
@@ -72,7 +72,7 @@ class BreakoutConditionChecker:
     def check_long_breakout(
         self,
         symbol: str,
-        bar5m: Bar5m,
+        bar5m: Bar,
         level_price: float,
         level_age_minutes: int,
         ribbon_state: RibbonState,
@@ -165,7 +165,7 @@ class BreakoutConditionChecker:
     def check_short_breakout(
         self,
         symbol: str,
-        bar5m: Bar5m,
+        bar5m: Bar,
         level_price: float,
         level_age_minutes: int,
         ribbon_state: RibbonState,

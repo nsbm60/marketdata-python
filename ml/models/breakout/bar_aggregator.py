@@ -25,7 +25,7 @@ class Bar1m(Protocol):
 
 
 @dataclass(slots=True)
-class Bar5m:
+class Bar:
     """5-minute OHLCV bar aggregated from 1-minute bars."""
     ts: datetime  # Start of the 5-minute period in ET
     open: float
@@ -36,7 +36,7 @@ class Bar5m:
     vwap: float
 
 
-class Bar5mAggregator:
+class BarAggregator:
     """
     Aggregates 1-minute bars into 5-minute bars.
 
@@ -51,9 +51,9 @@ class Bar5mAggregator:
         self.timeframe = timeframe_minutes
         self._current_period: Optional[datetime] = None
         self._pending_bars: list[Bar1m] = []
-        self._completed_bars: list[Bar5m] = []
+        self._completed_bars: list[Bar] = []
 
-    def add_bar(self, bar: Bar1m) -> Optional[Bar5m]:
+    def add_bar(self, bar: Bar1m) -> Optional[Bar]:
         """
         Add a 1-minute bar. Returns completed 5m bar if period boundary crossed.
 
@@ -82,13 +82,13 @@ class Bar5mAggregator:
         self._pending_bars = [bar]
         return completed
 
-    def get_bars(self, n: Optional[int] = None) -> list[Bar5m]:
+    def get_bars(self, n: Optional[int] = None) -> list[Bar]:
         """Return list of completed 5-minute bars (oldest first)."""
         if n is None:
             return list(self._completed_bars)
         return self._completed_bars[-n:] if n > 0 else []
 
-    def get_last_bar(self) -> Optional[Bar5m]:
+    def get_last_bar(self) -> Optional[Bar]:
         """Return the most recently completed 5-minute bar."""
         return self._completed_bars[-1] if self._completed_bars else None
 
@@ -112,7 +112,7 @@ class Bar5mAggregator:
         minute = ts.minute - (ts.minute % self.timeframe)
         return ts.replace(minute=minute, second=0, microsecond=0)
 
-    def _finalize_period(self) -> Optional[Bar5m]:
+    def _finalize_period(self) -> Optional[Bar]:
         """Convert pending 1-minute bars into a completed 5-minute bar."""
         if not self._pending_bars:
             return None
@@ -132,7 +132,7 @@ class Bar5mAggregator:
         else:
             vwap = close_price
 
-        bar5m = Bar5m(
+        bar5m = Bar(
             ts=self._current_period,
             open=open_price,
             high=high_price,

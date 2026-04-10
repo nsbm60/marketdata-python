@@ -7,7 +7,7 @@ Tracks session high/low levels and their age for breakout detection.
 from datetime import datetime
 from typing import Optional
 
-from ml.models.breakout.bar_aggregator import Bar5m
+from ml.models.breakout.bar_aggregator import Bar
 
 
 class LevelTracker:
@@ -44,7 +44,7 @@ class LevelTracker:
         self._last_bar_ts: Optional[datetime] = None
         self._bar_count: int = 0
 
-    def update(self, bar5m: Bar5m) -> None:
+    def update(self, bar5m: Bar) -> None:
         """
         Update levels with new 5-minute bar.
 
@@ -96,13 +96,13 @@ class LevelTracker:
         """Bars since session low was established."""
         return self.low_age_minutes() // self.timeframe
 
-    def is_new_high(self, bar5m: Bar5m) -> bool:
+    def is_new_high(self, bar5m: Bar) -> bool:
         """Check if bar made a new session high."""
         if self._high_price is None:
             return True
         return bar5m.high > self._high_price
 
-    def is_new_low(self, bar5m: Bar5m) -> bool:
+    def is_new_low(self, bar5m: Bar) -> bool:
         """Check if bar made a new session low."""
         if self._low_price is None:
             return True

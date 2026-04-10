@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from ml.models.breakout.bar_aggregator import Bar5m
+from ml.models.breakout.bar_aggregator import Bar
 
 EMA_PERIODS = [10, 15, 20, 25, 30]
 
@@ -76,7 +76,7 @@ class EMARibbon:
         self._current_state: RibbonState = RibbonState.TRANSITIONAL
         self._state_age: int = 0
 
-    def update(self, bar5m: Bar5m) -> dict[int, float]:
+    def update(self, bar5m: Bar) -> dict[int, float]:
         """
         Update all EMAs with new 5-minute bar close.
 

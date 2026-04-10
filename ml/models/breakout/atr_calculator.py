@@ -8,7 +8,7 @@ Also includes volume average calculator for volume ratio.
 from collections import deque
 from typing import Optional
 
-from ml.models.breakout.bar_aggregator import Bar5m
+from ml.models.breakout.bar_aggregator import Bar
 
 
 class ATRCalculator:
@@ -27,7 +27,7 @@ class ATRCalculator:
         self._atr: Optional[float] = None
         self._count = 0
 
-    def update(self, bar5m: Bar5m) -> Optional[float]:
+    def update(self, bar5m: Bar) -> Optional[float]:
         """
         Update ATR with new bar.
 

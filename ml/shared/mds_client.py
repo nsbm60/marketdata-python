@@ -17,7 +17,7 @@ NY = ZoneInfo("America/New_York")
 
 
 @dataclass
-class Bar1m:
+class BarRecord:
     """1-minute bar data."""
     ts: datetime
     open: float
@@ -48,7 +48,7 @@ def get_bars(
     period: str = "1m",
     session: int = 1,
     timeout_ms: int = 5000,
-) -> list[Bar1m]:
+) -> list[BarRecord]:
     """
     Fetch bars from MDS via ZMQ RPC.
 
@@ -60,7 +60,7 @@ def get_bars(
         timeout_ms: Request timeout in milliseconds
 
     Returns:
-        List of Bar1m objects in chronological order
+        List of BarRecord objects in chronological order
 
     Raises:
         RuntimeError: If MDS unreachable or returns error
@@ -101,7 +101,7 @@ def get_bars(
                     ts = datetime.fromisoformat(ts_str)
                 ts = ts.astimezone(NY)
 
-                bars.append(Bar1m(
+                bars.append(BarRecord(
                     ts=ts,
                     open=bar["open"],
                     high=bar["high"],

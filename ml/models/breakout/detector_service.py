@@ -22,7 +22,7 @@ from discovery.service_locator import ServiceLocator
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
 
-from ml.models.breakout.bar_aggregator import Bar5m
+from ml.models.breakout.bar_aggregator import Bar
 from ml.models.breakout.ema_ribbon import RibbonState
 from ml.models.breakout.atr_calculator import VolumeAverageCalculator
 from ml.models.breakout.level_tracker import LevelTracker
@@ -244,7 +244,7 @@ class BreakoutDetector:
 
                 # Replay 5m bars through level tracker only
                 for bar in bars:
-                    bar5m = Bar5m(
+                    bar5m = Bar(
                         ts=bar.ts, open=bar.open, high=bar.high,
                         low=bar.low, close=bar.close, volume=bar.volume,
                         vwap=bar.vwap,
@@ -367,7 +367,7 @@ class BreakoutDetector:
                 bar_data["ts"].replace("Z", "+00:00")
             ).astimezone(NY)
 
-            bar5m = Bar5m(
+            bar5m = Bar(
                 ts=ts,
                 open=float(bar_data["open"]),
                 high=float(bar_data["high"]),
@@ -472,7 +472,7 @@ class BreakoutDetector:
         self._fetch_prior_session_data()
         self._warmup_indicators()
 
-    def _check_breakout(self, symbol: str, bar5m: Bar5m):
+    def _check_breakout(self, symbol: str, bar5m: Bar):
         """Check for breakout conditions using MDS indicator state."""
         ind = self.indicators[symbol]
         levels = self.levels[symbol]
