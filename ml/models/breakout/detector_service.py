@@ -450,22 +450,24 @@ class BreakoutDetector:
             log.warning(f"Error processing calendar: {e}")
 
     def _reset_session_state(self):
-        """Reset state for new trading session."""
+        """Reset state for new trading session.
+
+        Does not call _warmup_levels() — at market open the new session
+        has no 5m bars yet. Level state rebuilds naturally from incoming bars.
+        """
         log.info("Resetting session state")
         self._today = datetime.now(NY).date()
         self._signals_today.clear()
 
         for symbol in self.symbols:
-            self.aggregators[symbol].clear()
-            self.ribbons[symbol].reset()
+            self.indicators[symbol] = IndicatorState()
             self.levels[symbol].clear()
-            self.atr_calcs[symbol].reset()
             self.volume_calcs[symbol].reset()
             self.session_open[symbol] = None
             self.gap_pct[symbol] = 0.0
 
-        # Refresh prior session data
         self._fetch_prior_session_data()
+        self._warmup_indicators()
 
     def _check_breakout(self, symbol: str, bar5m: Bar5m):
         """Check for breakout conditions using MDS indicator state."""
