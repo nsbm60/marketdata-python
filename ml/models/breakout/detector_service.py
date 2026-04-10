@@ -321,55 +321,89 @@ class BreakoutDetector:
         elif topic.startswith(CAL_TOPIC_PREFIX):
             self._handle_calendar(topic, payload)
 
-    def _handle_bar(self, symbol: str, payload: str):
-        """Process incoming 1-minute bar."""
+    def _handle_bar_5m(self, symbol: str, payload: str):
+        """Process completed 5m bar from MDS."""
         try:
             data = json.loads(payload)
             bar_data = data["data"]
 
-            # Parse timestamp (comes in ISO format with offset)
-            raw_ts = bar_data["ts"]
-            ts = datetime.fromisoformat(raw_ts).astimezone(NY)
-
-            # Skip non-regular session
             session = bar_data.get("session", "regular")
             if session != "regular":
                 return
 
-            # Create bar object
-            class Bar:
-                pass
-            bar = Bar()
-            bar.ts = ts
-            bar.open = float(bar_data["open"])
-            bar.high = float(bar_data["high"])
-            bar.low = float(bar_data["low"])
-            bar.close = float(bar_data["close"])
-            bar.volume = int(bar_data["volume"])
-            bar.vwap = float(bar_data["vwap"])
+            ts = datetime.fromisoformat(
+                bar_data["ts"].replace("Z", "+00:00")
+            ).astimezone(NY)
 
-            log.debug(f"1m bar: {symbol} {ts.strftime('%H:%M')} C={bar.close:.2f}")
+            bar5m = Bar5m(
+                ts=ts,
+                open=float(bar_data["open"]),
+                high=float(bar_data["high"]),
+                low=float(bar_data["low"]),
+                close=float(bar_data["close"]),
+                volume=int(bar_data["volume"]),
+                vwap=float(bar_data.get("vwap", bar_data["close"])),
+            )
 
             # Track session open
             if self.session_open[symbol] is None:
-                self.session_open[symbol] = bar.open
+                self.session_open[symbol] = bar5m.open
                 if self.prior_close[symbol] is not None:
                     self.gap_pct[symbol] = (
-                        (bar.open - self.prior_close[symbol])
+                        (bar5m.open - self.prior_close[symbol])
                         / self.prior_close[symbol]
                     )
                     log.info(f"{symbol} gap: {self.gap_pct[symbol]*100:.2f}%")
 
-            # Aggregate to 5m
-            bar5m = self.aggregators[symbol].add_bar(bar)
-            if bar5m is not None:
-                log.debug(f"5m bar: {symbol} {bar5m.ts.strftime('%H:%M')} "
-                          f"O={bar5m.open:.2f} H={bar5m.high:.2f} "
-                          f"L={bar5m.low:.2f} C={bar5m.close:.2f}")
-                self._on_bar_5m(symbol, bar5m)
+            # Update level tracker and volume calc
+            self.levels[symbol].update(bar5m)
+            self.volume_calcs[symbol].update(bar5m.volume)
+
+            log.debug(f"5m bar: {symbol} {ts.strftime('%H:%M')} "
+                      f"O={bar5m.open:.2f} H={bar5m.high:.2f} "
+                      f"L={bar5m.low:.2f} C={bar5m.close:.2f}")
+
+            # Check for breakout using MDS indicators
+            self._check_breakout(symbol, bar5m)
 
         except Exception as e:
-            log.warning(f"Error processing bar for {symbol}: {e}")
+            log.warning(f"Error processing 5m bar for {symbol}: {e}")
+
+    def _handle_ema(self, symbol: str, payload: str):
+        """Update EMA ribbon state from MDS."""
+        try:
+            data = json.loads(payload)
+            seq = data.get("seq", 0)
+            state = self.indicators[symbol]
+            if seq <= state.seq:
+                return  # dedup per subscribe_with_backfill ADR
+            state.seq          = seq
+            state.ema10        = data.get("ema10")
+            state.ema15        = data.get("ema15")
+            state.ema20        = data.get("ema20")
+            state.ema25        = data.get("ema25")
+            state.ema30        = data.get("ema30")
+            state.ribbon_state = data.get("ribbon_state", "WARMING")
+            state.ema_warm     = data.get("warm", False)
+            state.bar_index    = data.get("bar_index", 0)
+            state.bar_time     = datetime.fromisoformat(
+                data["bar_time"].replace("Z", "+00:00")
+            ) if "bar_time" in data else None
+        except Exception as e:
+            log.warning(f"Error processing EMA for {symbol}: {e}")
+
+    def _handle_atr(self, symbol: str, payload: str):
+        """Update ATR state from MDS."""
+        try:
+            data = json.loads(payload)
+            seq = data.get("seq", 0)
+            state = self.indicators[symbol]
+            # ATR shares seq with EMA — use max to avoid regression
+            state.seq      = max(state.seq, seq)
+            state.atr      = data.get("atr")
+            state.atr_warm = data.get("warm", False)
+        except Exception as e:
+            log.warning(f"Error processing ATR for {symbol}: {e}")
 
     def _handle_calendar(self, topic: str, payload: str):
         """Process calendar event."""
@@ -403,18 +437,6 @@ class BreakoutDetector:
 
         # Refresh prior session data
         self._fetch_prior_session_data()
-
-    def _on_bar_5m(self, symbol: str, bar5m: Bar5m):
-        """Process completed 5-minute bar."""
-        self._update_indicators(symbol, bar5m)
-        self._check_breakout(symbol, bar5m)
-
-    def _update_indicators(self, symbol: str, bar5m: Bar5m):
-        """Update all indicators with new bar."""
-        self.ribbons[symbol].update(bar5m)
-        self.levels[symbol].update(bar5m)
-        self.atr_calcs[symbol].update(bar5m)
-        self.volume_calcs[symbol].update(bar5m.volume)
 
     def _check_breakout(self, symbol: str, bar5m: Bar5m):
         """Check for breakout conditions."""
