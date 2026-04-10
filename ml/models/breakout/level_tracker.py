@@ -7,7 +7,7 @@ Tracks session high/low levels and their age for breakout detection.
 from datetime import datetime
 from typing import Optional
 
-from ml.models.breakout.bar_aggregator import Bar
+from ml.models.breakout.types import Bar
 
 
 class LevelTracker:

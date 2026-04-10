@@ -22,9 +22,7 @@ from discovery.service_locator import ServiceLocator
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
 
-from ml.models.breakout.bar_aggregator import Bar
-from ml.models.breakout.ema_ribbon import RibbonState
-from ml.models.breakout.atr_calculator import VolumeAverageCalculator
+from ml.models.breakout.types import Bar, RibbonState, VolumeAverageCalculator
 from ml.models.breakout.level_tracker import LevelTracker
 from ml.models.breakout.signal_generator import (
     BreakoutConditionChecker, SignalConfig, BreakoutCandidate

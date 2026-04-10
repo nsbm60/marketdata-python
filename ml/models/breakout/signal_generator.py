@@ -9,8 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from ml.models.breakout.bar_aggregator import Bar
-from ml.models.breakout.ema_ribbon import RibbonState
+from ml.models.breakout.types import Bar, RibbonState
 
 
 class BreakoutDirection(Enum):
