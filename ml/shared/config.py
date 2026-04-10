@@ -130,3 +130,137 @@ def update_symbol_config(
     )
 
     save_prediction_config(config)
+
+
+def fetch_symbol_list(mds_router_url: str, list_name: str) -> list[str]:
+    """
+    Fetch a named symbol list from MDS via ZMQ DEALER/ROUTER.
+
+    Args:
+        mds_router_url: MDS router endpoint e.g. "tcp://192.168.37.191:6007"
+        list_name:      Name of symbol list e.g. "trading_universe"
+
+    Returns:
+        List of symbol strings
+
+    Raises:
+        RuntimeError: If list not found or MDS unreachable
+    """
+    import zmq
+    import json
+
+    ctx = zmq.Context()
+    dealer = ctx.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
+    dealer.connect(mds_router_url)
+
+    try:
+        request = json.dumps({"op": "get_symbol_list", "name": list_name})
+        dealer.send_string(request)
+
+        if dealer.poll(timeout=5000):
+            response = json.loads(dealer.recv_string())
+            if not response.get("ok"):
+                raise RuntimeError(
+                    f"MDS error for list '{list_name}': "
+                    f"{response.get('error', 'unknown')}"
+                )
+            return response["data"]["symbols"]
+        else:
+            raise RuntimeError(f"MDS timeout fetching symbol list '{list_name}'")
+    finally:
+        dealer.close(linger=0)
+        ctx.term()
+
+
+# ---------------------------------------------------------------------------
+# Breakout Detector Configuration
+# ---------------------------------------------------------------------------
+
+BREAKOUT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "breakout_config.yaml"
+
+
+@dataclass
+class BreakoutSymbolConfig:
+    """Configuration for a single symbol's breakout detection."""
+
+    timeframe_minutes: int
+    level_age_threshold: int  # bars (12 = 60 min on 5m)
+    ribbon_age_threshold: int  # bars (6 = 30 min on 5m)
+    ribbon_spread_min_pct: float
+    break_bar_atr_min: float
+    break_bar_close_pct: float
+    volume_ratio_min: float
+    clear_air_atr_min: float
+    gap_atr_threshold: float
+
+
+@dataclass
+class BreakoutConfig:
+    """Full breakout detector configuration."""
+
+    defaults: BreakoutSymbolConfig
+    symbols: dict[str, BreakoutSymbolConfig]
+    phase: int  # 0 = log only, 1 = publish high conviction
+
+    def get(self, symbol: str) -> BreakoutSymbolConfig:
+        """Get config for a symbol, merging with defaults."""
+        symbol = symbol.upper()
+        if symbol not in self.symbols:
+            return self.defaults
+        return self.symbols[symbol]
+
+
+def load_breakout_config() -> BreakoutConfig:
+    """Load breakout detector config from YAML file."""
+    if not BREAKOUT_CONFIG_PATH.exists():
+        # Return defaults if config file doesn't exist
+        default_cfg = BreakoutSymbolConfig(
+            timeframe_minutes=5,
+            level_age_threshold=12,
+            ribbon_age_threshold=6,
+            ribbon_spread_min_pct=0.5,
+            break_bar_atr_min=1.5,
+            break_bar_close_pct=0.25,
+            volume_ratio_min=1.2,
+            clear_air_atr_min=1.5,
+            gap_atr_threshold=1.0,
+        )
+        return BreakoutConfig(defaults=default_cfg, symbols={}, phase=0)
+
+    with open(BREAKOUT_CONFIG_PATH) as f:
+        raw = yaml.safe_load(f)
+
+    defaults = raw.get("defaults", {})
+    default_cfg = BreakoutSymbolConfig(
+        timeframe_minutes=defaults.get("timeframe_minutes", 5),
+        level_age_threshold=defaults.get("level_age_threshold", 12),
+        ribbon_age_threshold=defaults.get("ribbon_age_threshold", 6),
+        ribbon_spread_min_pct=defaults.get("ribbon_spread_min_pct", 0.5),
+        break_bar_atr_min=defaults.get("break_bar_atr_min", 1.5),
+        break_bar_close_pct=defaults.get("break_bar_close_pct", 0.25),
+        volume_ratio_min=defaults.get("volume_ratio_min", 1.2),
+        clear_air_atr_min=defaults.get("clear_air_atr_min", 1.5),
+        gap_atr_threshold=defaults.get("gap_atr_threshold", 1.0),
+    )
+
+    symbols = {}
+    for sym, cfg in raw.get("symbols", {}).items():
+        # Merge symbol overrides with defaults
+        symbols[sym.upper()] = BreakoutSymbolConfig(
+            timeframe_minutes=cfg.get("timeframe_minutes", default_cfg.timeframe_minutes),
+            level_age_threshold=cfg.get("level_age_threshold", default_cfg.level_age_threshold),
+            ribbon_age_threshold=cfg.get("ribbon_age_threshold", default_cfg.ribbon_age_threshold),
+            ribbon_spread_min_pct=cfg.get("ribbon_spread_min_pct", default_cfg.ribbon_spread_min_pct),
+            break_bar_atr_min=cfg.get("break_bar_atr_min", default_cfg.break_bar_atr_min),
+            break_bar_close_pct=cfg.get("break_bar_close_pct", default_cfg.break_bar_close_pct),
+            volume_ratio_min=cfg.get("volume_ratio_min", default_cfg.volume_ratio_min),
+            clear_air_atr_min=cfg.get("clear_air_atr_min", default_cfg.clear_air_atr_min),
+            gap_atr_threshold=cfg.get("gap_atr_threshold", default_cfg.gap_atr_threshold),
+        )
+
+    return BreakoutConfig(
+        defaults=default_cfg,
+        symbols=symbols,
+        phase=raw.get("defaults", {}).get("phase", 0),
+    )

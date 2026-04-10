@@ -10,8 +10,16 @@ Orchestrates the full ML pipeline for one or more symbols:
 5. Run confidence exploration
 
 Usage:
+    # Run for all trading universe symbols (fetches from MDS)
+    python ml/pipeline/run_pipeline.py --skip-etl
+
+    # Run for specific symbols (explicit override)
     python ml/pipeline/run_pipeline.py --symbols NVDA AMD --skip-etl
-    python ml/pipeline/run_pipeline.py --symbols MSFT AAPL GOOGL
+
+    # Run for a different named list
+    python ml/pipeline/run_pipeline.py --list options_universe --skip-etl
+
+    # Run for a single symbol with specific windows
     python ml/pipeline/run_pipeline.py --symbols TSLA --windows 60
 """
 
@@ -25,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from ml.shared.paths import features_path, model_path, ensure_dirs
 from ml.shared.clickhouse import get_ch_client
+from ml.shared.config import fetch_symbol_list
+from discovery import ServiceLocator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,7 +101,9 @@ def run_pipeline_for_symbol(
     skip_features: bool = False,
     skip_train: bool = False,
     skip_score: bool = False,
+    skip_labels: bool = False,
     skip_explore: bool = False,
+    update_config: bool = False,
 ) -> dict:
     """
     Run the full pipeline for a single symbol.
@@ -192,7 +204,7 @@ def run_pipeline_for_symbol(
         results["score"] = "SKIPPED"
 
     # Step 4: Backfill session labels if needed
-    if needs_label_backfill(symbol):
+    if not skip_labels and needs_label_backfill(symbol):
         features_file = features_path(symbol, 60)
         cmd = [
             sys.executable,
@@ -205,6 +217,8 @@ def run_pipeline_for_symbol(
         else:
             results["labels"] = "FAILED"
             return results
+    elif skip_labels:
+        results["labels"] = "SKIPPED"
     else:
         log.info(f"{symbol}: session labels already exist")
         results["labels"] = "SKIPPED"
@@ -216,6 +230,8 @@ def run_pipeline_for_symbol(
             "ml/models/session_direction/explore_confidence.py",
             "--symbols", symbol,
         ]
+        if update_config:
+            cmd.append("--update-config")
         if run_command(cmd, f"Explore confidence for {symbol}"):
             results["explore"] = "OK"
         else:
@@ -230,8 +246,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run full ML pipeline for symbols"
     )
-    parser.add_argument("--symbols", nargs="+", required=True,
-                        help="Symbols to process")
+    parser.add_argument("--symbols", nargs="+", default=None,
+                        help="Symbols to process (default: fetch trading_universe from MDS)")
+    parser.add_argument("--list", default="trading_universe",
+                        help="Named symbol list to fetch from MDS (default: trading_universe)")
     parser.add_argument("--windows", nargs="+", type=int, default=[15, 30, 45, 60],
                         help="Windows to build (default: 15 30 45 60)")
     parser.add_argument("--skip-etl", action="store_true",
@@ -242,17 +260,44 @@ def main():
                         help="Skip model training")
     parser.add_argument("--skip-score", action="store_true",
                         help="Skip historical scoring")
+    parser.add_argument("--skip-labels", action="store_true",
+                        help="Skip session labels backfill")
     parser.add_argument("--skip-explore", action="store_true",
                         help="Skip confidence exploration")
+    parser.add_argument("--update-config", action="store_true",
+                        help="Update prediction_windows.yaml with explore recommendations")
     args = parser.parse_args()
 
-    symbols = [s.upper() for s in args.symbols]
+    # Determine symbols: explicit CLI or fetch from MDS
+    if args.symbols:
+        symbols = [s.upper() for s in args.symbols]
+    else:
+        # Fetch from MDS
+        log.info(f"Fetching symbol list '{args.list}' from MDS...")
+        md_endpoint = ServiceLocator.find_service(
+            ServiceLocator.MARKET_DATA, wait_sec=10
+        )
+        if md_endpoint:
+            router_url = md_endpoint.router if hasattr(md_endpoint, 'router') \
+                         else f"tcp://{md_endpoint.host}:6007"
+            try:
+                symbols = fetch_symbol_list(router_url, args.list)
+                log.info(f"Fetched {len(symbols)} symbols: {symbols}")
+            except RuntimeError as e:
+                log.error(f"Failed to fetch symbol list: {e}")
+                log.error("Use --symbols to specify symbols explicitly")
+                sys.exit(1)
+        else:
+            log.error("MDS not available -- use --symbols to specify symbols explicitly")
+            sys.exit(1)
+
     windows = sorted(args.windows)
 
     log.info(f"Pipeline starting for {len(symbols)} symbols: {symbols}")
     log.info(f"Windows: {windows}")
     log.info(f"Skip flags: etl={args.skip_etl}, features={args.skip_features}, "
-             f"train={args.skip_train}, score={args.skip_score}, explore={args.skip_explore}")
+             f"train={args.skip_train}, score={args.skip_score}, "
+             f"labels={args.skip_labels}, explore={args.skip_explore}")
 
     all_results = []
     for symbol in symbols:
@@ -263,7 +308,9 @@ def main():
             skip_features=args.skip_features,
             skip_train=args.skip_train,
             skip_score=args.skip_score,
+            skip_labels=args.skip_labels,
             skip_explore=args.skip_explore,
+            update_config=args.update_config,
         )
         all_results.append(results)
 

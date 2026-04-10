@@ -59,28 +59,25 @@ ORDER BY session_date
 # Model training (same approach as train.py)
 # ---------------------------------------------------------------------------
 
-def get_available_features(df: pd.DataFrame) -> list[str]:
-    """Return features that exist in the DataFrame."""
-    return [f for f in FEATURES if f in df.columns]
-
-
-def load_features(symbol: str, window: int) -> tuple[pd.DataFrame, list[str]]:
-    """Load feature matrix for a window. Returns (df, available_features)."""
+def load_features(symbol: str, window: int) -> pd.DataFrame:
+    """Load feature matrix for a window. Requires all canonical FEATURES."""
     path = features_path(symbol, window)
     if not path.exists():
         log.warning(f"Feature matrix not found: {path}")
-        return pd.DataFrame(), []
+        return pd.DataFrame()
 
     df = pd.read_csv(path, parse_dates=["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Determine available features
-    available_features = get_available_features(df)
+    # Require all canonical features
+    missing = [f for f in FEATURES if f not in df.columns]
+    if missing:
+        raise ValueError(f"{symbol} w{window}: missing features: {missing}")
 
-    # Fill nulls in correlation features if present
+    # Fill nulls in correlation features
     corr_features = ["target_qqq_corr", "target_smh_corr", "target_qqq_beta"]
     for col in corr_features:
-        if col in df.columns and df[col].isnull().any():
+        if df[col].isnull().any():
             median = df[col].median()
             df[col] = df[col].fillna(median)
 
@@ -88,10 +85,10 @@ def load_features(symbol: str, window: int) -> tuple[pd.DataFrame, list[str]]:
     if DIRECTIONAL_LABEL_COL in df.columns:
         df = df[df[DIRECTIONAL_LABEL_COL].isin([0, 1])].copy()
 
-    return df, available_features
+    return df
 
 
-def train_model(df: pd.DataFrame, window: int, features: list[str]) -> tuple:
+def train_model(df: pd.DataFrame, window: int) -> tuple:
     """
     Train XGBoost model for directional prediction.
     Returns (model, calibrator) or (None, None) if insufficient data.
@@ -101,13 +98,13 @@ def train_model(df: pd.DataFrame, window: int, features: list[str]) -> tuple:
         return None, None
 
     # Drop rows with missing features or labels
-    df = df.dropna(subset=features + [DIRECTIONAL_LABEL_COL])
+    df = df.dropna(subset=FEATURES + [DIRECTIONAL_LABEL_COL])
 
     if len(df) < 100:
         log.warning(f"Insufficient data after dropping nulls for w{window}: {len(df)}")
         return None, None
 
-    X = df[features]
+    X = df[FEATURES]
     y = df[DIRECTIONAL_LABEL_COL]
 
     # Use last 15% for validation/calibration
@@ -147,14 +144,14 @@ def train_model(df: pd.DataFrame, window: int, features: list[str]) -> tuple:
 
 
 def get_or_train_model(symbol: str, window: int) -> tuple:
-    """Load existing model or train if not found. Returns (model, calibrator, features)."""
+    """Load existing model or train if not found. Returns (model, calibrator)."""
     m_path = model_path(symbol, "session_direction", window)
     c_path = calibration_path(symbol, window)
 
-    # Load features to get feature list
-    df, available_features = load_features(symbol, window)
+    # Load features (validates all canonical FEATURES are present)
+    df = load_features(symbol, window)
     if df.empty:
-        return None, None, []
+        return None, None
 
     if m_path.exists() and c_path.exists():
         log.info(f"Loading existing model for w{window}")
@@ -162,10 +159,10 @@ def get_or_train_model(symbol: str, window: int) -> tuple:
         model.load_model(str(m_path))
         with open(c_path, "rb") as f:
             calibrator = pickle.load(f)
-        return model, calibrator, available_features
+        return model, calibrator
 
-    log.info(f"Training model for w{window} with {len(available_features)} features...")
-    model, calibrator = train_model(df, window, available_features)
+    log.info(f"Training model for w{window} with {len(FEATURES)} features...")
+    model, calibrator = train_model(df, window)
 
     if model is not None:
         # Save for reuse
@@ -175,7 +172,7 @@ def get_or_train_model(symbol: str, window: int) -> tuple:
             pickle.dump(calibrator, f)
         log.info(f"Saved model to {m_path}")
 
-    return model, calibrator, available_features
+    return model, calibrator
 
 
 def apply_calibration(model, calibrator, X: pd.DataFrame) -> np.ndarray:
@@ -199,18 +196,18 @@ def score_all_windows(symbol: str, windows: list[int]) -> pd.DataFrame:
     all_scores = {}
 
     for window in windows:
-        model, calibrator, features = get_or_train_model(symbol, window)
+        model, calibrator = get_or_train_model(symbol, window)
         if model is None:
             log.warning(f"No model for w{window}")
             continue
 
-        # Reload features for scoring (get_or_train_model uses them internally too)
-        df, _ = load_features(symbol, window)
+        # Reload features for scoring
+        df = load_features(symbol, window)
         if df.empty:
             continue
 
-        # Score all sessions using available features
-        X = df[features]
+        # Score all sessions using canonical FEATURES
+        X = df[FEATURES]
         cal_probs = apply_calibration(model, calibrator, X)
 
         scores = pd.DataFrame({

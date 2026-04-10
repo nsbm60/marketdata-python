@@ -1,5 +1,5 @@
 """
-service_locator.py - with diagnostic logging added to _run and _handle_message
+service_locator.py - Service discovery via ZMQ subscription.
 """
 
 import json
@@ -71,25 +71,12 @@ class DiscoverySubscriber:
         self._socket.setsockopt_string(zmq.SUBSCRIBE, self._topic)
         self._socket.setsockopt(zmq.RCVTIMEO, 500)
 
-        log.info(f"[Discovery] Connected to {self.discovery_url}, "
-                 f"subscribed to topic='{self._topic}'")
+        log.debug(f"[Discovery] Connected to {self.discovery_url}, "
+                  f"subscribed to topic='{self._topic}'")
 
-        msg_count = 0
         while self._running:
             try:
                 frames = self._socket.recv_multipart()
-                msg_count += 1
-
-                log.info(f"[Discovery] Received {len(frames)} frame(s) "
-                         f"(message #{msg_count})")
-
-                for i, frame in enumerate(frames):
-                    try:
-                        decoded = frame.decode("utf-8")
-                        log.info(f"[Discovery] Frame[{i}]: {decoded[:200]}")
-                    except Exception as e:
-                        log.info(f"[Discovery] Frame[{i}]: <decode error: {e}> "
-                                 f"raw={frame[:50]}")
 
                 if len(frames) >= 2:
                     topic   = frames[0].decode("utf-8")

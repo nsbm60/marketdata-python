@@ -1,0 +1,46 @@
+# Breakout detector configuration
+# Model: EMA Ribbon + Level Break
+# ZMQ topic: ml.breakout.{SYMBOL}
+# Last updated: 2026-04-07
+
+defaults:
+  # Timeframe
+  timeframe_minutes: 5          # 5-minute bars
+
+  # Level tracking (in bars, not minutes)
+  level_age_threshold: 12       # 12 bars = 60 minutes on 5m
+
+  # EMA ribbon
+  ribbon_age_threshold: 6       # 6 bars = 30 minutes in ordered state
+  ribbon_spread_min_pct: 0.5    # Min EMA10-EMA30 spread as % of price
+
+  # Break bar quality
+  break_bar_atr_min: 1.5        # Min break bar size as ATR multiple
+  break_bar_close_pct: 0.25     # Close must be in top/bottom 25% of bar
+
+  # Volume
+  volume_ratio_min: 1.2         # Min volume vs 20-bar average
+
+  # Clear air
+  clear_air_atr_min: 1.5        # Min ATR distance to next level
+
+  # Gap filter
+  gap_atr_threshold: 1.0        # Gap > 1 ATR = gap-induced ribbon
+
+  # Phase control
+  phase: 0                      # 0 = log only, 1 = publish high conviction
+
+# Per-symbol overrides (populated after observation)
+symbols:
+  NVDA:
+    break_bar_atr_min: 1.5
+
+  TSLA:
+    gap_atr_threshold: 1.5
+
+  GLW:
+    level_age_threshold: 18     # 90 minutes - slower stock
+
+  SPY:
+    gap_atr_threshold: 0.5
+    ribbon_spread_min_pct: 0.3
