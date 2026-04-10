@@ -1,4 +1,9 @@
 """
+DEPRECATED: This ETL is superseded by MDS (MarketDataServiceMain) which
+receives Alpaca pre-built 1m bars via WebSocket and writes to stock_bar
+in real time. See docs/decisions/adr_bar_data_source.md.
+This file is retained for reference only — do not run.
+
 alpaca_bars_etl.py
 
 Pull historical 1-minute OHLCV bars from Alpaca and insert into ClickHouse.

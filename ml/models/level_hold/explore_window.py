@@ -96,10 +96,11 @@ log = logging.getLogger(__name__)
 
 INTRADAY_BARS_SQL = """
 SELECT ts, open, high, low, close, volume
-FROM stock_bar_1m
+FROM stock_bar FINAL
 WHERE symbol     = %(symbol)s
+  AND period     = '1m'
   AND session    = 1
-  AND toDate(ts) = %(session_date)s
+  AND toDate(toTimezone(ts, 'America/New_York')) = %(session_date)s
   AND (toHour(ts) > 10 OR (toHour(ts) = 10 AND toMinute(ts) >= 30))
 ORDER BY ts
 """
@@ -110,13 +111,14 @@ SELECT
     avg(session_volume) AS avg_volume
 FROM (
     SELECT
-        toDate(ts)                    AS session_date,
+        toDate(toTimezone(ts, 'America/New_York'))  AS session_date,
         max(high) - min(low)          AS session_range,
         sum(volume)                   AS session_volume
-    FROM stock_bar_1m
+    FROM stock_bar FINAL
     WHERE symbol   = %(symbol)s
+      AND period   = '1m'
       AND session  = 1
-      AND toDate(ts) < %(session_date)s
+      AND toDate(toTimezone(ts, 'America/New_York')) < %(session_date)s
     GROUP BY session_date
     ORDER BY session_date DESC
     LIMIT 20

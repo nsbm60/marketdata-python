@@ -78,10 +78,11 @@ regular AS (
         volume,
         toHour(ts)              AS hr,
         toMinute(ts)            AS mn
-    FROM stock_bar_1m
+    FROM stock_bar FINAL
     WHERE symbol    = %(symbol)s
+      AND period    = '1m'
       AND session   = 1
-      AND toDate(ts) BETWEEN %(start)s AND %(end)s
+      AND toDate(toTimezone(ts, 'America/New_York')) BETWEEN %(start)s AND %(end)s
 ),
 
 full_session AS (

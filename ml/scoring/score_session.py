@@ -322,10 +322,11 @@ SELECT
     min(low)                                AS session_low,
     sum(volume)                             AS session_volume,
     argMin(open, ts)                        AS open_930
-FROM stock_bar_1m
+FROM stock_bar FINAL
 WHERE symbol  = %(symbol)s
+  AND period  = '1m'
   AND session = 1
-  AND toDate(ts) < today()
+  AND toDate(toTimezone(ts, 'America/New_York')) < today()
 GROUP BY session_date
 ORDER BY session_date DESC
 LIMIT %(n)s
@@ -333,20 +334,22 @@ LIMIT %(n)s
 
 PRIOR_CLOSE_SQL = """
 SELECT argMax(close, ts) AS prev_close
-FROM stock_bar_1m
+FROM stock_bar FINAL
 WHERE symbol  = %(symbol)s
+  AND period  = '1m'
   AND session = 1
-  AND toDate(ts) = %(prev_date)s
+  AND toDate(toTimezone(ts, 'America/New_York')) = %(prev_date)s
 """
 
 QQQ_HISTORY_SQL = """
 SELECT
-    toDate(ts)          AS session_date,
+    toDate(toTimezone(ts, 'America/New_York'))  AS session_date,
     argMax(close, ts)   AS close
-FROM stock_bar_1m
+FROM stock_bar FINAL
 WHERE symbol  = 'QQQ'
+  AND period  = '1m'
   AND session = 1
-  AND toDate(ts) < today()
+  AND toDate(toTimezone(ts, 'America/New_York')) < today()
 GROUP BY session_date
 ORDER BY session_date DESC
 LIMIT %(n)s
@@ -776,12 +779,13 @@ class SessionScorer:
         result = ch_client.query(
             """
             SELECT
-                toDate(ts)  AS session_date,
+                toDate(toTimezone(ts, 'America/New_York'))  AS session_date,
                 count()     AS bar_count
-            FROM stock_bar_1m
+            FROM stock_bar FINAL
             WHERE symbol      = %(symbol)s
+              AND period      = '1m'
               AND session     = 1
-              AND toDate(ts) >= %(start_date)s
+              AND toDate(toTimezone(ts, 'America/New_York')) >= %(start_date)s
               AND toDate(ts) <= %(end_date)s
             GROUP BY session_date
             ORDER BY session_date
@@ -888,10 +892,11 @@ class SessionScorer:
             result = ch.query(
                 """
                 SELECT ts, open, high, low, close, volume, vwap, trade_count, session
-                FROM stock_bar_1m
+                FROM stock_bar FINAL
                 WHERE symbol    = %(symbol)s
+                  AND period    = '1m'
                   AND session   = 1
-                  AND toDate(ts) = %(session_date)s
+                  AND toDate(toTimezone(ts, 'America/New_York')) = %(session_date)s
                 ORDER BY ts
                 """,
                 parameters={
@@ -1434,57 +1439,17 @@ class SessionScorer:
 
     def _end_of_day(self):
         """
-        End-of-day processing: flush accumulated bars to ClickHouse.
+        End-of-day processing.
 
-        Called when market close event is received. Writes all bars
-        accumulated during the session to the stock_bar_1m table.
+        Called when market close event is received.
+        Bar writes are handled by MDS (EquityBarService) — the scorer
+        does not write bars to ClickHouse.
         """
         if self._eod_done:
             return
         self._eod_done = True
 
         today = date.today()
-        ch = self._get_ch_client()
-
-        all_symbols = list(set(self.symbols + CORRELATION_SYMBOLS))
-        total_bars = 0
-
-        for symbol in all_symbols:
-            bars = self.bar_store.get_bars(symbol)
-            if not bars:
-                continue
-
-            # Filter to regular session bars only
-            regular_bars = [b for b in bars if b.session == "regular"]
-
-            rows = []
-            for bar in regular_bars:
-                rows.append([
-                    symbol,
-                    bar.ts,
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    bar.volume,
-                    bar.vwap,
-                    bar.trade_count,
-                    1,  # session = regular
-                ])
-
-            if rows:
-                ch.insert(
-                    "stock_bar_1m",
-                    rows,
-                    column_names=[
-                        "symbol", "ts", "open", "high", "low", "close",
-                        "volume", "vwap", "trade_count", "session"
-                    ],
-                )
-                total_bars += len(rows)
-                log.info(f"  {symbol}: flushed {len(rows)} bars to ClickHouse")
-
-        log.info(f"End-of-day: flushed {total_bars} total bars for {today}")
 
         # Update prediction outcomes
         self._update_prediction_outcomes(today)
