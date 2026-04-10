@@ -23,7 +23,7 @@ from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
 
 from ml.models.breakout.bar_aggregator import Bar5m, Bar5mAggregator
-from ml.models.breakout.ema_ribbon import EMARibbon
+from ml.models.breakout.ema_ribbon import EMARibbon, RibbonState
 from ml.models.breakout.atr_calculator import ATRCalculator, VolumeAverageCalculator
 from ml.models.breakout.level_tracker import LevelTracker
 from ml.models.breakout.signal_generator import (
@@ -37,6 +37,27 @@ BAR_5M_TOPIC_PREFIX  = "md.equity.bar.5m."
 IND_EMA_TOPIC_PREFIX = "md.equity.indicator.ema.5m."
 IND_ATR_TOPIC_PREFIX = "md.equity.indicator.atr.5m."
 CAL_TOPIC_PREFIX     = "cal."
+
+# MDS publishes "BULLISH_ALIGNED" etc.; local signal_generator uses RibbonState enum
+# with different value strings. This map bridges the two.
+_MDS_RIBBON_MAP = {
+    "BULLISH_ALIGNED": RibbonState.ORDERED_BULLISH,
+    "BEARISH_ALIGNED": RibbonState.ORDERED_BEARISH,
+    "MIXED":           RibbonState.TRANSITIONAL,
+    "WARMING":         RibbonState.TRANSITIONAL,  # safety fallback — warm check gates before here
+}
+
+
+def _mds_to_ribbon_state(mds_state: str) -> RibbonState:
+    """Convert MDS ribbon_state string to local RibbonState enum."""
+    return _MDS_RIBBON_MAP.get(mds_state, RibbonState.TRANSITIONAL)
+
+
+def _ribbon_spread_pct(ind: "IndicatorState", close: float) -> float:
+    """Compute ribbon spread % from MDS indicator state."""
+    if ind.ema10 is None or ind.ema30 is None or close <= 0:
+        return 0.0
+    return abs(ind.ema10 - ind.ema30) / close
 
 
 @dataclass
@@ -447,22 +468,23 @@ class BreakoutDetector:
         self._fetch_prior_session_data()
 
     def _check_breakout(self, symbol: str, bar5m: Bar5m):
-        """Check for breakout conditions."""
-        ribbon = self.ribbons[symbol]
+        """Check for breakout conditions using MDS indicator state."""
+        ind = self.indicators[symbol]
         levels = self.levels[symbol]
-        atr_calc = self.atr_calcs[symbol]
         vol_calc = self.volume_calcs[symbol]
 
-        # Need warmup
-        if not ribbon.is_warm or not atr_calc.is_warm:
-            log.debug(f"{symbol} not warm: ribbon={ribbon.is_warm} atr={atr_calc.is_warm}")
+        # Need warm indicators from MDS
+        if not ind.ema_warm or not ind.atr_warm:
+            log.debug(f"{symbol} indicators not warm: ema={ind.ema_warm} atr={ind.atr_warm}")
             return
 
-        atr = atr_calc.value
-        avg_vol = vol_calc.value
-        volume_ratio = bar5m.volume / avg_vol if avg_vol > 0 else 0
+        if ind.atr is None or ind.atr <= 0:
+            return
 
-        # Build checker
+        atr = ind.atr
+        avg_vol = vol_calc.value
+        volume_ratio = bar5m.volume / avg_vol if avg_vol and avg_vol > 0 else 1.0
+
         signal_config = SignalConfig(
             level_age_threshold=self.config.level_age_threshold,
             ribbon_age_threshold=self.config.ribbon_age_threshold,
@@ -475,6 +497,8 @@ class BreakoutDetector:
         )
         checker = BreakoutConditionChecker(signal_config)
 
+        ribbon_state = _mds_to_ribbon_state(ind.ribbon_state)
+
         # Check long breakout
         if levels.high_price is not None:
             candidate = checker.check_long_breakout(
@@ -482,9 +506,12 @@ class BreakoutDetector:
                 bar5m=bar5m,
                 level_price=levels.high_price,
                 level_age_minutes=levels.high_age_minutes(),
-                ribbon_state=ribbon.state,
-                ribbon_age=ribbon.state_age,
-                ribbon_spread_pct=ribbon.spread_pct(bar5m.close),
+                ribbon_state=ribbon_state,
+                # bar_index is a proxy for ribbon age — it's the count of
+                # completed bars this session, not consecutive bars in the
+                # current ribbon state. Reasonable approximation.
+                ribbon_age=ind.bar_index,
+                ribbon_spread_pct=_ribbon_spread_pct(ind, bar5m.close),
                 atr=atr,
                 volume_ratio=volume_ratio,
                 gap_pct=self.gap_pct[symbol],
@@ -500,9 +527,9 @@ class BreakoutDetector:
                 bar5m=bar5m,
                 level_price=levels.low_price,
                 level_age_minutes=levels.low_age_minutes(),
-                ribbon_state=ribbon.state,
-                ribbon_age=ribbon.state_age,
-                ribbon_spread_pct=ribbon.spread_pct(bar5m.close),
+                ribbon_state=ribbon_state,
+                ribbon_age=ind.bar_index,
+                ribbon_spread_pct=_ribbon_spread_pct(ind, bar5m.close),
                 atr=atr,
                 volume_ratio=volume_ratio,
                 gap_pct=self.gap_pct[symbol],
