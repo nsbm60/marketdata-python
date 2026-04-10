@@ -150,18 +150,21 @@ class BreakoutDetector:
         # Initialize per-symbol state
         self._init_symbol_state()
 
+        # Setup ZMQ FIRST — subscribe to all topics before any RPC calls.
+        # Required by subscribe_with_backfill ADR for gap-free indicator seeding.
+        self._setup_zmq(market_data_url)
+
         # Fetch prior session data
         self._fetch_prior_session_data()
 
-        # Warmup from today's bars
-        log.info("Warming up indicators from MDS...")
-        self._warmup_from_history()
+        # Warm up levels from today's 5m bars (via MDS get_bars RPC)
+        self._warmup_levels()
+
+        # Seed indicator state from MDS (via subscribe_with_backfill RPC)
+        self._warmup_indicators()
 
         # Set _today AFTER warmup to prevent reset
         self._today = datetime.now(NY).date()
-
-        # Setup ZMQ
-        self._setup_zmq(market_data_url)
 
         # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
