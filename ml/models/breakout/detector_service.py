@@ -85,10 +85,8 @@ class BreakoutDetector:
         self.symbols: list[str] = []
 
         # Per-symbol state
-        self.aggregators: dict[str, Bar5mAggregator] = {}
-        self.ribbons: dict[str, EMARibbon] = {}
+        self.indicators: dict[str, IndicatorState] = {}
         self.levels: dict[str, LevelTracker] = {}
-        self.atr_calcs: dict[str, ATRCalculator] = {}
         self.volume_calcs: dict[str, VolumeAverageCalculator] = {}
 
         # Session state
@@ -164,10 +162,8 @@ class BreakoutDetector:
     def _init_symbol_state(self):
         """Initialize per-symbol state objects."""
         for symbol in self.symbols:
-            self.aggregators[symbol] = Bar5mAggregator(symbol, self.config.timeframe_minutes)
-            self.ribbons[symbol] = EMARibbon()
+            self.indicators[symbol] = IndicatorState()
             self.levels[symbol] = LevelTracker(symbol, self.config.timeframe_minutes)
-            self.atr_calcs[symbol] = ATRCalculator()
             self.volume_calcs[symbol] = VolumeAverageCalculator()
 
     def _fetch_prior_session_data(self):
