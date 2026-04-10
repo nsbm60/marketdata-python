@@ -33,8 +33,10 @@ from ml.models.breakout.signal_generator import (
 log = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
 
-BAR_TOPIC_PREFIX = "equity.bar.1m."
-CAL_TOPIC_PREFIX = "calendar."
+BAR_5M_TOPIC_PREFIX  = "md.equity.bar.5m."
+IND_EMA_TOPIC_PREFIX = "md.equity.indicator.ema.5m."
+IND_ATR_TOPIC_PREFIX = "md.equity.indicator.atr.5m."
+CAL_TOPIC_PREFIX     = "cal."
 
 
 @dataclass
@@ -50,6 +52,23 @@ class BreakoutConfig:
     volume_ratio_min: float = 1.0        # Min volume vs average
     clear_air_atr_min: float = 0.5       # Min distance to prior level
     gap_atr_threshold: float = 2.0       # Max gap in ATR units
+
+
+@dataclass
+class IndicatorState:
+    """Latest indicator values from MDS for one symbol."""
+    ema10:        Optional[float] = None
+    ema15:        Optional[float] = None
+    ema20:        Optional[float] = None
+    ema25:        Optional[float] = None
+    ema30:        Optional[float] = None
+    ribbon_state: str = "WARMING"
+    ema_warm:     bool = False
+    atr:          Optional[float] = None
+    atr_warm:     bool = False
+    bar_index:    int = 0
+    bar_time:     Optional[datetime] = None
+    seq:          int = 0
 
 
 class BreakoutDetector:
