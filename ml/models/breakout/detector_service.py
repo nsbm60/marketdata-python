@@ -285,7 +285,7 @@ class BreakoutDetector:
                     state.atr_warm     = atr.get("warm", False)
                     state.seq          = snapshot.get("seq", 0)
                     log.info(f"{symbol} indicator snapshot: ribbon={state.ribbon_state} "
-                             f"warm={state.ema_warm} atr={state.atr:.4f if state.atr else 'N/A'}")
+                             f"warm={state.ema_warm} atr={f'{state.atr:.4f}' if state.atr else 'N/A'}")
                 else:
                     error = snapshot.get("error", "unknown") if snapshot else "timeout"
                     log.warning(f"{symbol}: subscribe_with_backfill failed: {error}")
