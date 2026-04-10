@@ -1,8 +1,8 @@
 """
 ml/models/breakout/detector_service.py
 
-Breakout detection service that consumes 1m bars from MDS,
-aggregates to 5m, and generates breakout signals.
+Breakout detection service that consumes 5m bars and EMA/ATR indicators
+from MDS via ZMQ subscription, and generates breakout signals.
 """
 
 import json
@@ -22,9 +22,9 @@ from discovery.service_locator import ServiceLocator
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
 
-from ml.models.breakout.bar_aggregator import Bar5m, Bar5mAggregator
-from ml.models.breakout.ema_ribbon import EMARibbon, RibbonState
-from ml.models.breakout.atr_calculator import ATRCalculator, VolumeAverageCalculator
+from ml.models.breakout.bar_aggregator import Bar5m
+from ml.models.breakout.ema_ribbon import RibbonState
+from ml.models.breakout.atr_calculator import VolumeAverageCalculator
 from ml.models.breakout.level_tracker import LevelTracker
 from ml.models.breakout.signal_generator import (
     BreakoutConditionChecker, SignalConfig, BreakoutCandidate
