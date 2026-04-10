@@ -132,7 +132,7 @@ class BarAggregator:
         else:
             vwap = close_price
 
-        bar5m = Bar(
+        bar = Bar(
             ts=self._current_period,
             open=open_price,
             high=high_price,
@@ -142,5 +142,5 @@ class BarAggregator:
             vwap=vwap,
         )
 
-        self._completed_bars.append(bar5m)
-        return bar5m
+        self._completed_bars.append(bar)
+        return bar

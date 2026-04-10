@@ -244,12 +244,12 @@ class BreakoutDetector:
 
                 # Replay 5m bars through level tracker only
                 for bar in bars:
-                    bar5m = Bar(
+                    bar = Bar(
                         ts=bar.ts, open=bar.open, high=bar.high,
                         low=bar.low, close=bar.close, volume=bar.volume,
                         vwap=bar.vwap,
                     )
-                    self.levels[symbol].update(bar5m)
+                    self.levels[symbol].update(bar)
                     self.volume_calcs[symbol].update(bar.volume)
 
                 log.info(f"{symbol}: warmed levels from {len(bars)} 5m bars "
@@ -367,7 +367,7 @@ class BreakoutDetector:
                 bar_data["ts"].replace("Z", "+00:00")
             ).astimezone(NY)
 
-            bar5m = Bar(
+            bar = Bar(
                 ts=ts,
                 open=float(bar_data["open"]),
                 high=float(bar_data["high"]),
@@ -379,24 +379,24 @@ class BreakoutDetector:
 
             # Track session open
             if self.session_open[symbol] is None:
-                self.session_open[symbol] = bar5m.open
+                self.session_open[symbol] = bar.open
                 if self.prior_close[symbol] is not None:
                     self.gap_pct[symbol] = (
-                        (bar5m.open - self.prior_close[symbol])
+                        (bar.open - self.prior_close[symbol])
                         / self.prior_close[symbol]
                     )
                     log.info(f"{symbol} gap: {self.gap_pct[symbol]*100:.2f}%")
 
             # Update level tracker and volume calc
-            self.levels[symbol].update(bar5m)
-            self.volume_calcs[symbol].update(bar5m.volume)
+            self.levels[symbol].update(bar)
+            self.volume_calcs[symbol].update(bar.volume)
 
             log.debug(f"5m bar: {symbol} {ts.strftime('%H:%M')} "
-                      f"O={bar5m.open:.2f} H={bar5m.high:.2f} "
-                      f"L={bar5m.low:.2f} C={bar5m.close:.2f}")
+                      f"O={bar.open:.2f} H={bar.high:.2f} "
+                      f"L={bar.low:.2f} C={bar.close:.2f}")
 
             # Check for breakout using MDS indicators
-            self._check_breakout(symbol, bar5m)
+            self._check_breakout(symbol, bar)
 
         except Exception as e:
             log.warning(f"Error processing 5m bar for {symbol}: {e}")
@@ -472,7 +472,7 @@ class BreakoutDetector:
         self._fetch_prior_session_data()
         self._warmup_indicators()
 
-    def _check_breakout(self, symbol: str, bar5m: Bar):
+    def _check_breakout(self, symbol: str, bar: Bar):
         """Check for breakout conditions using MDS indicator state."""
         ind = self.indicators[symbol]
         levels = self.levels[symbol]
@@ -488,7 +488,7 @@ class BreakoutDetector:
 
         atr = ind.atr
         avg_vol = vol_calc.value
-        volume_ratio = bar5m.volume / avg_vol if avg_vol and avg_vol > 0 else 1.0
+        volume_ratio = bar.volume / avg_vol if avg_vol and avg_vol > 0 else 1.0
 
         signal_config = SignalConfig(
             level_age_threshold=self.config.level_age_threshold,
@@ -508,7 +508,7 @@ class BreakoutDetector:
         if levels.high_price is not None:
             candidate = checker.check_long_breakout(
                 symbol=symbol,
-                bar5m=bar5m,
+                bar=bar,
                 level_price=levels.high_price,
                 level_age_minutes=levels.high_age_minutes(),
                 ribbon_state=ribbon_state,
@@ -516,7 +516,7 @@ class BreakoutDetector:
                 # completed bars this session, not consecutive bars in the
                 # current ribbon state. Reasonable approximation.
                 ribbon_age=ind.bar_index,
-                ribbon_spread_pct=_ribbon_spread_pct(ind, bar5m.close),
+                ribbon_spread_pct=_ribbon_spread_pct(ind, bar.close),
                 atr=atr,
                 volume_ratio=volume_ratio,
                 gap_pct=self.gap_pct[symbol],
@@ -529,12 +529,12 @@ class BreakoutDetector:
         if levels.low_price is not None:
             candidate = checker.check_short_breakout(
                 symbol=symbol,
-                bar5m=bar5m,
+                bar=bar,
                 level_price=levels.low_price,
                 level_age_minutes=levels.low_age_minutes(),
                 ribbon_state=ribbon_state,
                 ribbon_age=ind.bar_index,
-                ribbon_spread_pct=_ribbon_spread_pct(ind, bar5m.close),
+                ribbon_spread_pct=_ribbon_spread_pct(ind, bar.close),
                 atr=atr,
                 volume_ratio=volume_ratio,
                 gap_pct=self.gap_pct[symbol],

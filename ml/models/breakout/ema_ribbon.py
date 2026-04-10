@@ -76,14 +76,14 @@ class EMARibbon:
         self._current_state: RibbonState = RibbonState.TRANSITIONAL
         self._state_age: int = 0
 
-    def update(self, bar5m: Bar) -> dict[int, float]:
+    def update(self, bar: Bar) -> dict[int, float]:
         """
         Update all EMAs with new 5-minute bar close.
 
         Returns:
             Dictionary of period -> EMA value
         """
-        values = {p: ema.update(bar5m.close) for p, ema in self.emas.items()}
+        values = {p: ema.update(bar.close) for p, ema in self.emas.items()}
 
         # Update state tracking
         new_state = self._compute_state(values)

@@ -72,7 +72,7 @@ class BreakoutConditionChecker:
     def check_long_breakout(
         self,
         symbol: str,
-        bar5m: Bar,
+        bar: Bar,
         level_price: float,
         level_age_minutes: int,
         ribbon_state: RibbonState,
@@ -91,7 +91,7 @@ class BreakoutConditionChecker:
         c = self.config
 
         # Must make new high
-        if bar5m.high <= level_price:
+        if bar.high <= level_price:
             return None
 
         # Level must be aged
@@ -109,14 +109,14 @@ class BreakoutConditionChecker:
             return None
 
         # Bar quality
-        bar_range = bar5m.high - bar5m.low
+        bar_range = bar.high - bar.low
         bar_range_atr = bar_range / atr if atr > 0 else 0
         if bar_range_atr < c.break_bar_atr_min:
             return None
 
         # Close in upper portion of bar
         if bar_range > 0:
-            bar_close_pct = (bar5m.close - bar5m.low) / bar_range
+            bar_close_pct = (bar.close - bar.low) / bar_range
         else:
             bar_close_pct = 0.5
         if bar_close_pct < c.break_bar_close_pct:
@@ -127,12 +127,12 @@ class BreakoutConditionChecker:
             return None
 
         # Gap filter
-        if atr > 0 and abs(gap_pct * bar5m.close) / atr > c.gap_atr_threshold:
+        if atr > 0 and abs(gap_pct * bar.close) / atr > c.gap_atr_threshold:
             return None
 
         # Clear air above prior session high
         if prior_session_high is not None and atr > 0:
-            distance_to_prior = bar5m.high - prior_session_high
+            distance_to_prior = bar.high - prior_session_high
             if distance_to_prior < 0:  # Below prior high = no clear air
                 return None
             if distance_to_prior / atr < c.clear_air_atr_min:
@@ -147,8 +147,8 @@ class BreakoutConditionChecker:
         return BreakoutCandidate(
             symbol=symbol,
             direction=BreakoutDirection.LONG,
-            ts=bar5m.ts,
-            price=bar5m.close,
+            ts=bar.ts,
+            price=bar.close,
             level_price=level_price,
             level_age_minutes=level_age_minutes,
             ribbon_state=ribbon_state,
@@ -165,7 +165,7 @@ class BreakoutConditionChecker:
     def check_short_breakout(
         self,
         symbol: str,
-        bar5m: Bar,
+        bar: Bar,
         level_price: float,
         level_age_minutes: int,
         ribbon_state: RibbonState,
@@ -184,7 +184,7 @@ class BreakoutConditionChecker:
         c = self.config
 
         # Must make new low
-        if bar5m.low >= level_price:
+        if bar.low >= level_price:
             return None
 
         # Level must be aged
@@ -202,14 +202,14 @@ class BreakoutConditionChecker:
             return None
 
         # Bar quality
-        bar_range = bar5m.high - bar5m.low
+        bar_range = bar.high - bar.low
         bar_range_atr = bar_range / atr if atr > 0 else 0
         if bar_range_atr < c.break_bar_atr_min:
             return None
 
         # Close in lower portion of bar
         if bar_range > 0:
-            bar_close_pct = (bar5m.high - bar5m.close) / bar_range  # Inverted for shorts
+            bar_close_pct = (bar.high - bar.close) / bar_range  # Inverted for shorts
         else:
             bar_close_pct = 0.5
         if bar_close_pct < c.break_bar_close_pct:
@@ -220,12 +220,12 @@ class BreakoutConditionChecker:
             return None
 
         # Gap filter
-        if atr > 0 and abs(gap_pct * bar5m.close) / atr > c.gap_atr_threshold:
+        if atr > 0 and abs(gap_pct * bar.close) / atr > c.gap_atr_threshold:
             return None
 
         # Clear air below prior session low
         if prior_session_low is not None and atr > 0:
-            distance_to_prior = prior_session_low - bar5m.low
+            distance_to_prior = prior_session_low - bar.low
             if distance_to_prior < 0:  # Above prior low = no clear air
                 return None
             if distance_to_prior / atr < c.clear_air_atr_min:
@@ -240,8 +240,8 @@ class BreakoutConditionChecker:
         return BreakoutCandidate(
             symbol=symbol,
             direction=BreakoutDirection.SHORT,
-            ts=bar5m.ts,
-            price=bar5m.close,
+            ts=bar.ts,
+            price=bar.close,
             level_price=level_price,
             level_age_minutes=level_age_minutes,
             ribbon_state=ribbon_state,

@@ -44,25 +44,25 @@ class LevelTracker:
         self._last_bar_ts: Optional[datetime] = None
         self._bar_count: int = 0
 
-    def update(self, bar5m: Bar) -> None:
+    def update(self, bar: Bar) -> None:
         """
         Update levels with new 5-minute bar.
 
         Args:
-            bar5m: Completed 5-minute bar
+            bar: Completed 5-minute bar
         """
         self._bar_count += 1
-        self._last_bar_ts = bar5m.ts
+        self._last_bar_ts = bar.ts
 
         # Update high
-        if self._high_price is None or bar5m.high > self._high_price:
-            self._high_price = bar5m.high
-            self._high_ts = bar5m.ts
+        if self._high_price is None or bar.high > self._high_price:
+            self._high_price = bar.high
+            self._high_ts = bar.ts
 
         # Update low
-        if self._low_price is None or bar5m.low < self._low_price:
-            self._low_price = bar5m.low
-            self._low_ts = bar5m.ts
+        if self._low_price is None or bar.low < self._low_price:
+            self._low_price = bar.low
+            self._low_ts = bar.ts
 
     @property
     def high_price(self) -> Optional[float]:
@@ -96,17 +96,17 @@ class LevelTracker:
         """Bars since session low was established."""
         return self.low_age_minutes() // self.timeframe
 
-    def is_new_high(self, bar5m: Bar) -> bool:
+    def is_new_high(self, bar: Bar) -> bool:
         """Check if bar made a new session high."""
         if self._high_price is None:
             return True
-        return bar5m.high > self._high_price
+        return bar.high > self._high_price
 
-    def is_new_low(self, bar5m: Bar) -> bool:
+    def is_new_low(self, bar: Bar) -> bool:
         """Check if bar made a new session low."""
         if self._low_price is None:
             return True
-        return bar5m.low < self._low_price
+        return bar.low < self._low_price
 
     def clear(self) -> None:
         """Clear session levels (call at start of new session)."""

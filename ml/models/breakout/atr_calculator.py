@@ -27,7 +27,7 @@ class ATRCalculator:
         self._atr: Optional[float] = None
         self._count = 0
 
-    def update(self, bar5m: Bar) -> Optional[float]:
+    def update(self, bar: Bar) -> Optional[float]:
         """
         Update ATR with new bar.
 
@@ -36,15 +36,15 @@ class ATRCalculator:
         """
         # Calculate True Range
         if self._prev_close is None:
-            tr = bar5m.high - bar5m.low
+            tr = bar.high - bar.low
         else:
             tr = max(
-                bar5m.high - bar5m.low,
-                abs(bar5m.high - self._prev_close),
-                abs(bar5m.low - self._prev_close)
+                bar.high - bar.low,
+                abs(bar.high - self._prev_close),
+                abs(bar.low - self._prev_close)
             )
 
-        self._prev_close = bar5m.close
+        self._prev_close = bar.close
         self._count += 1
 
         # Update ATR using Wilder's smoothing
