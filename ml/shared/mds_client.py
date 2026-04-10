@@ -45,6 +45,7 @@ def get_bars(
     router_url: str,
     symbol: str,
     bar_date: Optional[date] = None,
+    period: str = "1m",
     session: int = 1,
     timeout_ms: int = 5000,
 ) -> list[Bar1m]:
@@ -73,6 +74,7 @@ def get_bars(
         request = {
             "op": "get_bars",
             "symbol": symbol.upper(),
+            "period": period,
             "session": session,
         }
         if bar_date:
@@ -172,6 +174,59 @@ def get_prior_session(
             )
         else:
             raise RuntimeError(f"MDS timeout for get_prior_session({symbol})")
+    finally:
+        dealer.close(linger=0)
+        ctx.term()
+
+
+def subscribe_with_backfill(
+    router_url: str,
+    symbol: str,
+    data_type: str,
+    timeframe: str = "5m",
+    timeout_ms: int = 5000,
+) -> Optional[dict]:
+    """
+    Call MDS subscribe_with_backfill RPC.
+
+    Per the subscribe-with-backfill ADR, the caller MUST subscribe to the
+    relevant PUB topics BEFORE calling this function — otherwise the gap
+    guarantee is void.
+
+    Args:
+        router_url: MDS router endpoint e.g. "tcp://192.168.37.191:6007"
+        symbol: Equity symbol (e.g., "NVDA")
+        data_type: Data type (e.g., "indicators")
+        timeframe: Timeframe (e.g., "5m", "1m")
+        timeout_ms: Request timeout in milliseconds
+
+    Returns:
+        Full response dict on success (caller checks response["ok"]).
+        None on timeout.
+
+    Raises:
+        RuntimeError: If MDS unreachable
+    """
+    ctx = zmq.Context()
+    dealer = ctx.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    dealer.connect(router_url)
+
+    try:
+        request = {
+            "op": "subscribe_with_backfill",
+            "data_type": data_type,
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+        }
+
+        dealer.send_string(json.dumps(request))
+
+        if dealer.poll(timeout=timeout_ms):
+            response = json.loads(dealer.recv_string())
+            return response
+        else:
+            return None
     finally:
         dealer.close(linger=0)
         ctx.term()
