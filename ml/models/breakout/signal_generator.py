@@ -48,6 +48,7 @@ class BreakoutCandidate:
     bar_close_pct: float
     volume_ratio: float
     gap_pct: float
+    bar_index: int
     score: float
 
 
@@ -81,6 +82,7 @@ class BreakoutConditionChecker:
         volume_ratio: float,
         gap_pct: float,
         prior_session_high: Optional[float],
+        bar_index: int = 0,
     ) -> Optional[BreakoutCandidate]:
         """
         Check for long breakout (new high).
@@ -158,6 +160,7 @@ class BreakoutConditionChecker:
             bar_close_pct=bar_close_pct,
             volume_ratio=volume_ratio,
             gap_pct=gap_pct,
+            bar_index=bar_index,
             score=score,
         )
 
@@ -174,6 +177,7 @@ class BreakoutConditionChecker:
         volume_ratio: float,
         gap_pct: float,
         prior_session_low: Optional[float],
+        bar_index: int = 0,
     ) -> Optional[BreakoutCandidate]:
         """
         Check for short breakout (new low).
@@ -251,6 +255,7 @@ class BreakoutConditionChecker:
             bar_close_pct=bar_close_pct,
             volume_ratio=volume_ratio,
             gap_pct=gap_pct,
+            bar_index=bar_index,
             score=score,
         )
 
