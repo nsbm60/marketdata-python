@@ -41,6 +41,14 @@ class SessionSummary:
     volume: int
 
 
+@dataclass
+class TradingSession:
+    """A single trading day with UTC open/close."""
+    date: date
+    open_utc: datetime
+    close_utc: datetime
+
+
 def get_bars(
     router_url: str,
     symbol: str,
@@ -227,6 +235,62 @@ def subscribe_with_backfill(
             return response
         else:
             return None
+    finally:
+        dealer.close(linger=0)
+        ctx.term()
+
+
+def get_trading_sessions(
+    router_url: str,
+    start_date: date,
+    end_date: date,
+    timeout_ms: int = 10000,
+) -> list[TradingSession]:
+    """
+    Fetch trading sessions (dates + UTC open/close) from MDS.
+
+    Args:
+        router_url: MDS router endpoint
+        start_date: Start date (inclusive)
+        end_date: End date (inclusive)
+        timeout_ms: Request timeout (default 10s — may return many days)
+
+    Returns:
+        List of TradingSession in chronological order
+    """
+    ctx = zmq.Context()
+    dealer = ctx.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    dealer.connect(router_url)
+
+    try:
+        request = {
+            "op": "get_trading_sessions",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        }
+        dealer.send_string(json.dumps(request))
+
+        if dealer.poll(timeout=timeout_ms):
+            response = json.loads(dealer.recv_string())
+            if not response.get("ok"):
+                raise RuntimeError(
+                    f"MDS error for get_trading_sessions: "
+                    f"{response.get('error', 'unknown')}"
+                )
+
+            sessions = []
+            for s in response.get("sessions", []):
+                sessions.append(TradingSession(
+                    date=date.fromisoformat(s["date"]),
+                    open_utc=datetime.fromisoformat(
+                        s["open_utc"].replace("Z", "+00:00")),
+                    close_utc=datetime.fromisoformat(
+                        s["close_utc"].replace("Z", "+00:00")),
+                ))
+            return sessions
+        else:
+            raise RuntimeError("MDS timeout for get_trading_sessions")
     finally:
         dealer.close(linger=0)
         ctx.term()
