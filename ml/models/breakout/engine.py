@@ -187,6 +187,22 @@ class BreakoutEngine:
         # Check breakout conditions
         return self._check_breakout(symbol, bar)
 
+    def warmup_bar(self, symbol: str, bar: Bar) -> None:
+        """Replay a historical bar to build state without checking breakouts.
+
+        Used during startup warmup — levels and volume must be seeded from
+        today's bars before live detection begins.
+        """
+        if self.session_open.get(symbol) is None:
+            self.session_open[symbol] = bar.open
+            prior = self.prior_close.get(symbol)
+            if prior is not None and prior > 0:
+                self.gap_pct[symbol] = (bar.open - prior) / prior
+
+        self.levels[symbol].update(bar)
+        self.volume_calcs[symbol].update(bar.volume)
+        self._bar_index[symbol] = self._bar_index.get(symbol, 0) + 1
+
     def reset_session(self, symbols: list[str]) -> None:
         """Reset intraday state at session boundary."""
         for symbol in symbols:

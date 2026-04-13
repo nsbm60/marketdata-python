@@ -1,8 +1,9 @@
 """
 ml/models/breakout/detector_service.py
 
-Breakout detection service that consumes 5m bars and EMA/ATR indicators
-from MDS via ZMQ subscription, and generates breakout signals.
+Multi-timeframe breakout detection service. Consumes bars and EMA/ATR
+indicators from MDS via ZMQ subscription across all timeframes, and
+generates breakout signals using BreakoutEngine.
 """
 
 import json
@@ -22,47 +23,22 @@ from discovery.service_locator import ServiceLocator
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
 
-from ml.models.breakout.types import Bar, RibbonState, VolumeAverageCalculator
-from ml.models.breakout.level_tracker import LevelTracker
-from ml.models.breakout.signal_generator import (
-    BreakoutConditionChecker, SignalConfig, BreakoutCandidate
-)
+from ml.models.breakout.engine import BreakoutEngine
+from ml.models.breakout.persistence import BreakoutPersistor
+from ml.models.breakout.signal_generator import BreakoutCandidate, SignalConfig
+from ml.models.breakout.types import Bar
 
 log = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
 
-BAR_5M_TOPIC_PREFIX  = "md.equity.bar.5m."
-IND_EMA_TOPIC_PREFIX = "md.equity.indicator.ema.5m."
-IND_ATR_TOPIC_PREFIX = "md.equity.indicator.atr.5m."
-CAL_TOPIC_PREFIX     = "cal."
-
-# MDS publishes "BULLISH_ALIGNED" etc.; local signal_generator uses RibbonState enum
-# with different value strings. This map bridges the two.
-_MDS_RIBBON_MAP = {
-    "BULLISH_ALIGNED": RibbonState.ORDERED_BULLISH,
-    "BEARISH_ALIGNED": RibbonState.ORDERED_BEARISH,
-    "MIXED":           RibbonState.TRANSITIONAL,
-    "WARMING":         RibbonState.TRANSITIONAL,  # safety fallback — warm check gates before here
-}
-
-
-def _mds_to_ribbon_state(mds_state: str) -> RibbonState:
-    """Convert MDS ribbon_state string to local RibbonState enum."""
-    return _MDS_RIBBON_MAP.get(mds_state, RibbonState.TRANSITIONAL)
-
-
-def _ribbon_spread_pct(ind: "IndicatorState", close: float) -> float:
-    """Compute ribbon spread % from MDS indicator state."""
-    if ind.ema10 is None or ind.ema30 is None or close <= 0:
-        return 0.0
-    return abs(ind.ema10 - ind.ema30) / close
+TIMEFRAMES = ["1m", "5m", "10m", "15m", "20m", "30m", "60m"]
+CAL_TOPIC_PREFIX = "cal."
 
 
 @dataclass
 class BreakoutConfig:
     """Configuration for breakout detection."""
     phase: int = 0                       # 0=log only, 1=publish signals
-    timeframe_minutes: int = 5
     level_age_threshold: int = 30        # Min minutes level must be aged
     ribbon_age_threshold: int = 3        # Min bars in ordered state
     ribbon_spread_min_pct: float = 0.1   # Min ribbon spread %
@@ -72,53 +48,49 @@ class BreakoutConfig:
     clear_air_atr_min: float = 0.5       # Min distance to prior level
     gap_atr_threshold: float = 2.0       # Max gap in ATR units
 
-
-@dataclass
-class IndicatorState:
-    """Latest indicator values from MDS for one symbol."""
-    ema10:        Optional[float] = None
-    ema15:        Optional[float] = None
-    ema20:        Optional[float] = None
-    ema25:        Optional[float] = None
-    ema30:        Optional[float] = None
-    ribbon_state: str = "WARMING"
-    ema_warm:     bool = False
-    atr:          Optional[float] = None
-    atr_warm:     bool = False
-    bar_index:    int = 0
-    bar_time:     Optional[datetime] = None
-    seq:          int = 0
+    def to_signal_config(self) -> SignalConfig:
+        """Convert to SignalConfig for BreakoutEngine."""
+        return SignalConfig(
+            level_age_threshold=self.level_age_threshold,
+            ribbon_age_threshold=self.ribbon_age_threshold,
+            ribbon_spread_min_pct=self.ribbon_spread_min_pct,
+            break_bar_atr_min=self.break_bar_atr_min,
+            break_bar_close_pct=self.break_bar_close_pct,
+            volume_ratio_min=self.volume_ratio_min,
+            clear_air_atr_min=self.clear_air_atr_min,
+            gap_atr_threshold=self.gap_atr_threshold,
+        )
 
 
 class BreakoutDetector:
     """
-    Main breakout detection service.
+    Multi-timeframe breakout detection service.
 
-    Subscribes to 1m bars from MDS, aggregates to 5m bars,
-    and checks for breakout conditions on each completed 5m bar.
+    Runs one BreakoutEngine per timeframe, all within a single process.
+    Subscribes to bars and indicators from MDS for all timeframes and
+    routes messages to the correct engine.
     """
 
-    def __init__(self, config: BreakoutConfig = None, dry_run: bool = True):
+    def __init__(self, config: BreakoutConfig = None, dry_run: bool = True,
+                 timeframes: list[str] = None):
         self.config = config or BreakoutConfig()
         self.dry_run = dry_run
+        self.timeframes = timeframes or TIMEFRAMES
         self.symbols: list[str] = []
 
-        # Per-symbol state
-        self.indicators: dict[str, IndicatorState] = {}
-        self.levels: dict[str, LevelTracker] = {}
-        self.volume_calcs: dict[str, VolumeAverageCalculator] = {}
+        # One engine per timeframe
+        self.engines: dict[str, BreakoutEngine] = {}
 
-        # Session state
-        self.prior_close: dict[str, Optional[float]] = defaultdict(lambda: None)
-        self.prior_session_high: dict[str, Optional[float]] = defaultdict(lambda: None)
-        self.prior_session_low: dict[str, Optional[float]] = defaultdict(lambda: None)
-        self.session_open: dict[str, Optional[float]] = defaultdict(lambda: None)
-        self.gap_pct: dict[str, float] = defaultdict(float)
+        # Topic prefix -> (timeframe, kind) for O(1) routing
+        self._topic_routes: dict[str, tuple[str, str]] = {}
 
         # MDS connection
         self._mds_router_url: Optional[str] = None
         self._context: Optional[zmq.Context] = None
         self._sub: Optional[zmq.Socket] = None
+
+        # Persistence
+        self._persistor: Optional[BreakoutPersistor] = None
 
         # Control
         self._running = False
@@ -127,7 +99,8 @@ class BreakoutDetector:
 
     def start(self):
         """Start the breakout detector service."""
-        log.info("Starting Breakout Detector...")
+        log.info("Starting Multi-Timeframe Breakout Detector...")
+        log.info(f"Timeframes: {self.timeframes}")
         log.info(f"Phase: {self.config.phase}, Dry run: {self.dry_run}")
 
         # Discover MDS
@@ -145,21 +118,41 @@ class BreakoutDetector:
         self.symbols = fetch_symbol_list(self._mds_router_url, "trading_universe")
         log.info(f"Trading universe: {len(self.symbols)} symbols")
 
-        # Initialize per-symbol state
-        self._init_symbol_state()
+        # Create engines
+        signal_config = self.config.to_signal_config()
+        for tf in self.timeframes:
+            engine = BreakoutEngine(tf, signal_config)
+            engine.init_symbols(self.symbols)
+            self.engines[tf] = engine
+        log.info(f"Created {len(self.engines)} engines")
+
+        # Build topic routing table
+        for tf in self.timeframes:
+            self._topic_routes[f"md.equity.bar.{tf}."] = (tf, "bar")
+            self._topic_routes[f"md.equity.indicator.ema.{tf}."] = (tf, "ema")
+            self._topic_routes[f"md.equity.indicator.atr.{tf}."] = (tf, "atr")
 
         # Setup ZMQ FIRST — subscribe to all topics before any RPC calls.
         # Required by subscribe_with_backfill ADR for gap-free indicator seeding.
         self._setup_zmq(market_data_url)
 
-        # Fetch prior session data
+        # Fetch prior session data and seed all engines
         self._fetch_prior_session_data()
 
-        # Warm up levels from today's 5m bars (via MDS get_bars RPC)
-        self._warmup_levels()
+        # Warm up levels and indicators per timeframe
+        for tf in self.timeframes:
+            self._warmup_levels(tf)
+            self._warmup_indicators(tf)
 
-        # Seed indicator state from MDS (via subscribe_with_backfill RPC)
-        self._warmup_indicators()
+        # Init persistence
+        if not self.dry_run:
+            try:
+                from ml.shared.clickhouse import get_ch_client
+                ch = get_ch_client()
+                self._persistor = BreakoutPersistor(ch)
+                log.info("ClickHouse persistor initialized")
+            except Exception as e:
+                log.warning(f"ClickHouse not available, running without persistence: {e}")
 
         # Set _today AFTER warmup to prevent reset
         self._today = datetime.now(NY).date()
@@ -181,23 +174,17 @@ class BreakoutDetector:
         log.info("Breakout Detector started")
         self._main_loop()
 
-    def _init_symbol_state(self):
-        """Initialize per-symbol state objects."""
-        for symbol in self.symbols:
-            self.indicators[symbol] = IndicatorState()
-            self.levels[symbol] = LevelTracker(symbol, self.config.timeframe_minutes)
-            self.volume_calcs[symbol] = VolumeAverageCalculator()
-
     def _fetch_prior_session_data(self):
-        """Fetch prior session data from MDS for all symbols."""
+        """Fetch prior session data from MDS and seed all engines."""
         log.info("Fetching prior session data...")
         for symbol in self.symbols:
             try:
                 session = get_prior_session(self._mds_router_url, symbol)
                 if session:
-                    self.prior_close[symbol] = session.close
-                    self.prior_session_high[symbol] = session.high
-                    self.prior_session_low[symbol] = session.low
+                    for engine in self.engines.values():
+                        engine.set_prior_session(
+                            symbol, session.close, session.high, session.low
+                        )
                     log.debug(f"{symbol} prior: close={session.close:.2f}, "
                               f"high={session.high:.2f}, low={session.low:.2f}")
                 else:
@@ -205,90 +192,74 @@ class BreakoutDetector:
             except Exception as e:
                 log.warning(f"Failed to fetch prior session for {symbol}: {e}")
 
-    def _warmup_levels(self):
-        """Warm up LevelTracker from today's 5m bars fetched from MDS.
+    def _warmup_levels(self, tf: str):
+        """Warm up levels and volume from today's bars for one timeframe.
 
-        Indicator state comes from MDS via subscribe_with_backfill —
-        do not recompute locally.
+        Uses engine.warmup_bar() to avoid triggering breakout detection
+        on historical bars.
         """
         today_et = datetime.now(NY).date()
+        engine = self.engines[tf]
 
         for symbol in self.symbols:
             try:
                 bars = get_bars(self._mds_router_url, symbol,
-                                bar_date=today_et, period="5m", session=1)
+                                bar_date=today_et, period=tf, session=1)
 
                 if not bars:
-                    log.debug(f"{symbol}: no 5m bars for level warmup")
+                    log.debug(f"{symbol} {tf}: no bars for level warmup")
                     continue
 
-                # Re-initialize level tracker with prior session data
-                self.levels[symbol] = LevelTracker(
-                    symbol,
-                    timeframe_minutes=self.config.timeframe_minutes,
-                    prior_close=self.prior_close[symbol],
-                    prior_session_high=self.prior_session_high[symbol],
-                    prior_session_low=self.prior_session_low[symbol],
-                )
-
-                # Track session open from first bar
-                if self.session_open[symbol] is None and bars:
-                    self.session_open[symbol] = bars[0].open
-                    if self.prior_close[symbol] is not None:
-                        self.gap_pct[symbol] = (
-                            (bars[0].open - self.prior_close[symbol])
-                            / self.prior_close[symbol]
-                        )
-
-                # Replay 5m bars through level tracker only
-                for bar in bars:
+                for bar_rec in bars:
                     bar = Bar(
-                        ts=bar.ts, open=bar.open, high=bar.high,
-                        low=bar.low, close=bar.close, volume=bar.volume,
-                        vwap=bar.vwap,
+                        ts=bar_rec.ts, open=bar_rec.open, high=bar_rec.high,
+                        low=bar_rec.low, close=bar_rec.close,
+                        volume=bar_rec.volume, vwap=bar_rec.vwap,
                     )
-                    self.levels[symbol].update(bar)
-                    self.volume_calcs[symbol].update(bar.volume)
+                    engine.warmup_bar(symbol, bar)
 
-                log.info(f"{symbol}: warmed levels from {len(bars)} 5m bars "
-                         f"(high_age={self.levels[symbol].high_age_minutes()}min)")
+                level_age = engine.levels[symbol].high_age_minutes()
+                log.info(f"{symbol} {tf}: warmed from {len(bars)} bars "
+                         f"(high_age={level_age}min)")
 
             except Exception as e:
-                log.warning(f"Failed to warmup levels for {symbol}: {e}")
+                log.warning(f"Failed to warmup levels for {symbol} {tf}: {e}")
 
-    def _warmup_indicators(self):
-        """Seed indicator state from MDS via subscribe_with_backfill.
+    def _warmup_indicators(self, tf: str):
+        """Seed indicator state from MDS via subscribe_with_backfill for one timeframe.
 
         ZMQ SUB topics must already be subscribed (done in _setup_zmq)
         before this is called — per subscribe_with_backfill ADR.
         """
+        engine = self.engines[tf]
+
         for symbol in self.symbols:
             try:
                 snapshot = subscribe_with_backfill(
-                    self._mds_router_url, symbol, "indicators", timeframe="5m"
+                    self._mds_router_url, symbol, "indicators", timeframe=tf
                 )
                 if snapshot and snapshot.get("ok"):
                     snap = snapshot["snapshot"]
-                    state = self.indicators[symbol]
                     ema = snap.get("ema", {})
-                    atr = snap.get("atr", {})
-                    state.ema10        = ema.get("ema10")
-                    state.ema15        = ema.get("ema15")
-                    state.ema20        = ema.get("ema20")
-                    state.ema25        = ema.get("ema25")
-                    state.ema30        = ema.get("ema30")
-                    state.ribbon_state = ema.get("ribbon_state", "WARMING")
-                    state.ema_warm     = ema.get("warm", False)
-                    state.atr          = atr.get("atr")
-                    state.atr_warm     = atr.get("warm", False)
-                    state.seq          = snapshot.get("seq", 0)
-                    log.info(f"{symbol} indicator snapshot: ribbon={state.ribbon_state} "
-                             f"warm={state.ema_warm} atr={f'{state.atr:.4f}' if state.atr else 'N/A'}")
+                    atr_data = snap.get("atr", {})
+                    engine.update_indicator(
+                        symbol,
+                        ema_dict=ema,
+                        ribbon_state=ema.get("ribbon_state", "WARMING"),
+                        ema_warm=ema.get("warm", False),
+                        atr_value=atr_data.get("atr"),
+                        atr_warm=atr_data.get("warm", False),
+                        bar_index=ema.get("bar_index", 0),
+                        seq=snapshot.get("seq", 0),
+                    )
+                    ind = engine.indicators[symbol]
+                    log.info(f"{symbol} {tf} indicators: ribbon={ind.ribbon_state} "
+                             f"warm={ind.ema_warm} atr={f'{ind.atr:.4f}' if ind.atr else 'N/A'}")
                 else:
                     error = snapshot.get("error", "unknown") if snapshot else "timeout"
-                    log.warning(f"{symbol}: subscribe_with_backfill failed: {error}")
+                    log.warning(f"{symbol} {tf}: subscribe_with_backfill failed: {error}")
             except Exception as e:
-                log.warning(f"Failed to seed indicators for {symbol}: {e}")
+                log.warning(f"Failed to seed indicators for {symbol} {tf}: {e}")
 
     def _setup_zmq(self, market_data_endpoint: str):
         """Setup ZMQ sockets.
@@ -303,14 +274,21 @@ class BreakoutDetector:
         # Subscribe to calendar events
         self._sub.setsockopt_string(zmq.SUBSCRIBE, CAL_TOPIC_PREFIX)
 
-        # Subscribe to 5m bars and indicators for all symbols
-        for symbol in self.symbols:
-            self._sub.setsockopt_string(zmq.SUBSCRIBE, f"{BAR_5M_TOPIC_PREFIX}{symbol}")
-            self._sub.setsockopt_string(zmq.SUBSCRIBE, f"{IND_EMA_TOPIC_PREFIX}{symbol}")
-            self._sub.setsockopt_string(zmq.SUBSCRIBE, f"{IND_ATR_TOPIC_PREFIX}{symbol}")
+        # Subscribe per timeframe × symbol
+        topic_count = 0
+        for tf in self.timeframes:
+            for symbol in self.symbols:
+                self._sub.setsockopt_string(
+                    zmq.SUBSCRIBE, f"md.equity.bar.{tf}.{symbol}")
+                self._sub.setsockopt_string(
+                    zmq.SUBSCRIBE, f"md.equity.indicator.ema.{tf}.{symbol}")
+                self._sub.setsockopt_string(
+                    zmq.SUBSCRIBE, f"md.equity.indicator.atr.{tf}.{symbol}")
+                topic_count += 3
 
         self._sub.setsockopt(zmq.RCVTIMEO, 100)
-        log.info(f"Subscribed to {len(self.symbols)} symbols (5m bars + EMA + ATR)")
+        log.info(f"Subscribed to {topic_count} topics "
+                 f"({len(self.symbols)} symbols x {len(self.timeframes)} timeframes)")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
@@ -318,7 +296,7 @@ class BreakoutDetector:
         self._running = False
 
     def _bar_ingestion_loop(self):
-        """Receive and process bars from ZMQ."""
+        """Receive and process messages from ZMQ."""
         log.info("Bar ingestion thread started")
         while self._running:
             try:
@@ -335,24 +313,25 @@ class BreakoutDetector:
         log.info("Bar ingestion thread stopped")
 
     def _handle_message(self, topic: str, payload: str):
-        """Route incoming ZMQ message."""
-        if topic.startswith(BAR_5M_TOPIC_PREFIX):
-            symbol = topic[len(BAR_5M_TOPIC_PREFIX):]
-            if symbol in self.symbols:
-                self._handle_bar_5m(symbol, payload)
-        elif topic.startswith(IND_EMA_TOPIC_PREFIX):
-            symbol = topic[len(IND_EMA_TOPIC_PREFIX):]
-            if symbol in self.symbols:
-                self._handle_ema(symbol, payload)
-        elif topic.startswith(IND_ATR_TOPIC_PREFIX):
-            symbol = topic[len(IND_ATR_TOPIC_PREFIX):]
-            if symbol in self.symbols:
-                self._handle_atr(symbol, payload)
-        elif topic.startswith(CAL_TOPIC_PREFIX):
+        """Route incoming ZMQ message to the correct engine."""
+        for prefix, (tf, kind) in self._topic_routes.items():
+            if topic.startswith(prefix):
+                symbol = topic[len(prefix):]
+                if symbol not in self.symbols:
+                    return
+                if kind == "bar":
+                    self._handle_bar(tf, symbol, payload)
+                elif kind == "ema":
+                    self._handle_ema(tf, symbol, payload)
+                elif kind == "atr":
+                    self._handle_atr(tf, symbol, payload)
+                return
+
+        if topic.startswith(CAL_TOPIC_PREFIX):
             self._handle_calendar(topic, payload)
 
-    def _handle_bar_5m(self, symbol: str, payload: str):
-        """Process completed 5m bar from MDS."""
+    def _handle_bar(self, tf: str, symbol: str, payload: str):
+        """Process completed bar from MDS."""
         try:
             data = json.loads(payload)
             bar_data = data["data"]
@@ -375,65 +354,44 @@ class BreakoutDetector:
                 vwap=float(bar_data.get("vwap", bar_data["close"])),
             )
 
-            # Track session open
-            if self.session_open[symbol] is None:
-                self.session_open[symbol] = bar.open
-                if self.prior_close[symbol] is not None:
-                    self.gap_pct[symbol] = (
-                        (bar.open - self.prior_close[symbol])
-                        / self.prior_close[symbol]
-                    )
-                    log.info(f"{symbol} gap: {self.gap_pct[symbol]*100:.2f}%")
-
-            # Update level tracker and volume calc
-            self.levels[symbol].update(bar)
-            self.volume_calcs[symbol].update(bar.volume)
-
-            log.debug(f"5m bar: {symbol} {ts.strftime('%H:%M')} "
+            log.debug(f"{tf} bar: {symbol} {ts.strftime('%H:%M')} "
                       f"O={bar.open:.2f} H={bar.high:.2f} "
                       f"L={bar.low:.2f} C={bar.close:.2f}")
 
-            # Check for breakout using MDS indicators
-            self._check_breakout(symbol, bar)
+            candidates = self.engines[tf].on_bar(symbol, bar)
+            for c in candidates:
+                self._handle_signal(c, tf)
 
         except Exception as e:
-            log.warning(f"Error processing 5m bar for {symbol}: {e}")
+            log.warning(f"Error processing {tf} bar for {symbol}: {e}")
 
-    def _handle_ema(self, symbol: str, payload: str):
+    def _handle_ema(self, tf: str, symbol: str, payload: str):
         """Update EMA ribbon state from MDS."""
         try:
             data = json.loads(payload)
-            seq = data.get("seq", 0)
-            state = self.indicators[symbol]
-            if seq <= state.seq:
-                return  # dedup per subscribe_with_backfill ADR
-            state.seq          = seq
-            state.ema10        = data.get("ema10")
-            state.ema15        = data.get("ema15")
-            state.ema20        = data.get("ema20")
-            state.ema25        = data.get("ema25")
-            state.ema30        = data.get("ema30")
-            state.ribbon_state = data.get("ribbon_state", "WARMING")
-            state.ema_warm     = data.get("warm", False)
-            state.bar_index    = data.get("bar_index", 0)
-            state.bar_time     = datetime.fromisoformat(
-                data["bar_time"].replace("Z", "+00:00")
-            ) if "bar_time" in data else None
+            self.engines[tf].update_indicator(
+                symbol,
+                ema_dict=data,
+                ribbon_state=data.get("ribbon_state"),
+                ema_warm=data.get("warm"),
+                bar_index=data.get("bar_index"),
+                seq=data.get("seq", 0),
+            )
         except Exception as e:
-            log.warning(f"Error processing EMA for {symbol}: {e}")
+            log.warning(f"Error processing EMA for {symbol} {tf}: {e}")
 
-    def _handle_atr(self, symbol: str, payload: str):
+    def _handle_atr(self, tf: str, symbol: str, payload: str):
         """Update ATR state from MDS."""
         try:
             data = json.loads(payload)
-            seq = data.get("seq", 0)
-            state = self.indicators[symbol]
-            # ATR shares seq with EMA — use max to avoid regression
-            state.seq      = max(state.seq, seq)
-            state.atr      = data.get("atr")
-            state.atr_warm = data.get("warm", False)
+            self.engines[tf].update_indicator(
+                symbol,
+                atr_value=data.get("atr"),
+                atr_warm=data.get("warm"),
+                seq=data.get("seq", 0),
+            )
         except Exception as e:
-            log.warning(f"Error processing ATR for {symbol}: {e}")
+            log.warning(f"Error processing ATR for {symbol} {tf}: {e}")
 
     def _handle_calendar(self, topic: str, payload: str):
         """Process calendar event."""
@@ -446,110 +404,40 @@ class BreakoutDetector:
                 self._reset_session_state()
             elif event_type == "market_close":
                 log.info("Market close event")
+                if self._persistor:
+                    self._persistor.flush()
 
         except Exception as e:
             log.warning(f"Error processing calendar: {e}")
 
-    def _reset_session_state(self):
-        """Reset state for new trading session.
-
-        Does not call _warmup_levels() — at market open the new session
-        has no 5m bars yet. Level state rebuilds naturally from incoming bars.
-        """
-        log.info("Resetting session state")
-        self._today = datetime.now(NY).date()
-        self._signals_today.clear()
-
-        for symbol in self.symbols:
-            self.indicators[symbol] = IndicatorState()
-            self.levels[symbol].clear()
-            self.volume_calcs[symbol].reset()
-            self.session_open[symbol] = None
-            self.gap_pct[symbol] = 0.0
-
-        self._fetch_prior_session_data()
-        self._warmup_indicators()
-
-    def _check_breakout(self, symbol: str, bar: Bar):
-        """Check for breakout conditions using MDS indicator state."""
-        ind = self.indicators[symbol]
-        levels = self.levels[symbol]
-        vol_calc = self.volume_calcs[symbol]
-
-        # Need warm indicators from MDS
-        if not ind.ema_warm or not ind.atr_warm:
-            log.debug(f"{symbol} indicators not warm: ema={ind.ema_warm} atr={ind.atr_warm}")
-            return
-
-        if ind.atr is None or ind.atr <= 0:
-            return
-
-        atr = ind.atr
-        avg_vol = vol_calc.value
-        volume_ratio = bar.volume / avg_vol if avg_vol and avg_vol > 0 else 1.0
-
-        signal_config = SignalConfig(
-            level_age_threshold=self.config.level_age_threshold,
-            ribbon_age_threshold=self.config.ribbon_age_threshold,
-            ribbon_spread_min_pct=self.config.ribbon_spread_min_pct,
-            break_bar_atr_min=self.config.break_bar_atr_min,
-            break_bar_close_pct=self.config.break_bar_close_pct,
-            volume_ratio_min=self.config.volume_ratio_min,
-            clear_air_atr_min=self.config.clear_air_atr_min,
-            gap_atr_threshold=self.config.gap_atr_threshold,
-        )
-        checker = BreakoutConditionChecker(signal_config)
-
-        ribbon_state = _mds_to_ribbon_state(ind.ribbon_state)
-
-        # Check long breakout
-        if levels.high_price is not None:
-            candidate = checker.check_long_breakout(
-                symbol=symbol,
-                bar=bar,
-                level_price=levels.high_price,
-                level_age_minutes=levels.high_age_minutes(),
-                ribbon_state=ribbon_state,
-                # bar_index is a proxy for ribbon age — it's the count of
-                # completed bars this session, not consecutive bars in the
-                # current ribbon state. Reasonable approximation.
-                ribbon_age=ind.bar_index,
-                ribbon_spread_pct=_ribbon_spread_pct(ind, bar.close),
-                atr=atr,
-                volume_ratio=volume_ratio,
-                gap_pct=self.gap_pct[symbol],
-                prior_session_high=self.prior_session_high[symbol],
-            )
-            if candidate:
-                self._handle_signal(candidate)
-
-        # Check short breakout
-        if levels.low_price is not None:
-            candidate = checker.check_short_breakout(
-                symbol=symbol,
-                bar=bar,
-                level_price=levels.low_price,
-                level_age_minutes=levels.low_age_minutes(),
-                ribbon_state=ribbon_state,
-                ribbon_age=ind.bar_index,
-                ribbon_spread_pct=_ribbon_spread_pct(ind, bar.close),
-                atr=atr,
-                volume_ratio=volume_ratio,
-                gap_pct=self.gap_pct[symbol],
-                prior_session_low=self.prior_session_low[symbol],
-            )
-            if candidate:
-                self._handle_signal(candidate)
-
-    def _handle_signal(self, candidate: BreakoutCandidate):
+    def _handle_signal(self, candidate: BreakoutCandidate, timeframe: str):
         """Handle detected breakout signal."""
-        log.info(f"BREAKOUT: {candidate.symbol} {candidate.direction.value} "
-                 f"@ {candidate.price:.2f} (score={candidate.score})")
+        log.info(f"BREAKOUT [{timeframe}]: {candidate.symbol} "
+                 f"{candidate.direction.value} @ {candidate.price:.2f} "
+                 f"(score={candidate.score})")
 
         self._signals_today[candidate.symbol].append(candidate)
 
-        # TODO: Persist to ClickHouse
-        # TODO: Publish to ZMQ if phase >= 1
+        if self._persistor:
+            self._persistor.persist(
+                candidate,
+                timeframe=timeframe,
+                session_date=datetime.now(NY).date(),
+                source="live",
+            )
+
+    def _reset_session_state(self):
+        """Reset state for new trading session."""
+        log.info("Resetting session state for all timeframes")
+        self._today = datetime.now(NY).date()
+        self._signals_today.clear()
+
+        for engine in self.engines.values():
+            engine.reset_session(self.symbols)
+
+        self._fetch_prior_session_data()
+        for tf in self.timeframes:
+            self._warmup_indicators(tf)
 
     def _main_loop(self):
         """Main loop - monitors session state."""
@@ -564,6 +452,8 @@ class BreakoutDetector:
 
         # Cleanup
         log.info("Shutting down...")
+        if self._persistor:
+            self._persistor.flush()
         if self._sub:
             self._sub.close()
         if self._context:
@@ -574,10 +464,12 @@ def main():
     """Entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Breakout Detector Service")
+    parser = argparse.ArgumentParser(description="Multi-Timeframe Breakout Detector")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--dry-run", action="store_true", default=True,
                         help="Dry run mode (no persistence)")
+    parser.add_argument("--timeframes", type=str, default=None,
+                        help="Comma-separated timeframes (default: all)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -586,8 +478,10 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    timeframes = args.timeframes.split(",") if args.timeframes else None
     config = BreakoutConfig()
-    detector = BreakoutDetector(config=config, dry_run=args.dry_run)
+    detector = BreakoutDetector(config=config, dry_run=args.dry_run,
+                                timeframes=timeframes)
     detector.start()
 
 
