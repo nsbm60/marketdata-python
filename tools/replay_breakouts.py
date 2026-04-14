@@ -34,6 +34,7 @@ from ml.models.breakout.types import Bar, PivotPoint
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import TradingSession, get_trading_sessions
+from ml.shared.utils import utc_dt
 
 log = logging.getLogger("ReplayBreakouts")
 
@@ -96,8 +97,9 @@ def query_bars(
     )
     bars = []
     for row in result.result_rows:
+        ts = utc_dt(row[0])
         bars.append(Bar(
-            ts=row[0],
+            ts=ts,
             open=float(row[1]),
             high=float(row[2]),
             low=float(row[3]),
@@ -135,8 +137,8 @@ def query_pivots(
         PivotPoint(
             direction="high" if row[1] == "pivot_high" else "low",
             price=float(row[2]),
-            pivot_ts=row[0],
-            confirmed_ts=row[3],
+            pivot_ts=utc_dt(row[0]),
+            confirmed_ts=utc_dt(row[3]),
             pivot_bar_index=int(row[4]),
         )
         for row in result.result_rows
@@ -165,7 +167,7 @@ def query_indicators(
             "close_utc": session.close_utc,
         },
     )
-    return [(row[0], row[1], float(row[2])) for row in result.result_rows]
+    return [(utc_dt(row[0]), row[1], float(row[2])) for row in result.result_rows]
 
 
 def _derive_ribbon_state(ema_dict: dict[str, float]) -> str:
@@ -260,7 +262,7 @@ def replay(
     persistor = BreakoutPersistor(ch, flush_size=flush_size)
 
     # Loose thresholds for replay — cast a wide net, let Model 2 learn
-    signal_config = SignalConfig()
+    signal_config = SignalConfig(ribbon_spread_min_pct=0.001)
 
     total_candidates = 0
     t0 = time.time()
