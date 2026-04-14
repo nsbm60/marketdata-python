@@ -21,12 +21,14 @@ import zmq
 
 from discovery.service_locator import ServiceLocator
 from ml.shared.config import fetch_symbol_list
-from ml.shared.mds_client import get_bars, get_prior_session, subscribe_with_backfill
+from ml.shared.mds_client import (
+    get_bars, get_prior_session, parse_pivot_backfill, subscribe_with_backfill,
+)
 
 from ml.models.breakout.engine import BreakoutEngine
 from ml.models.breakout.persistence import BreakoutPersistor
 from ml.models.breakout.signal_generator import BreakoutCandidate, SignalConfig
-from ml.models.breakout.types import Bar
+from ml.models.breakout.types import Bar, PivotPoint
 
 log = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
@@ -131,6 +133,7 @@ class BreakoutDetector:
             self._topic_routes[f"md.equity.bar.{tf}."] = (tf, "bar")
             self._topic_routes[f"md.equity.indicator.ema.{tf}."] = (tf, "ema")
             self._topic_routes[f"md.equity.indicator.atr.{tf}."] = (tf, "atr")
+            self._topic_routes[f"md.equity.pivot.{tf}."] = (tf, "pivot")
 
         # Setup ZMQ FIRST — subscribe to all topics before any RPC calls.
         # Required by subscribe_with_backfill ADR for gap-free indicator seeding.
@@ -139,10 +142,11 @@ class BreakoutDetector:
         # Fetch prior session data and seed all engines
         self._fetch_prior_session_data()
 
-        # Warm up levels and indicators per timeframe
+        # Warm up volume, indicators, and pivots per timeframe
         for tf in self.timeframes:
-            self._warmup_levels(tf)
+            self._warmup_volume(tf)
             self._warmup_indicators(tf)
+            self._warmup_pivots(tf)
 
         # Init persistence
         if not self.dry_run:
@@ -192,11 +196,11 @@ class BreakoutDetector:
             except Exception as e:
                 log.warning(f"Failed to fetch prior session for {symbol}: {e}")
 
-    def _warmup_levels(self, tf: str):
-        """Warm up levels and volume from today's bars for one timeframe.
+    def _warmup_volume(self, tf: str):
+        """Warm up volume average from today's bars for one timeframe.
 
-        Uses engine.warmup_bar() to avoid triggering breakout detection
-        on historical bars.
+        Uses engine.warmup_bar() which updates VolumeAverageCalculator
+        without checking breakout conditions.
         """
         today_et = datetime.now(NY).date()
         engine = self.engines[tf]
@@ -207,7 +211,7 @@ class BreakoutDetector:
                                 bar_date=today_et, period=tf, session=1)
 
                 if not bars:
-                    log.debug(f"{symbol} {tf}: no bars for level warmup")
+                    log.debug(f"{symbol} {tf}: no bars for volume warmup")
                     continue
 
                 for bar_rec in bars:
@@ -218,12 +222,10 @@ class BreakoutDetector:
                     )
                     engine.warmup_bar(symbol, bar)
 
-                level_age = engine.levels[symbol].high_age_minutes()
-                log.info(f"{symbol} {tf}: warmed from {len(bars)} bars "
-                         f"(high_age={level_age}min)")
+                log.info(f"{symbol} {tf}: volume warmed from {len(bars)} bars")
 
             except Exception as e:
-                log.warning(f"Failed to warmup levels for {symbol} {tf}: {e}")
+                log.warning(f"Failed to warmup volume for {symbol} {tf}: {e}")
 
     def _warmup_indicators(self, tf: str):
         """Seed indicator state from MDS via subscribe_with_backfill for one timeframe.
@@ -261,6 +263,29 @@ class BreakoutDetector:
             except Exception as e:
                 log.warning(f"Failed to seed indicators for {symbol} {tf}: {e}")
 
+    def _warmup_pivots(self, tf: str):
+        """Seed pivot state from MDS via subscribe_with_backfill for one timeframe.
+
+        ZMQ SUB topics must already be subscribed (done in _setup_zmq)
+        before this is called — per subscribe_with_backfill ADR.
+        """
+        engine = self.engines[tf]
+
+        for symbol in self.symbols:
+            try:
+                response = subscribe_with_backfill(
+                    self._mds_router_url, symbol, "pivots", timeframe=tf
+                )
+                pivots = parse_pivot_backfill(response)
+                for pivot in pivots:
+                    engine.update_pivot(symbol, pivot)
+                if pivots:
+                    log.info(f"{symbol} {tf}: seeded {len(pivots)} pivots "
+                             f"(high={engine.pivots[symbol].high_price} "
+                             f"low={engine.pivots[symbol].low_price})")
+            except Exception as e:
+                log.warning(f"Failed to seed pivots for {symbol} {tf}: {e}")
+
     def _setup_zmq(self, market_data_endpoint: str):
         """Setup ZMQ sockets.
 
@@ -284,7 +309,9 @@ class BreakoutDetector:
                     zmq.SUBSCRIBE, f"md.equity.indicator.ema.{tf}.{symbol}")
                 self._sub.setsockopt_string(
                     zmq.SUBSCRIBE, f"md.equity.indicator.atr.{tf}.{symbol}")
-                topic_count += 3
+                self._sub.setsockopt_string(
+                    zmq.SUBSCRIBE, f"md.equity.pivot.{tf}.{symbol}")
+                topic_count += 4
 
         self._sub.setsockopt(zmq.RCVTIMEO, 100)
         log.info(f"Subscribed to {topic_count} topics "
@@ -325,6 +352,8 @@ class BreakoutDetector:
                     self._handle_ema(tf, symbol, payload)
                 elif kind == "atr":
                     self._handle_atr(tf, symbol, payload)
+                elif kind == "pivot":
+                    self._handle_pivot(tf, symbol, payload)
                 return
 
         if topic.startswith(CAL_TOPIC_PREFIX):
@@ -393,6 +422,29 @@ class BreakoutDetector:
         except Exception as e:
             log.warning(f"Error processing ATR for {symbol} {tf}: {e}")
 
+    def _handle_pivot(self, tf: str, symbol: str, payload: str):
+        """Process confirmed pivot point from MDS."""
+        try:
+            data = json.loads(payload)
+            pivot_ts = data["pivot_ts"]
+            if isinstance(pivot_ts, str):
+                pivot_ts = datetime.fromisoformat(
+                    pivot_ts.replace("Z", "+00:00"))
+            confirmed_ts = data["confirmed_ts"]
+            if isinstance(confirmed_ts, str):
+                confirmed_ts = datetime.fromisoformat(
+                    confirmed_ts.replace("Z", "+00:00"))
+            pivot = PivotPoint(
+                direction=data["direction"],
+                price=data["price"],
+                pivot_ts=pivot_ts,
+                confirmed_ts=confirmed_ts,
+                pivot_bar_index=data["pivot_bar_index"],
+            )
+            self.engines[tf].update_pivot(symbol, pivot)
+        except Exception as e:
+            log.warning(f"Error processing pivot for {symbol} {tf}: {e}")
+
     def _handle_calendar(self, topic: str, payload: str):
         """Process calendar event."""
         try:
@@ -438,6 +490,7 @@ class BreakoutDetector:
         self._fetch_prior_session_data()
         for tf in self.timeframes:
             self._warmup_indicators(tf)
+            self._warmup_pivots(tf)
 
     def _main_loop(self):
         """Main loop - monitors session state."""

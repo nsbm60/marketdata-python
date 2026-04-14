@@ -23,6 +23,16 @@ class Bar:
     vwap: float
 
 
+@dataclass(slots=True)
+class PivotPoint:
+    """Confirmed pivot point published by MDS."""
+    direction: str          # "high" or "low"
+    price: float
+    pivot_ts: datetime      # timestamp of the pivot bar (UTC)
+    confirmed_ts: datetime  # timestamp when confirmed, N bars later (UTC)
+    pivot_bar_index: int
+
+
 class RibbonState(Enum):
     """EMA ribbon alignment state."""
     ORDERED_BULLISH = "ordered_bullish"   # EMA10 > EMA15 > EMA20 > EMA25 > EMA30

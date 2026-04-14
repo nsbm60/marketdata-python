@@ -30,7 +30,7 @@ from discovery.service_locator import ServiceLocator
 from ml.models.breakout.engine import BreakoutEngine
 from ml.models.breakout.persistence import BreakoutPersistor
 from ml.models.breakout.signal_generator import SignalConfig
-from ml.models.breakout.types import Bar
+from ml.models.breakout.types import Bar, PivotPoint
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import TradingSession, get_trading_sessions
@@ -106,6 +106,41 @@ def query_bars(
             vwap=float(row[6]) if row[6] else float(row[4]),
         ))
     return bars
+
+
+def query_pivots(
+    ch, symbol: str, session: TradingSession, timeframe: str,
+) -> list[PivotPoint]:
+    """Fetch confirmed pivot points for one symbol on a trading date.
+
+    Reads from trading.indicator where indicator IN ('pivot_high', 'pivot_low').
+    Returns PivotPoints sorted by confirmed_ts so they can be fed into the
+    engine at the correct time during replay.
+    """
+    result = ch.query(
+        "SELECT ts, indicator, value, confirmed_ts, bar_index "
+        "FROM trading.indicator FINAL "
+        "WHERE symbol = %(symbol)s "
+        "  AND timeframe = %(tf)s "
+        "  AND trading_date = %(trading_date)s "
+        "  AND indicator IN ('pivot_high', 'pivot_low') "
+        "ORDER BY confirmed_ts",
+        parameters={
+            "symbol": symbol,
+            "tf": timeframe,
+            "trading_date": session.date,
+        },
+    )
+    return [
+        PivotPoint(
+            direction="high" if row[1] == "pivot_high" else "low",
+            price=float(row[2]),
+            pivot_ts=row[0],
+            confirmed_ts=row[3],
+            pivot_bar_index=int(row[4]),
+        )
+        for row in result.result_rows
+    ]
 
 
 def query_indicators(
@@ -206,7 +241,12 @@ def replay(
     sessions: list[TradingSession],
     flush_size: int = 200,
 ) -> int:
-    """Run historical replay. Returns total candidate count."""
+    """Run historical replay. Returns total candidate count.
+
+    The first day in *sessions* has no prior session and no confirmed pivots,
+    so no breakouts can fire.  Callers should include one trading day
+    before the desired analysis window so that levels are seeded.
+    """
 
     log.info(
         "Replay: %d trading days, %d symbols, %d timeframes",
@@ -238,6 +278,8 @@ def replay(
                 prior = query_prior_session(ch, symbols, prior_session, tf)
                 for symbol, (close, high, low) in prior.items():
                     engine.set_prior_session(symbol, close, high, low)
+            else:
+                log.warning("No prior session for %s — gap calculation unavailable", session.date)
 
             # Process each symbol
             tf_candidates = 0
@@ -252,7 +294,15 @@ def replay(
                     indicators = query_indicators(ch, symbol, session, tf)
                     ind_by_ts = pivot_indicators(indicators)
 
+                    # Fetch confirmed pivots, sorted by confirmed_ts
+                    pivots = query_pivots(ch, symbol, session, tf)
+                    pivot_idx = 0
+
                     for bar in bars:
+                        # Feed pivots confirmed at or before this bar
+                        while pivot_idx < len(pivots) and pivots[pivot_idx].confirmed_ts <= bar.ts:
+                            engine.update_pivot(symbol, pivots[pivot_idx])
+                            pivot_idx += 1
                         if bar.ts in ind_by_ts:
                             engine.update_indicator(symbol, **ind_by_ts[bar.ts])
                         candidates = engine.on_bar(symbol, bar)
@@ -302,7 +352,8 @@ def main():
         description="Replay breakout detection on historical data",
     )
     parser.add_argument("--start-date", type=str, required=True,
-                        help="Start date (YYYY-MM-DD)")
+                        help="Start date (YYYY-MM-DD) — set one trading day before "
+                             "first desired candidate date to seed prior session levels")
     parser.add_argument("--end-date", type=str, required=True,
                         help="End date (YYYY-MM-DD)")
     parser.add_argument("--symbols", type=str, default=None,

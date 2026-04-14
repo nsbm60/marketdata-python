@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 import zmq
 
+from ml.models.breakout.types import PivotPoint
+
 NY = ZoneInfo("America/New_York")
 
 
@@ -294,3 +296,33 @@ def get_trading_sessions(
     finally:
         dealer.close(linger=0)
         ctx.term()
+
+
+def parse_pivot_backfill(response: dict) -> list[PivotPoint]:
+    """Parse a subscribe_with_backfill(data_type='pivots') response.
+
+    Returns confirmed PivotPoints from the backfill snapshot, sorted by
+    confirmed_ts.  Returns an empty list if the response is not ok or
+    contains no pivots.
+    """
+    if not response or not response.get("ok"):
+        return []
+
+    pivots = []
+    for p in response.get("pivots", []):
+        pivot_ts = p["pivot_ts"]
+        if isinstance(pivot_ts, str):
+            pivot_ts = datetime.fromisoformat(pivot_ts.replace("Z", "+00:00"))
+        confirmed_ts = p["confirmed_ts"]
+        if isinstance(confirmed_ts, str):
+            confirmed_ts = datetime.fromisoformat(
+                confirmed_ts.replace("Z", "+00:00"))
+        pivots.append(PivotPoint(
+            direction=p["direction"],
+            price=p["price"],
+            pivot_ts=pivot_ts,
+            confirmed_ts=confirmed_ts,
+            pivot_bar_index=p["pivot_bar_index"],
+        ))
+    pivots.sort(key=lambda pp: pp.confirmed_ts)
+    return pivots

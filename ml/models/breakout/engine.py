@@ -13,13 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from ml.models.breakout.level_tracker import LevelTracker
+from ml.models.breakout.pivot_state import PivotState
 from ml.models.breakout.signal_generator import (
     BreakoutCandidate,
     BreakoutConditionChecker,
     SignalConfig,
 )
-from ml.models.breakout.types import Bar, RibbonState, VolumeAverageCalculator
+from ml.models.breakout.types import Bar, PivotPoint, RibbonState, VolumeAverageCalculator
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +62,8 @@ class BreakoutEngine:
     """
     Core breakout detection logic — timeframe and data-source agnostic.
 
-    Owns all per-symbol mutable state: LevelTracker, VolumeAverageCalculator,
-    IndicatorState, session open/gap. Processes bars one at a time and returns
+    Owns all per-symbol mutable state: PivotState, VolumeAverageCalculator,
+    IndicatorState, session open/gap.  Processes bars one at a time and returns
     any breakout candidates detected.
 
     Both the live detector (ZMQ) and historical replay (ClickHouse) use this
@@ -78,10 +78,9 @@ class BreakoutEngine:
         """
         self.timeframe = timeframe
         self.config = config
-        self._timeframe_minutes = _parse_timeframe_minutes(timeframe)
 
         # Per-symbol state — populated by init_symbols()
-        self.levels: dict[str, LevelTracker] = {}
+        self.pivots: dict[str, PivotState] = {}
         self.volume_calcs: dict[str, VolumeAverageCalculator] = {}
         self.indicators: dict[str, IndicatorState] = {}
         self.session_open: dict[str, Optional[float]] = {}
@@ -95,7 +94,7 @@ class BreakoutEngine:
         """Initialize per-symbol state for given symbols."""
         for symbol in symbols:
             self.indicators[symbol] = IndicatorState()
-            self.levels[symbol] = LevelTracker(symbol, self._timeframe_minutes)
+            self.pivots[symbol] = PivotState()
             self.volume_calcs[symbol] = VolumeAverageCalculator()
             self.session_open[symbol] = None
             self.gap_pct[symbol] = 0.0
@@ -108,18 +107,16 @@ class BreakoutEngine:
         self, symbol: str, close: float,
         high: float, low: float,
     ) -> None:
-        """Seed prior session data before replay or live session begins."""
+        """Seed prior session close/high/low for gap calculation."""
         self.prior_close[symbol] = close
         self.prior_session_high[symbol] = high
         self.prior_session_low[symbol] = low
-        # Re-create level tracker with prior session context
-        self.levels[symbol] = LevelTracker(
-            symbol,
-            timeframe_minutes=self._timeframe_minutes,
-            prior_close=close,
-            prior_session_high=high,
-            prior_session_low=low,
-        )
+
+    def update_pivot(self, symbol: str, pivot: PivotPoint) -> None:
+        """Record a confirmed pivot from MDS or ClickHouse replay."""
+        state = self.pivots.get(symbol)
+        if state is not None:
+            state.update(pivot)
 
     def update_indicator(
         self,
@@ -167,11 +164,7 @@ class BreakoutEngine:
             state.bar_index = bar_index
 
     def on_bar(self, symbol: str, bar: Bar) -> list[BreakoutCandidate]:
-        """Process a completed bar. Returns any breakout candidates detected.
-
-        Updates session open, gap, LevelTracker, VolumeAverageCalculator,
-        then checks breakout conditions.
-        """
+        """Process a completed bar. Returns any breakout candidates detected."""
         # Track session open from first bar
         if self.session_open.get(symbol) is None:
             self.session_open[symbol] = bar.open
@@ -179,27 +172,19 @@ class BreakoutEngine:
             if prior is not None and prior > 0:
                 self.gap_pct[symbol] = (bar.open - prior) / prior
 
-        # Update level tracker and volume calc
-        self.levels[symbol].update(bar)
         self.volume_calcs[symbol].update(bar.volume)
         self._bar_index[symbol] = self._bar_index.get(symbol, 0) + 1
 
-        # Check breakout conditions
         return self._check_breakout(symbol, bar)
 
     def warmup_bar(self, symbol: str, bar: Bar) -> None:
-        """Replay a historical bar to build state without checking breakouts.
-
-        Used during startup warmup — levels and volume must be seeded from
-        today's bars before live detection begins.
-        """
+        """Replay a historical bar for volume warmup without checking breakouts."""
         if self.session_open.get(symbol) is None:
             self.session_open[symbol] = bar.open
             prior = self.prior_close.get(symbol)
             if prior is not None and prior > 0:
                 self.gap_pct[symbol] = (bar.open - prior) / prior
 
-        self.levels[symbol].update(bar)
         self.volume_calcs[symbol].update(bar.volume)
         self._bar_index[symbol] = self._bar_index.get(symbol, 0) + 1
 
@@ -208,8 +193,8 @@ class BreakoutEngine:
         for symbol in symbols:
             if symbol in self.indicators:
                 self.indicators[symbol] = IndicatorState()
-            if symbol in self.levels:
-                self.levels[symbol].clear()
+            if symbol in self.pivots:
+                self.pivots[symbol].clear()
             if symbol in self.volume_calcs:
                 self.volume_calcs[symbol].reset()
             self.session_open[symbol] = None
@@ -223,10 +208,10 @@ class BreakoutEngine:
     def _check_breakout(self, symbol: str, bar: Bar) -> list[BreakoutCandidate]:
         """Check for breakout conditions using current indicator state."""
         ind = self.indicators.get(symbol)
-        levels = self.levels.get(symbol)
+        pivots = self.pivots.get(symbol)
         vol_calc = self.volume_calcs.get(symbol)
 
-        if ind is None or levels is None or vol_calc is None:
+        if ind is None or pivots is None or vol_calc is None:
             return []
 
         # Need warm indicators
@@ -248,12 +233,12 @@ class BreakoutEngine:
         candidates = []
 
         # Check long breakout
-        if levels.high_price is not None:
+        if pivots.high_price is not None:
             candidate = checker.check_long_breakout(
                 symbol=symbol,
                 bar=bar,
-                level_price=levels.high_price,
-                level_age_minutes=levels.high_age_minutes(),
+                level_price=pivots.high_price,
+                level_age_minutes=pivots.high_age_minutes(bar.ts),
                 ribbon_state=rs,
                 ribbon_age=bar_index,
                 ribbon_spread_pct=ribbon_spread_pct(ind, bar.close),
@@ -267,12 +252,12 @@ class BreakoutEngine:
                 candidates.append(candidate)
 
         # Check short breakout
-        if levels.low_price is not None:
+        if pivots.low_price is not None:
             candidate = checker.check_short_breakout(
                 symbol=symbol,
                 bar=bar,
-                level_price=levels.low_price,
-                level_age_minutes=levels.low_age_minutes(),
+                level_price=pivots.low_price,
+                level_age_minutes=pivots.low_age_minutes(bar.ts),
                 ribbon_state=rs,
                 ribbon_age=bar_index,
                 ribbon_spread_pct=ribbon_spread_pct(ind, bar.close),
@@ -286,10 +271,3 @@ class BreakoutEngine:
                 candidates.append(candidate)
 
         return candidates
-
-
-def _parse_timeframe_minutes(timeframe: str) -> int:
-    """Parse '5m' -> 5, '60m' -> 60, etc."""
-    if timeframe.endswith("m"):
-        return int(timeframe[:-1])
-    raise ValueError(f"Unsupported timeframe format: {timeframe}")
