@@ -20,39 +20,40 @@ class PivotState:
     """
 
     def __init__(self):
-        self.latest_high: Optional[PivotPoint] = None
-        self.latest_low: Optional[PivotPoint] = None
-        self.all_pivots: list[PivotPoint] = []
+        self.highs: list[PivotPoint] = []
+        self.lows: list[PivotPoint] = []
 
     def update(self, pivot: PivotPoint) -> None:
         """Record a confirmed pivot from MDS."""
-        self.all_pivots.append(pivot)
         if pivot.direction == "high":
-            self.latest_high = pivot
+            self.highs.append(pivot)
+            self.highs.sort(key=lambda p: p.price, reverse=True)
         elif pivot.direction == "low":
-            self.latest_low = pivot
+            self.lows.append(pivot)
+            self.lows.sort(key=lambda p: p.price)
 
     @property
-    def high_price(self) -> Optional[float]:
-        return self.latest_high.price if self.latest_high else None
+    def high_levels(self) -> list[PivotPoint]:
+        """All confirmed pivot highs sorted descending by price."""
+        return self.highs
 
     @property
-    def low_price(self) -> Optional[float]:
-        return self.latest_low.price if self.latest_low else None
+    def low_levels(self) -> list[PivotPoint]:
+        """All confirmed pivot lows sorted ascending by price."""
+        return self.lows
 
-    def high_age_minutes(self, now: datetime) -> int:
-        """Minutes since the pivot high bar. now must be timezone-aware UTC."""
-        if self.latest_high is None:
-            return 0
-        return int((now - self.latest_high.pivot_ts).total_seconds() / 60)
+    @property
+    def most_recent_high(self) -> Optional[PivotPoint]:
+        if not self.highs:
+            return None
+        return max(self.highs, key=lambda p: p.confirmed_ts)
 
-    def low_age_minutes(self, now: datetime) -> int:
-        """Minutes since the pivot low bar. now must be timezone-aware UTC."""
-        if self.latest_low is None:
-            return 0
-        return int((now - self.latest_low.pivot_ts).total_seconds() / 60)
+    @property
+    def most_recent_low(self) -> Optional[PivotPoint]:
+        if not self.lows:
+            return None
+        return max(self.lows, key=lambda p: p.confirmed_ts)
 
     def clear(self) -> None:
-        self.latest_high = None
-        self.latest_low = None
-        self.all_pivots.clear()
+        self.highs.clear()
+        self.lows.clear()

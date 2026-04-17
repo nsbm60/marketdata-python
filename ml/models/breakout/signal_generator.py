@@ -27,7 +27,6 @@ class SignalConfig:
     break_bar_atr_min: float = 0.5       # Min bar range in ATR units
     break_bar_close_pct: float = 0.6     # Bar must close in top/bottom X%
     volume_ratio_min: float = 1.0        # Min volume vs average
-    clear_air_atr_min: float = 0.5       # Min distance to prior session level
     gap_atr_threshold: float = 2.0       # Max gap in ATR units
 
 
@@ -50,6 +49,8 @@ class BreakoutCandidate:
     gap_pct: float
     bar_index: int
     score: float
+    prior_session_high: Optional[float] = None
+    prior_session_low: Optional[float] = None
 
 
 class BreakoutConditionChecker:
@@ -75,13 +76,14 @@ class BreakoutConditionChecker:
         bar: Bar,
         level_price: float,
         level_age_minutes: int,
+        is_most_recent: bool,
         ribbon_state: RibbonState,
         ribbon_age: int,
         ribbon_spread_pct: float,
         atr: float,
         volume_ratio: float,
         gap_pct: float,
-        prior_session_high: Optional[float],
+        prior_bar_close: Optional[float] = None,
         bar_index: int = 0,
     ) -> Optional[BreakoutCandidate]:
         """
@@ -95,8 +97,16 @@ class BreakoutConditionChecker:
         if bar.high <= level_price:
             return None
 
-        # Level must be aged
-        if level_age_minutes < c.level_age_threshold:
+        # Bar must have opened near the level — break must happen on this bar
+        if atr > 0 and (bar.open - level_price) > atr:
+            return None
+
+        # Prior bar must have closed below the level — break is happening now
+        if prior_bar_close is not None and prior_bar_close >= level_price:
+            return None
+
+        # Level must be aged (only enforced for most recent pivot)
+        if is_most_recent and level_age_minutes < c.level_age_threshold:
             return None
 
         # Ribbon must be bullish and mature
@@ -131,14 +141,6 @@ class BreakoutConditionChecker:
         if atr > 0 and abs(gap_pct * bar.close) / atr > c.gap_atr_threshold:
             return None
 
-        # Clear air above prior session high
-        if prior_session_high is not None and atr > 0:
-            distance_to_prior = bar.high - prior_session_high
-            if distance_to_prior < 0:  # Below prior high = no clear air
-                return None
-            if distance_to_prior / atr < c.clear_air_atr_min:
-                return None
-
         # Calculate score
         score = self._calculate_score(
             level_age_minutes, ribbon_age, ribbon_spread_pct,
@@ -170,13 +172,14 @@ class BreakoutConditionChecker:
         bar: Bar,
         level_price: float,
         level_age_minutes: int,
+        is_most_recent: bool,
         ribbon_state: RibbonState,
         ribbon_age: int,
         ribbon_spread_pct: float,
         atr: float,
         volume_ratio: float,
         gap_pct: float,
-        prior_session_low: Optional[float],
+        prior_bar_close: Optional[float] = None,
         bar_index: int = 0,
     ) -> Optional[BreakoutCandidate]:
         """
@@ -186,28 +189,65 @@ class BreakoutConditionChecker:
         """
         c = self.config
 
+        # DEBUG: trace all conditions for NVDA around 13:30 ET on 2026-03-20
+        _debug = (symbol == "NVDA" and bar.ts.strftime("%Y-%m-%d %H") == "2026-03-20 17")
+        if _debug:
+            bar_range = bar.high - bar.low
+            _br_atr = bar_range / atr if atr > 0 else 0
+            _bcp = (bar.high - bar.close) / bar_range if bar_range > 0 else 0.5
+            _prox = (level_price - bar.open) / atr if atr > 0 else 0
+            _gap_atr = abs(gap_pct * bar.close) / atr if atr > 0 else 0
+            print(f"[DEBUG SHORT] {symbol} {bar.ts} level={level_price:.2f} "
+                  f"bar=[O={bar.open:.2f} H={bar.high:.2f} L={bar.low:.2f} C={bar.close:.2f}]")
+            print(f"  new_low: {bar.low < level_price} (bar.low={bar.low:.2f} < level={level_price:.2f})")
+            print(f"  proximity: {_prox:.2f} ATR (threshold: 1.0)")
+            print(f"  prior_bar_close: {prior_bar_close} (must be > {level_price:.2f})")
+            print(f"  level_age: {level_age_minutes}min (threshold: {c.level_age_threshold})")
+            print(f"  ribbon: {ribbon_state} age={ribbon_age} (need ORDERED_BEARISH, age>={c.ribbon_age_threshold})")
+            print(f"  ribbon_spread: {ribbon_spread_pct:.4f} (threshold: {c.ribbon_spread_min_pct})")
+            print(f"  bar_range_atr: {_br_atr:.2f} (threshold: {c.break_bar_atr_min})")
+            print(f"  bar_close_pct: {_bcp:.2f} (threshold: {c.break_bar_close_pct})")
+            print(f"  volume_ratio: {volume_ratio:.2f} (threshold: {c.volume_ratio_min})")
+            print(f"  gap_atr: {_gap_atr:.2f} (threshold: {c.gap_atr_threshold})")
+
         # Must make new low
         if bar.low >= level_price:
+            if _debug: print(f"  -> REJECTED: no new low")
             return None
 
-        # Level must be aged
-        if level_age_minutes < c.level_age_threshold:
+        # Bar must have opened near the level — break must happen on this bar
+        if atr > 0 and (level_price - bar.open) > atr:
+            if _debug: print(f"  -> REJECTED: proximity")
+            return None
+
+        # Prior bar must have closed above the level — break is happening now
+        if prior_bar_close is not None and prior_bar_close <= level_price:
+            if _debug: print(f"  -> REJECTED: prior_bar_close")
+            return None
+
+        # Level must be aged (only enforced for most recent pivot)
+        if is_most_recent and level_age_minutes < c.level_age_threshold:
+            if _debug: print(f"  -> REJECTED: level_age")
             return None
 
         # Ribbon must be bearish and mature
         if ribbon_state != RibbonState.ORDERED_BEARISH:
+            if _debug: print(f"  -> REJECTED: ribbon_state")
             return None
         if ribbon_age < c.ribbon_age_threshold:
+            if _debug: print(f"  -> REJECTED: ribbon_age")
             return None
 
         # Ribbon spread check
         if ribbon_spread_pct < c.ribbon_spread_min_pct:
+            if _debug: print(f"  -> REJECTED: ribbon_spread")
             return None
 
         # Bar quality
         bar_range = bar.high - bar.low
         bar_range_atr = bar_range / atr if atr > 0 else 0
         if bar_range_atr < c.break_bar_atr_min:
+            if _debug: print(f"  -> REJECTED: bar_range_atr")
             return None
 
         # Close in lower portion of bar
@@ -216,23 +256,20 @@ class BreakoutConditionChecker:
         else:
             bar_close_pct = 0.5
         if bar_close_pct < c.break_bar_close_pct:
+            if _debug: print(f"  -> REJECTED: bar_close_pct")
             return None
 
         # Volume confirmation
         if volume_ratio < c.volume_ratio_min:
+            if _debug: print(f"  -> REJECTED: volume_ratio")
             return None
 
         # Gap filter
         if atr > 0 and abs(gap_pct * bar.close) / atr > c.gap_atr_threshold:
+            if _debug: print(f"  -> REJECTED: gap_filter")
             return None
 
-        # Clear air below prior session low
-        if prior_session_low is not None and atr > 0:
-            distance_to_prior = prior_session_low - bar.low
-            if distance_to_prior < 0:  # Above prior low = no clear air
-                return None
-            if distance_to_prior / atr < c.clear_air_atr_min:
-                return None
+        if _debug: print(f"  -> PASSED all conditions")
 
         # Calculate score
         score = self._calculate_score(

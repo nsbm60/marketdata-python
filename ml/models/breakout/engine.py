@@ -89,6 +89,9 @@ class BreakoutEngine:
         self.prior_session_high: dict[str, Optional[float]] = {}
         self.prior_session_low: dict[str, Optional[float]] = {}
         self._bar_index: dict[str, int] = {}
+        self.ribbon_age: dict[str, int] = {}
+        self.last_ribbon_state: dict[str, str] = {}
+        self.prior_bar_close: dict[str, Optional[float]] = {}
 
     def init_symbols(self, symbols: list[str]) -> None:
         """Initialize per-symbol state for given symbols."""
@@ -102,6 +105,9 @@ class BreakoutEngine:
             self.prior_session_high[symbol] = None
             self.prior_session_low[symbol] = None
             self._bar_index[symbol] = 0
+            self.ribbon_age[symbol] = 0
+            self.last_ribbon_state[symbol] = ""
+            self.prior_bar_close[symbol] = None
 
     def set_prior_session(
         self, symbol: str, close: float,
@@ -154,6 +160,12 @@ class BreakoutEngine:
 
         if ribbon_state is not None:
             state.ribbon_state = ribbon_state
+            prev = self.last_ribbon_state.get(symbol, "")
+            if ribbon_state == prev and ribbon_state in ("BULLISH_ALIGNED", "BEARISH_ALIGNED"):
+                self.ribbon_age[symbol] = self.ribbon_age.get(symbol, 0) + 1
+            else:
+                self.ribbon_age[symbol] = 1
+            self.last_ribbon_state[symbol] = ribbon_state
         if ema_warm is not None:
             state.ema_warm = ema_warm
         if atr_value is not None:
@@ -175,7 +187,9 @@ class BreakoutEngine:
         self.volume_calcs[symbol].update(bar.volume)
         self._bar_index[symbol] = self._bar_index.get(symbol, 0) + 1
 
-        return self._check_breakout(symbol, bar)
+        result = self._check_breakout(symbol, bar)
+        self.prior_bar_close[symbol] = bar.close
+        return result
 
     def warmup_bar(self, symbol: str, bar: Bar) -> None:
         """Replay a historical bar for volume warmup without checking breakouts."""
@@ -200,6 +214,9 @@ class BreakoutEngine:
             self.session_open[symbol] = None
             self.gap_pct[symbol] = 0.0
             self._bar_index[symbol] = 0
+            self.ribbon_age[symbol] = 0
+            self.last_ribbon_state[symbol] = ""
+            self.prior_bar_close[symbol] = None
 
     # ------------------------------------------------------------------
     # Internal
@@ -232,42 +249,66 @@ class BreakoutEngine:
 
         candidates = []
 
-        # Check long breakout
-        if pivots.high_price is not None:
+        # Check long breakout — iterate high levels, lowest high first
+        most_recent_high = pivots.most_recent_high
+        for level in reversed(pivots.high_levels):
+            # Skip if a higher pivot high exists confirmed after this level
+            if any(h.price > level.price and h.confirmed_ts > level.confirmed_ts
+                   for h in pivots.high_levels):
+                continue
+            is_most_recent = (most_recent_high is not None
+                              and level.confirmed_ts == most_recent_high.confirmed_ts)
+            level_age = int((bar.ts - level.pivot_ts).total_seconds() / 60)
             candidate = checker.check_long_breakout(
                 symbol=symbol,
                 bar=bar,
-                level_price=pivots.high_price,
-                level_age_minutes=pivots.high_age_minutes(bar.ts),
+                level_price=level.price,
+                level_age_minutes=level_age,
+                is_most_recent=is_most_recent,
                 ribbon_state=rs,
-                ribbon_age=bar_index,
+                ribbon_age=self.ribbon_age.get(symbol, 0),
                 ribbon_spread_pct=ribbon_spread_pct(ind, bar.close),
                 atr=atr,
                 volume_ratio=volume_ratio,
                 gap_pct=self.gap_pct.get(symbol, 0.0),
-                prior_session_high=self.prior_session_high.get(symbol),
+                prior_bar_close=self.prior_bar_close.get(symbol),
                 bar_index=bar_index,
             )
             if candidate:
+                candidate.prior_session_high = self.prior_session_high.get(symbol)
+                candidate.prior_session_low = self.prior_session_low.get(symbol)
                 candidates.append(candidate)
+                break  # fire on first matching level
 
-        # Check short breakout
-        if pivots.low_price is not None:
+        # Check short breakout — iterate low levels, highest low first
+        most_recent_low = pivots.most_recent_low
+        for level in reversed(pivots.low_levels):
+            # Skip if a lower pivot low exists confirmed after this level
+            if any(l.price < level.price and l.confirmed_ts > level.confirmed_ts
+                   for l in pivots.low_levels):
+                continue
+            is_most_recent = (most_recent_low is not None
+                              and level.confirmed_ts == most_recent_low.confirmed_ts)
+            level_age = int((bar.ts - level.pivot_ts).total_seconds() / 60)
             candidate = checker.check_short_breakout(
                 symbol=symbol,
                 bar=bar,
-                level_price=pivots.low_price,
-                level_age_minutes=pivots.low_age_minutes(bar.ts),
+                level_price=level.price,
+                level_age_minutes=level_age,
+                is_most_recent=is_most_recent,
                 ribbon_state=rs,
-                ribbon_age=bar_index,
+                ribbon_age=self.ribbon_age.get(symbol, 0),
                 ribbon_spread_pct=ribbon_spread_pct(ind, bar.close),
                 atr=atr,
                 volume_ratio=volume_ratio,
                 gap_pct=self.gap_pct.get(symbol, 0.0),
-                prior_session_low=self.prior_session_low.get(symbol),
+                prior_bar_close=self.prior_bar_close.get(symbol),
                 bar_index=bar_index,
             )
             if candidate:
+                candidate.prior_session_high = self.prior_session_high.get(symbol)
+                candidate.prior_session_low = self.prior_session_low.get(symbol)
                 candidates.append(candidate)
+                break  # fire on first matching level
 
         return candidates

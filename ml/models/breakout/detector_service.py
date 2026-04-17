@@ -281,8 +281,8 @@ class BreakoutDetector:
                     engine.update_pivot(symbol, pivot)
                 if pivots:
                     log.info(f"{symbol} {tf}: seeded {len(pivots)} pivots "
-                             f"(high={engine.pivots[symbol].high_price} "
-                             f"low={engine.pivots[symbol].low_price})")
+                             f"({len(engine.pivots[symbol].highs)} highs, "
+                             f"{len(engine.pivots[symbol].lows)} lows)")
             except Exception as e:
                 log.warning(f"Failed to seed pivots for {symbol} {tf}: {e}")
 

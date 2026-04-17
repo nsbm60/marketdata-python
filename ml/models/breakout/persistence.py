@@ -24,6 +24,7 @@ class BreakoutPersistor:
         "ribbon_state", "ribbon_age", "ribbon_spread",
         "atr", "bar_range_atr", "bar_close_pct", "volume_ratio", "gap_pct",
         "score", "source",
+        "prior_session_high", "prior_session_low",
     ]
 
     def __init__(self, ch_client: clickhouse_connect.driver.Client,
@@ -55,6 +56,8 @@ class BreakoutPersistor:
             candidate.gap_pct,
             candidate.score,
             source,
+            candidate.prior_session_high,
+            candidate.prior_session_low,
         ]
         self._buffer.append(row)
 
