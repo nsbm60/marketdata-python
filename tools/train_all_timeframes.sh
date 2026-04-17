@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-CONFIGS="config/models/1m.yaml config/models/5m.yaml"
+CONFIGS="config/models/1m.yaml config/models/5m.yaml config/models/10m.yaml config/models/15m.yaml config/models/20m.yaml"
 
 for CONFIG in $CONFIGS; do
     TF=$(grep timeframe $CONFIG | awk '{print $2}')
