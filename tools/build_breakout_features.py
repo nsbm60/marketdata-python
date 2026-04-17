@@ -23,6 +23,7 @@ from typing import Optional
 
 import pandas as pd
 
+from ml.models.breakout.config import ModelConfig
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.utils import utc_dt
 
@@ -354,7 +355,9 @@ def extract_ribbon_features(
 # Feature matrix builder
 # ---------------------------------------------------------------------------
 
-def build_features(ch, candidates: list[dict]) -> pd.DataFrame:
+def build_features(ch, candidates: list[dict],
+                   mfe_threshold: float = 1.0,
+                   mae_threshold: float = 1.0) -> pd.DataFrame:
     """Build full feature matrix with pivot features."""
     # Group by (symbol, timeframe, session) for batched pivot queries
     groups: dict[tuple, list[dict]] = defaultdict(list)
@@ -417,7 +420,7 @@ def build_features(ch, candidates: list[dict]) -> pd.DataFrame:
     df["prior_session_low_dist_atr"] = (df["price"] - df["prior_session_low"]) / df["atr"]
 
     # --- Label ---
-    df["label"] = ((df["mfe"] > 1.0) & (df["mae"] < 1.0)).astype(int)
+    df["label"] = ((df["mfe"] >= mfe_threshold) & (df["mae"] <= mae_threshold)).astype(int)
 
     # --- Select and order output columns ---
     output_cols = [
@@ -455,6 +458,8 @@ def main():
     parser.add_argument("--start-date", type=str, default=None)
     parser.add_argument("--end-date", type=str, default=None)
     parser.add_argument("--symbols", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model config YAML")
     parser.add_argument("--timeframe", type=str, default=None,
                         help="Filter to single timeframe (e.g. 5m)")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT)
@@ -467,10 +472,15 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # Load config if provided — CLI flags override config values
+    cfg = ModelConfig.from_yaml(args.config) if args.config else None
+    timeframe = args.timeframe or (cfg.timeframe if cfg else None)
+    mfe_threshold = cfg.mfe_threshold if cfg else 1.0
+    mae_threshold = cfg.mae_threshold if cfg else 1.0
+
     start = date.fromisoformat(args.start_date) if args.start_date else None
     end = date.fromisoformat(args.end_date) if args.end_date else None
     symbols = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
-    timeframe = args.timeframe
 
     ch = get_ch_client()
 
@@ -482,7 +492,7 @@ def main():
         log.info("No candidates found")
         return
 
-    df, symbol_map = build_features(ch, candidates)
+    df, symbol_map = build_features(ch, candidates, mfe_threshold, mae_threshold)
 
     # Write output
     if args.output != DEFAULT_OUTPUT:
@@ -512,8 +522,8 @@ def main():
     # Summary
     pos = (df["label"] == 1).sum()
     neg = (df["label"] == 0).sum()
-    log.info("Label distribution: %d positive (%.1f%%), %d negative (%.1f%%)",
-             pos, 100 * pos / len(df), neg, 100 * neg / len(df))
+    log.info("Label distribution (mfe>=%s AND mae<=%s): %d positive (%.1f%%), %d negative (%.1f%%)",
+             mfe_threshold, mae_threshold, pos, 100 * pos / len(df), neg, 100 * neg / len(df))
 
 
 if __name__ == "__main__":

@@ -18,18 +18,24 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.utils.class_weight import compute_sample_weight
 
+from ml.models.breakout.config import ModelConfig
 from ml.models.breakout.validate import FEATURES, LABEL_COL
 
 
 def main():
     parser = argparse.ArgumentParser(description="Breakout feature importance analysis")
     parser.add_argument("--features", required=True)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model config YAML")
     parser.add_argument("--timeframe", type=str, default=None,
                         help="Single timeframe (removes timeframe_encoded from features)")
     args = parser.parse_args()
 
+    cfg = ModelConfig.from_yaml(args.config) if args.config else None
+    timeframe = args.timeframe or (cfg.timeframe if cfg else None)
+
     features = list(FEATURES)
-    if args.timeframe:
+    if timeframe:
         features = [f for f in features if f != "timeframe_encoded"]
 
     df = pd.read_csv(args.features, parse_dates=["ts"])
@@ -72,8 +78,8 @@ def main():
     report = "\n".join(lines)
     print("\n" + report)
 
-    if args.timeframe:
-        out_dir = Path(f"data/reports/breakout/{args.timeframe}")
+    if timeframe:
+        out_dir = Path(f"data/reports/breakout/{timeframe}")
     else:
         out_dir = Path("data/reports/breakout/combined")
     out_dir.mkdir(parents=True, exist_ok=True)

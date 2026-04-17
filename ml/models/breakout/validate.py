@@ -19,6 +19,8 @@ Outputs:
 import argparse
 from pathlib import Path
 
+from ml.models.breakout.config import ModelConfig
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -154,6 +156,8 @@ def format_report(
     fold_size: int,
     min_train: int,
     confidence_threshold: float,
+    mfe_threshold: float = 1.0,
+    mae_threshold: float = 1.0,
 ) -> str:
     lines = []
     lines.append("=" * 75)
@@ -161,7 +165,7 @@ def format_report(
     lines.append("=" * 75)
     lines.append(f"Fold size: {fold_size} candidates  |  Total folds: {len(folds)}")
     lines.append(f"Min training size: {min_train} candidates")
-    lines.append(f"Label: mfe > 1.0 ATR and mae < 1.0 ATR")
+    lines.append(f"Label: mfe >= {mfe_threshold} ATR and mae <= {mae_threshold} ATR")
     lines.append("")
 
     # Per-fold table
@@ -277,13 +281,24 @@ def main():
                         help=f"Min training candidates before first fold (default: {DEFAULT_MIN_TRAIN})")
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE,
                         help=f"High-confidence threshold (default: {DEFAULT_CONFIDENCE})")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model config YAML")
     parser.add_argument("--timeframe", type=str, default=None,
                         help="Single timeframe (removes timeframe_encoded from features)")
     args = parser.parse_args()
 
+    # Load config if provided — CLI flags override config values
+    cfg = ModelConfig.from_yaml(args.config) if args.config else None
+    timeframe = args.timeframe or (cfg.timeframe if cfg else None)
+    fold_size = args.fold_size if args.fold_size != DEFAULT_FOLD_SIZE else (cfg.fold_size if cfg else DEFAULT_FOLD_SIZE)
+    min_train = args.min_train if args.min_train != DEFAULT_MIN_TRAIN else (cfg.min_train if cfg else DEFAULT_MIN_TRAIN)
+    confidence = args.confidence_threshold if args.confidence_threshold != DEFAULT_CONFIDENCE else (cfg.confidence_threshold if cfg else DEFAULT_CONFIDENCE)
+    mfe_threshold = cfg.mfe_threshold if cfg else 1.0
+    mae_threshold = cfg.mae_threshold if cfg else 1.0
+
     # Adjust features for per-timeframe mode
     features = list(FEATURES)
-    if args.timeframe:
+    if timeframe:
         features = [f for f in features if f != "timeframe_encoded"]
 
     print(f"Loading {args.features}...")
@@ -296,22 +311,21 @@ def main():
     print(f"  Label distribution: {pos} positive ({100 * pos / len(df):.1f}%), "
           f"{neg} negative ({100 * neg / len(df):.1f}%)")
 
-    n_folds = (len(df) - args.min_train) // args.fold_size
-    print(f"  Expected folds: ~{n_folds}  (fold_size={args.fold_size}, "
-          f"min_train={args.min_train})")
+    n_folds = (len(df) - min_train) // fold_size
+    print(f"  Expected folds: ~{n_folds}  (fold_size={fold_size}, "
+          f"min_train={min_train})")
 
     print("\nRunning walk-forward...")
-    folds = run_walk_forward(df, args.fold_size, args.min_train,
-                             args.confidence_threshold, features)
+    folds = run_walk_forward(df, fold_size, min_train, confidence, features)
     print(f"  Completed {len(folds)} folds")
 
-    report = format_report(folds, args.fold_size, args.min_train,
-                           args.confidence_threshold)
+    report = format_report(folds, fold_size, min_train, confidence,
+                           mfe_threshold, mae_threshold)
     print("\n" + report)
 
     # Save report
-    if args.timeframe:
-        report_dir = Path(f"data/reports/breakout/{args.timeframe}")
+    if timeframe:
+        report_dir = Path(f"data/reports/breakout/{timeframe}")
     else:
         report_dir = Path("data/reports/breakout/combined")
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +336,7 @@ def main():
 
     # Save plot
     plot_file = report_dir / "walkforward.png"
-    plot_results(folds, str(plot_file), args.confidence_threshold)
+    plot_results(folds, str(plot_file), confidence)
 
 
 if __name__ == "__main__":
