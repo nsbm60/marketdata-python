@@ -128,6 +128,30 @@ def query_emas(ch, symbol, timeframe, trading_date):
     return ema_data
 
 
+def query_pivots(ch, symbol, timeframe, trading_date):
+    """Fetch all pivots for the day (pre + regular + post)."""
+    result = ch.query(
+        "SELECT ts, confirmed_ts, value, pivot_direction, session "
+        "FROM trading.indicator FINAL "
+        "WHERE symbol = %(symbol)s "
+        "  AND timeframe = %(tf)s "
+        "  AND trading_date = %(date)s "
+        "  AND indicator IN ('pivot_high', 'pivot_low') "
+        "ORDER BY ts",
+        parameters={"symbol": symbol, "tf": timeframe, "date": trading_date},
+    )
+    return [
+        {
+            "ts": utc_dt(r[0]),
+            "confirmed_ts": utc_dt(r[1]),
+            "price": float(r[2]),
+            "direction": r[3],
+            "session": r[4],
+        }
+        for r in result.result_rows
+    ]
+
+
 def find_exit_ts(bars, bar_ts_index, candidate_ts, exit_bars):
     """Find the exit bar timestamp given candidate ts and exit_bars count."""
     if exit_bars is None:
@@ -146,6 +170,15 @@ EMA_STYLES = {
     "ema30": ("#ff6d00", 2),
 }
 
+PIVOT_COLORS = {
+    ("high", "pre"):     "#4fc3f7",
+    ("low",  "pre"):     "#4fc3f7",
+    ("high", "regular"): "#ffeb3b",
+    ("low",  "regular"): "#ffeb3b",
+    ("high", "post"):    "#ce93d8",
+    ("low",  "post"):    "#ce93d8",
+}
+
 
 def build_hover(c):
     lines = [
@@ -160,7 +193,8 @@ def build_hover(c):
     return "<br>".join(lines)
 
 
-def build_figure(bars, candidates, emas, symbol, timeframe, trading_date):
+def build_figure(bars, candidates, emas, symbol, timeframe, trading_date,
+                 pivots=None, show_pivots=False):
     """Build Plotly figure from pre-queried data. Timestamps converted to MT."""
     if not bars:
         return go.Figure().update_layout(
@@ -178,6 +212,10 @@ def build_figure(bars, candidates, emas, symbol, timeframe, trading_date):
         c["ts"] = to_mt(c["ts"])
     for name in emas:
         emas[name]["ts"] = [to_mt(t) for t in emas[name]["ts"]]
+    if pivots:
+        for p in pivots:
+            p["ts"] = to_mt(p["ts"])
+            p["confirmed_ts"] = to_mt(p["confirmed_ts"])
 
     # Build bar timestamp index
     bar_ts_list = [b["ts"] for b in bars]
@@ -231,6 +269,48 @@ def build_figure(bars, candidates, emas, symbol, timeframe, trading_date):
                 x=emas[name]["ts"], y=emas[name]["value"],
                 mode="lines", line=dict(color=color, width=width),
                 name=name.upper(), showlegend=True,
+            ), row=1, col=1)
+
+    # Pivots (if enabled)
+    if show_pivots and pivots:
+        last_ts = bar_ts_list[-1]
+        for p in pivots:
+            color = PIVOT_COLORS.get((p["direction"], p["session"]), "#888888")
+            is_high = p["direction"] == "high"
+
+            # Find bar at pivot ts for marker positioning
+            pivot_bar_idx = bar_ts_index.get(p["ts"])
+            if pivot_bar_idx is not None:
+                pb = bars[pivot_bar_idx]
+                py = pb["high"] + offset * 0.3 if is_high else pb["low"] - offset * 0.3
+                msym = "triangle-down" if is_high else "triangle-up"
+
+                pivot_ts_str = p["ts"].strftime("%H:%M")
+                conf_ts_str = p["confirmed_ts"].strftime("%H:%M")
+                age_min = int((p["confirmed_ts"] - p["ts"]).total_seconds() / 60)
+                hover = (f"<b>Pivot {'High' if is_high else 'Low'}</b> ({timeframe}, {p['session']})<br>"
+                         f"Price: {p['price']:.2f}<br>"
+                         f"Pivot bar: {pivot_ts_str} MT<br>"
+                         f"Confirmed: {conf_ts_str} MT ({age_min} min)")
+
+                fig.add_trace(go.Scatter(
+                    x=[p["ts"]], y=[py],
+                    mode="markers",
+                    marker=dict(symbol=msym, size=8, color=color,
+                                line=dict(width=0.5, color="#ffffff")),
+                    hovertext=hover, hoverinfo="text",
+                    showlegend=False,
+                ), row=1, col=1)
+
+            # Level line from confirmed_ts to end of session
+            fig.add_trace(go.Scatter(
+                x=[p["confirmed_ts"], last_ts],
+                y=[p["price"], p["price"]],
+                mode="lines",
+                line=dict(color=color, width=1, dash="dot"),
+                opacity=0.5,
+                showlegend=False,
+                hoverinfo="skip",
             ), row=1, col=1)
 
     # Candidates: markers + level lines + exit markers
@@ -332,10 +412,16 @@ def main():
     bars = query_bars(ch, symbol, timeframe, trading_date)
     candidates = query_candidates(ch, symbol, timeframe, trading_date)
     emas = query_emas(ch, symbol, timeframe, trading_date)
+    pivots = query_pivots(ch, symbol, timeframe, trading_date)
 
     print(f"{symbol} {timeframe} {trading_date}: {len(bars)} bars, {len(candidates)} candidates")
+    if pivots:
+        pre_count = sum(1 for p in pivots if p["session"] == "pre")
+        reg_count = sum(1 for p in pivots if p["session"] == "regular")
+        print(f"  {len(pivots)} pivots ({pre_count} pre, {reg_count} regular)")
 
-    fig = build_figure(bars, candidates, emas, symbol, timeframe, trading_date)
+    fig = build_figure(bars, candidates, emas, symbol, timeframe, trading_date,
+                       pivots=pivots, show_pivots=True)
     fig.show()
 
 

@@ -16,7 +16,7 @@ from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
 from discovery.service_locator import ServiceLocator
 from tools.chart_day import (
-    query_bars, query_candidates, query_emas, build_figure,
+    query_bars, query_candidates, query_emas, query_pivots, build_figure,
     TIMEFRAME_MINUTES,
 )
 
@@ -91,6 +91,12 @@ app.layout = html.Div(
                     style={"padding": "4px 10px", "cursor": "pointer",
                            "backgroundColor": "#2a2a4a", "border": "1px solid #3a3a5a",
                            "color": "#e0e0e0", "borderRadius": 4, "fontSize": 14}),
+                dcc.Checklist(
+                    id="show-pivots",
+                    options=[{"label": " Show pivots", "value": "on"}],
+                    value=[],
+                    style={"fontSize": 12, "marginLeft": 8},
+                ),
                 html.Span(id="status", style={"fontSize": 12, "marginLeft": "auto"}),
             ],
         ),
@@ -159,21 +165,29 @@ def navigate_date(prev_clicks, next_clicks, current_date, options):
     Input("symbol-dropdown", "value"),
     Input("timeframe-dropdown", "value"),
     Input("date-dropdown", "value"),
+    Input("show-pivots", "value"),
 )
-def update_chart(symbol, timeframe, date_str):
+def update_chart(symbol, timeframe, date_str, show_pivots_val):
     if not symbol or not timeframe or not date_str:
         empty = build_figure([], [], {}, "", "", "")
         return empty, ""
 
+    show_pivots = "on" in (show_pivots_val or [])
     trading_date = date.fromisoformat(date_str)
     bars = query_bars(ch, symbol, timeframe, trading_date)
     candidates = query_candidates(ch, symbol, timeframe, trading_date)
     emas = query_emas(ch, symbol, timeframe, trading_date)
+    pivots = query_pivots(ch, symbol, timeframe, trading_date) if show_pivots else []
 
-    fig = build_figure(bars, candidates, emas, symbol, timeframe, trading_date)
+    fig = build_figure(bars, candidates, emas, symbol, timeframe, trading_date,
+                       pivots=pivots, show_pivots=show_pivots)
     fig.update_layout(height=None)  # let CSS control height
 
     status = f"{len(bars)} bars, {len(candidates)} candidates"
+    if show_pivots and pivots:
+        pre_n = sum(1 for p in pivots if p["session"] == "pre")
+        reg_n = sum(1 for p in pivots if p["session"] == "regular")
+        status += f", {len(pivots)} pivots ({pre_n} pre, {reg_n} regular)"
     return fig, status
 
 
