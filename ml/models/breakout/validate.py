@@ -96,10 +96,11 @@ def run_walk_forward(
     min_train: int,
     confidence_threshold: float,
     features: list[str] = FEATURES,
-) -> list[dict]:
-    """Expanding window walk-forward. Returns list of fold result dicts."""
+) -> tuple[list[dict], pd.DataFrame]:
+    """Expanding window walk-forward. Returns (fold results, predictions DataFrame)."""
     n = len(df)
     folds = []
+    predictions = []
     start = min_train
 
     while start + fold_size <= n:
@@ -124,14 +125,31 @@ def run_walk_forward(
         probs = model.predict_proba(df_test[features])
         mean_conf = probs.max(axis=1).mean()
 
+        # Positive class probability
+        pos_probs = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
+
         # High-confidence accuracy
-        conf_mask = probs.max(axis=1) >= confidence_threshold
+        conf_mask = pos_probs >= confidence_threshold
         hc_acc = accuracy_score(y_true[conf_mask], y_pred[conf_mask]) \
             if conf_mask.sum() >= 5 else float("nan")
         hc_n = int(conf_mask.sum())
 
+        # Collect per-candidate predictions
+        fold_num = len(folds) + 1
+        for i in range(len(df_test)):
+            predictions.append({
+                "symbol": df_test.iloc[i]["symbol"],
+                "ts": df_test.iloc[i]["ts"],
+                "timeframe": df_test.iloc[i]["timeframe"],
+                "direction_encoded": int(df_test.iloc[i]["direction_encoded"]),
+                "fold": fold_num,
+                "prediction_prob": float(pos_probs[i]),
+                "actual_label": int(y_true[i]),
+                "is_hc": int(pos_probs[i] >= confidence_threshold),
+            })
+
         fold = {
-            "fold": len(folds) + 1,
+            "fold": fold_num,
             "train_start": df_train["ts"].min().date(),
             "train_end": df_train["ts"].max().date(),
             "test_start": df_test["ts"].min().date(),
@@ -148,7 +166,7 @@ def run_walk_forward(
         folds.append(fold)
         start += fold_size
 
-    return folds
+    return folds, pd.DataFrame(predictions)
 
 
 def format_report(
@@ -316,7 +334,7 @@ def main():
           f"min_train={min_train})")
 
     print("\nRunning walk-forward...")
-    folds = run_walk_forward(df, fold_size, min_train, confidence, features)
+    folds, predictions_df = run_walk_forward(df, fold_size, min_train, confidence, features)
     print(f"  Completed {len(folds)} folds")
 
     report = format_report(folds, fold_size, min_train, confidence,
@@ -333,6 +351,12 @@ def main():
     report_file = report_dir / "walkforward_report.txt"
     report_file.write_text(report)
     print(f"\nReport saved to {report_file}")
+
+    # Save predictions
+    if not predictions_df.empty:
+        pred_path = report_dir / "predictions.csv"
+        predictions_df.to_csv(pred_path, index=False)
+        print(f"Predictions saved to {pred_path} ({len(predictions_df)} rows)")
 
     # Save plot
     plot_file = report_dir / "walkforward.png"

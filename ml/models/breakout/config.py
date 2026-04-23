@@ -15,6 +15,8 @@ class ModelConfig:
     confidence_threshold: float = 0.65
     fold_size: int = 50
     min_train: int = 500
+    target_atr: float = 1.0
+    stop_atr: float = 0.5
 
     @classmethod
     def from_yaml(cls, path: str) -> "ModelConfig":

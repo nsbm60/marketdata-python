@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from discovery.service_locator import ServiceLocator
+from ml.models.breakout.config import ModelConfig
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
 from ml.shared.utils import utc_dt
@@ -45,6 +46,8 @@ OUTCOME_COLUMNS = [
     "return_atr_ema30", "exit_bars_ema30",
     "return_atr_eod",
     "max_favorable_excursion", "max_adverse_excursion",
+    "return_atr_target", "target_hit", "target_bars_to_hit",
+    "bracket_exit_type", "bracket_return_atr", "bracket_bars_to_exit",
 ]
 
 
@@ -237,12 +240,86 @@ def query_session_emas(
 # Labeling logic
 # ---------------------------------------------------------------------------
 
+def compute_target_exit(
+    bars: list[Bar],
+    entry_price: float,
+    direction: str,
+    atr: float,
+    target_atr: float,
+) -> tuple[float, bool, Optional[int]]:
+    """Walk forward to find first bar where ATR target is hit.
+
+    Returns (return_atr, target_hit, bars_to_hit).
+    """
+    target_price = (entry_price + target_atr * atr
+                    if direction == "long"
+                    else entry_price - target_atr * atr)
+
+    for i, bar in enumerate(bars[1:]):  # skip entry bar
+        if direction == "long" and bar.high >= target_price:
+            return target_atr, True, i + 2
+        elif direction == "short" and bar.low <= target_price:
+            return target_atr, True, i + 2
+
+    if bars:
+        last_bar = bars[-1]
+        eod_return = ((last_bar.close - entry_price) / atr
+                      if direction == "long"
+                      else (entry_price - last_bar.close) / atr)
+        return eod_return, False, None
+
+    return 0.0, False, None
+
+
+def compute_bracket_exit(
+    bars: list[Bar],
+    entry_price: float,
+    direction: str,
+    atr: float,
+    target_atr: float,
+    stop_atr: float,
+) -> tuple[str, float, Optional[int]]:
+    """Simulate bracket order: target limit + stop loss."""
+    if direction == "long":
+        target_price = entry_price + target_atr * atr
+        stop_price = entry_price - stop_atr * atr
+    else:
+        target_price = entry_price - target_atr * atr
+        stop_price = entry_price + stop_atr * atr
+
+    for i, bar in enumerate(bars[1:]):  # skip entry bar
+        if direction == "long":
+            target_hit = bar.high >= target_price
+            stop_hit = bar.low <= stop_price
+        else:
+            target_hit = bar.low <= target_price
+            stop_hit = bar.high >= stop_price
+
+        if target_hit and stop_hit:
+            return "stop", -stop_atr, i + 2
+        elif target_hit:
+            return "target", target_atr, i + 2
+        elif stop_hit:
+            return "stop", -stop_atr, i + 2
+
+    if bars:
+        last_bar = bars[-1]
+        eod_return = ((last_bar.close - entry_price) / atr
+                      if direction == "long"
+                      else (entry_price - last_bar.close) / atr)
+        return "eod", eod_return, None
+
+    return "eod", 0.0, None
+
+
 def label_group(
     candidates: list[Candidate],
     bars: list[Bar],
     pivots: list[Pivot],
     ema10_by_ts: dict[datetime, float],
     ema30_by_ts: dict[datetime, float],
+    target_atr: float = 1.0,
+    stop_atr: float = 0.5,
 ) -> list[list]:
     """Compute outcome labels for a group of candidates sharing (symbol, tf, date).
 
@@ -265,6 +342,8 @@ def label_group(
             rows.append([
                 cand.symbol, cand.timeframe, cand.ts,
                 None, None, None, None, None, None, None, None, None, None,
+                None, 0, None,
+                "", None, None,
             ])
             continue
 
@@ -353,6 +432,16 @@ def label_group(
             return_atr_ema30 = return_atr_eod
             exit_bars_ema30 = len(range_bars)
 
+        # --- Target exit ---
+        return_atr_target, target_hit, target_bars_to_hit = compute_target_exit(
+            range_bars, entry_price, cand.direction, cand.atr, target_atr
+        )
+
+        # --- Bracket exit ---
+        bracket_exit_type, bracket_return_atr, bracket_bars_to_exit = compute_bracket_exit(
+            range_bars, entry_price, cand.direction, cand.atr, target_atr, stop_atr
+        )
+
         rows.append([
             cand.symbol,
             cand.timeframe,
@@ -367,6 +456,12 @@ def label_group(
             return_atr_eod,
             mfe,
             mae,
+            return_atr_target,
+            1 if target_hit else 0,
+            target_bars_to_hit,
+            bracket_exit_type,
+            bracket_return_atr,
+            bracket_bars_to_exit,
         ])
 
     return rows
@@ -411,6 +506,8 @@ def main():
                         help="End date (YYYY-MM-DD)")
     parser.add_argument("--symbols", type=str, default=None,
                         help="Comma-separated symbols (default: trading_universe from MDS)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model config YAML (for target_atr)")
     parser.add_argument("--force", action="store_true",
                         help="Reprocess all rows, not just unlabeled ones")
     parser.add_argument("--dry-run", action="store_true",
@@ -426,6 +523,10 @@ def main():
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    cfg = ModelConfig.from_yaml(args.config) if args.config else None
+    target_atr = cfg.target_atr if cfg else 1.0
+    stop_atr = cfg.stop_atr if cfg else 0.5
 
     start = date.fromisoformat(args.start_date) if args.start_date else None
     end = date.fromisoformat(args.end_date) if args.end_date else None
@@ -446,6 +547,11 @@ def main():
     )
     candidates = query_candidates(ch, symbols, start, end, args.force)
     log.info("Loaded %d candidates to label", len(candidates))
+
+    # Filter to config's timeframe when --config is provided
+    if cfg:
+        candidates = [c for c in candidates if c.timeframe == cfg.timeframe]
+        log.info("Filtered to %s: %d candidates", cfg.timeframe, len(candidates))
 
     if not candidates:
         log.info("Nothing to do")
@@ -474,6 +580,8 @@ def main():
                     buffer.append([
                         c.symbol, c.timeframe, c.ts,
                         None, None, None, None, None, None, None, None, None, None,
+                        None, 0, None,
+                        "", None, None,
                     ])
                     total_skipped += 1
                 continue
@@ -481,7 +589,7 @@ def main():
             pivots = query_session_pivots(ch, symbol, tf, session_date)
             ema10, ema30 = query_session_emas(ch, symbol, tf, session_date)
 
-            rows = label_group(group_candidates, bars, pivots, ema10, ema30)
+            rows = label_group(group_candidates, bars, pivots, ema10, ema30, target_atr, stop_atr)
             buffer.extend(rows)
 
             labeled = sum(1 for r in rows if r[3] is not None)  # entry_price not null

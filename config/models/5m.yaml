@@ -4,3 +4,5 @@ mae_threshold: 0.5
 confidence_threshold: 0.65
 fold_size: 50
 min_train: 500
+target_atr: 2.0
+stop_atr: 0.5
