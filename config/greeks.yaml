@@ -1,0 +1,45 @@
+# Sole application config for the greeks validation package.
+# Read only via greeks.config.load_config(). Do not parse this file elsewhere.
+
+methodology_version: "v1"
+
+window:
+  start: "2026-05-27"
+  end: "2026-07-09"
+  # List, not a single hardcode — quiet-ticker reruns may add more bad days.
+  excluded_dates:
+    - "2026-06-08"
+
+tickers:
+  - NVDA
+  - MU
+
+t_floor_minutes: 15
+join_staleness_s: 300
+
+# Equity option expiry clock: 16:00 America/New_York (see solver/time.py).
+expiry_time_et: "16:00"
+day_count: "ACT/365"
+
+sofr_table: "trading.sofr_daily"
+
+dividends:
+  # Static schedule for validation phase only (Massive dividends deferred).
+  NVDA:
+    - amount: 0.25
+      ex_date: "2026-06-04"
+  # Q3 FY26 board declaration (Jun 24, 2026): $0.15/share, payable Jul 21, 2026,
+  # record date Jul 6, 2026. Ex-date set to record date under US T+1 convention
+  # (ex-date generally same business day as record). Inside validation window.
+  MU:
+    - amount: 0.15
+      ex_date: "2026-07-06"
+
+# ClickHouse table names (DDL lives in Scala MarketData schema/migrations).
+tables:
+  greeks_validation: "trading.greeks_validation"
+  greeks_residuals: "trading.greeks_residuals"
+  option_snapshot: "trading.option_snapshot"
+  option_contract: "trading.option_contract"
+  earnings_calendar: "trading.earnings_calendar"
+  sofr_daily: "trading.sofr_daily"

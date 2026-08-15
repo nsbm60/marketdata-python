@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marketdata-greeks"
+version = "0.1.0"
+description = "Greeks validation (Black-76 + py_vollib) — methodology gate"
+readme = "greeks/README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.24.0",
+  "py_vollib>=1.0.1",
+  "httpx>=0.27.0",
+  "clickhouse-connect>=0.7.0",
+  "alpaca-py>=0.20.0",
+  "python-dotenv>=1.0.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "mypy>=1.8",
+  "ruff>=0.3",
+  "types-PyYAML>=6.0",
+]
+tier2 = [
+  "QuantLib>=1.32",
+]
+
+[tool.setuptools.packages.find]
+include = ["greeks*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/greeks"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+mypy_path = "."
+packages = ["greeks"]
+exclude = [
+  "venv/",
+  "tools/venv/",
+  "ml/",
+  "portfolio_optimizer/",
+  "service/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+  "py_vollib.*",
+  "alpaca.*",
+  "clickhouse_connect.*",
+  "QuantLib",
+  "QuantLib.*",
+]
+ignore_missing_imports = true
+
+# Pre-existing untyped discovery layer; greeks only uses wait_for_service.
+[[tool.mypy.overrides]]
+module = [
+  "discovery",
+  "discovery.*",
+  "topic_builder",
+]
+ignore_errors = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

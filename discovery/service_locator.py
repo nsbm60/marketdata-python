@@ -11,10 +11,12 @@ from typing import Callable
 
 import zmq
 
+from topic_builder import TopicBuilder
+
 log = logging.getLogger(__name__)
 
 DEFAULT_DISCOVERY_PORT = 6005
-SERVICE_TOPIC_PREFIX = "service."
+SERVICE_TOPIC_PREFIX = TopicBuilder.service_prefix()  # "service." — sourced from the one topic home
 
 
 def _default_discovery_url() -> str:
@@ -44,7 +46,9 @@ class DiscoverySubscriber:
         self.service_name = service_name
         self.discovery_url = discovery_url or _default_discovery_url()
         self.on_discovered = on_discovered
-        self._topic = f"{SERVICE_TOPIC_PREFIX}{service_name}"
+        # Lowercases the name (via TopicBuilder) to match the wire topic `service.<name lower>`,
+        # so a caller passing canonical "marketData" still matches "service.marketdata".
+        self._topic = TopicBuilder.for_service(service_name)
 
         self._context: zmq.Context = None
         self._socket: zmq.Socket = None
@@ -151,6 +155,7 @@ class ServiceLocator:
     CALC           = "calc"
     ALPACA_TRADING = "alpaca"
     ML_SCORER      = "mlscorer"
+    OPTIMIZER      = "optimizer"
 
     @staticmethod
     def wait_for_service(

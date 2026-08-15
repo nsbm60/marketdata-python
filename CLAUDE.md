@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Subsystem | Document |
 |-----------|----------|
 | Breakout detector | `docs/plans/breakout_detector_refactor_spec.md` |
+| Greeks validation | `Scala/MarketData/docs/investigations/greeks-validation-brief.md` + `docs/plans/greeks-validation.md`; package `greeks/` — see `greeks/README.md` |
 
 ## Related Projects
 

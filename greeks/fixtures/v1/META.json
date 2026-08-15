@@ -1,0 +1,8 @@
+{
+  "forward": 100.0,
+  "max_relative_iv_error": 1e-10,
+  "methodology_version": "v1",
+  "n_rows": 2718,
+  "notes": "Prices generated with Black-76 via py_vollib; expected_iv from scalar invert. Delta in spot terms (S=F). Theta per calendar day. Do not edit this fixture set; bump methodology_version for changes.",
+  "r": 0.05
+}

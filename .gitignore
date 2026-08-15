@@ -29,3 +29,13 @@ Thumbs.db
 
 # Generated data outputs
 data/
+
+# Packaging / build
+*.egg-info/
+target/
+__pycache__/
+
+# Local run artifacts
+messages.jsonl
+out.jsonl
+*.html

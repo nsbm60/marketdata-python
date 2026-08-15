@@ -2,25 +2,28 @@
 """
 Portfolio construction report subscriber and validator.
 
-Subscribes to report.portfolioConstruction.<account> on CalcServer (port 6020),
+Subscribes to report.portfolio_construction.<broker> on CalcServer (port 6020),
 pretty-prints each message, and optionally validates schema invariants or
 cross-checks against the positions report.
 
+Both portfolio construction and positions reports are always-on (bounded) —
+no start/stop RPCs needed.
+
 Examples:
-  # Stream reports, pretty-printed
-  python portfolio_construction_client.py --account U1704448
+  # Stream reports, pretty-printed (default broker: ib)
+  python portfolio_construction_client.py
 
   # Validate schema invariants, exit after 1 message
-  python portfolio_construction_client.py --account U1704448 --validate --count 1
+  python portfolio_construction_client.py --validate --count 1
 
   # Cross-check against positions report
-  python portfolio_construction_client.py --account U1704448 --cross-check --count 1
+  python portfolio_construction_client.py --cross-check --count 1
 
   # Write 10 messages as JSON lines to a file
-  python portfolio_construction_client.py --account U1704448 --count 10 --output report.jsonl
+  python portfolio_construction_client.py --count 10 --output report.jsonl
 
-  # Start the report via RPC before subscribing
-  python portfolio_construction_client.py --account U1704448 --start
+  # Force an immediate publish before subscribing
+  python portfolio_construction_client.py --publish-now
 """
 
 import argparse
@@ -28,7 +31,6 @@ import json
 import signal
 import sys
 import time
-import uuid
 
 import zmq
 
@@ -118,20 +120,12 @@ def validate(r):
     return failures
 
 
-def cross_check(ctx, host, pc_report):
-    """Start a positions report, capture one message, reconcile per-underlying theta."""
-    client_id = f"pcxchk_{uuid.uuid4().hex[:8]}"
-
-    # Start positions report
-    resp = rpc(ctx, host, "start_positions_report", {"clientId": client_id, "broker": "ib"})
-    if not resp.get("ok"):
-        print(f"  Failed to start positions report: {resp.get('error')}", file=sys.stderr)
-        return False
-
-    topic_prefix = f"report.positions.ib.{client_id}"
+def cross_check(ctx, host, broker, pc_report):
+    """Subscribe to the always-on positions report, capture one message, reconcile per-underlying theta."""
+    topic = f"report.positions.{broker}"
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://{host}:{CALC_PUB_PORT}")
-    sub.setsockopt_string(zmq.SUBSCRIBE, topic_prefix)
+    sub.setsockopt_string(zmq.SUBSCRIBE, topic)
 
     poller = zmq.Poller()
     poller.register(sub, zmq.POLLIN)
@@ -144,9 +138,6 @@ def cross_check(ctx, host, pc_report):
             pos_report = json.loads(sub.recv_string())
             break
     sub.close()
-
-    # Stop positions report
-    rpc(ctx, host, "stop_positions_report", {"clientId": client_id, "broker": "ib"})
 
     if pos_report is None:
         print("  Timeout waiting for positions report", file=sys.stderr)
@@ -183,9 +174,9 @@ def cross_check(ctx, host, pc_report):
 
 def main():
     parser = argparse.ArgumentParser(description="Portfolio construction report client.")
-    parser.add_argument("--account", required=True, help="IB account ID (e.g. U1704448)")
+    parser.add_argument("--broker", default="ib", help="Broker wire name (default: ib)")
     parser.add_argument("--host", default="localhost", help="CalcServer host (default: localhost)")
-    parser.add_argument("--start", action="store_true", help="Start the report via RPC before subscribing")
+    parser.add_argument("--publish-now", action="store_true", help="Force immediate publish via RPC before subscribing")
     parser.add_argument("--validate", action="store_true", help="Run schema invariants on each message")
     parser.add_argument("--cross-check", action="store_true", help="Cross-check against positions report")
     parser.add_argument("--count", type=int, default=0, help="Exit after N messages (0 = unlimited)")
@@ -194,12 +185,12 @@ def main():
 
     ctx = zmq.Context()
 
-    if args.start:
-        resp = rpc(ctx, args.host, "start_portfolio_construction_report", {"account": args.account})
+    if args.publish_now:
+        resp = rpc(ctx, args.host, "publish_portfolio_construction_report_now", {"broker": args.broker})
         status = resp.get("data", {}).get("status", resp.get("error", "unknown"))
-        print(f"RPC start: {status}", file=sys.stderr)
+        print(f"RPC publish_now: {status}", file=sys.stderr)
 
-    topic = f"report.portfolioConstruction.{args.account}"
+    topic = f"report.portfolio_construction.{args.broker}"
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://{args.host}:{CALC_PUB_PORT}")
     sub.setsockopt_string(zmq.SUBSCRIBE, topic)
@@ -240,7 +231,7 @@ def main():
                 print(f"  PASS: all invariants hold", file=sys.stderr)
 
         if args.cross_check:
-            ok = cross_check(ctx, args.host, r)
+            ok = cross_check(ctx, args.host, args.broker, r)
             if not ok:
                 exit_code = 1
 
