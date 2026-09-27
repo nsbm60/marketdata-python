@@ -18,7 +18,7 @@ from option_archive.domain import TaskStatus, to_osi
 from option_archive.ingest_day import ingest_day, parse_trades
 from option_archive.queue import WorkQueue
 
-_HEADER = "ticker,conditions,correction,exchange,participant_timestamp,price,sip_timestamp,size"
+_HEADER = "ticker,conditions,correction,exchange,price,sip_timestamp,size"  # real 7-col file
 _C1 = to_osi("NVDA260417C00180000")
 _C2 = to_osi("NVDA260417P00180000")  # enumerated but absent from the file
 _D = date(2026, 4, 1)
@@ -33,9 +33,9 @@ def _gz(rows: list[str]) -> bytes:
 
 # One contract, three prints — the first two byte-identical (the dup case).
 _ROWS = [
-    f"O:NVDA260417C00180000,232,,312,{_SIP},11.82,{_SIP},2",
-    f"O:NVDA260417C00180000,232,,312,{_SIP},11.82,{_SIP},2",
-    f"O:NVDA260417C00180000,209,,325,{_SIP2},11.07,{_SIP2},1",
+    f"O:NVDA260417C00180000,232,0,312,11.82,{_SIP},2",
+    f"O:NVDA260417C00180000,232,0,312,11.82,{_SIP},2",
+    f"O:NVDA260417C00180000,209,0,325,11.07,{_SIP2},1",
 ]
 
 
@@ -86,17 +86,29 @@ def test_parse_assigns_ordinals_and_preserves_duplicates() -> None:
     assert [p.ordinal for p in prints] == [0, 1, 2]  # stable file order
     assert prints[0].price == 11.82 and prints[1].price == 11.82  # dup preserved as two rows
     assert prints[0].conditions == (232,)
-    assert prints[0].correction is None  # empty correction cell -> None
+    assert prints[0].correction == 0
+    assert prints[0].participant_timestamp_ns is None  # 7-col file omits it
     assert prints[2].exchange == 325
+
+
+def test_parse_reads_participant_timestamp_when_present() -> None:
+    # The documented 8-col layout: participant_timestamp populated, parsed by name.
+    header = "ticker,conditions,correction,exchange,participant_timestamp,price,sip_timestamp,size"
+    gz = gzip.compress(
+        (header + f"\nO:NVDA260417C00180000,232,0,312,{_SIP - 500},11.82,{_SIP},2\n").encode()
+    )
+    p = parse_trades(gz, frozenset({_C1}))[_C1][0]
+    assert p.participant_timestamp_ns == _SIP - 500
+    assert p.sip_timestamp_ns == _SIP and p.price == 11.82
 
 
 def test_parse_filters_to_keep_set() -> None:
     assert parse_trades(_gz(_ROWS), frozenset({_C2})) == {}  # C1 not kept
 
 
-def test_parse_rejects_unexpected_columns() -> None:
+def test_parse_rejects_missing_required_columns() -> None:
     bad = gzip.compress(b"ticker,price\nO:X,1\n")
-    with pytest.raises(ValueError, match="unexpected trade-file columns"):
+    with pytest.raises(ValueError, match="missing required columns"):
         parse_trades(bad, frozenset({_C1}))
 
 

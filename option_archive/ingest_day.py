@@ -47,16 +47,14 @@ FLATFILES_BUCKET = "flatfiles"
 TRADES_KEY_TEMPLATE = "us_options_opra/trades_v1/{y:04d}/{m:02d}/{y:04d}-{m:02d}-{d:02d}.csv.gz"
 
 # Trade flat-file columns (confirmed from a sample day).
-_TRADE_COLUMNS = (
-    "ticker",
-    "conditions",
-    "correction",
-    "exchange",
-    "participant_timestamp",
-    "price",
-    "sip_timestamp",
-    "size",
+# Massive documents an 8-column trade file, but some real files (e.g. 2024-05-23)
+# ship only these 7, omitting participant_timestamp (discrepancy reported to
+# Massive). We parse by header NAME and treat participant_timestamp as OPTIONAL —
+# populated when present, NULL when not — so both layouts load.
+_REQUIRED_COLUMNS = (
+    "ticker", "conditions", "correction", "exchange", "price", "sip_timestamp", "size",
 )
+_PARTICIPANT_COLUMN = "participant_timestamp"
 
 
 @dataclass(frozen=True)
@@ -66,7 +64,7 @@ class FlatTradePrint:
     symbol: OsiSymbol  # bare OSI
     ordinal: int  # stable within-(contract,day) position, file order
     sip_timestamp_ns: int
-    participant_timestamp_ns: Optional[int]
+    participant_timestamp_ns: Optional[int]  # present only when the file carries the column
     price: float
     size: float
     exchange: Optional[int]
@@ -93,7 +91,7 @@ class OptionTradeRow:
     sip_timestamp_ns: int
     ordinal: int
     sequence_number: Optional[int]  # None for flat-file rows
-    participant_timestamp_ns: Optional[int]
+    participant_timestamp_ns: Optional[int]  # None when the file omits the column
     correction: Optional[int]
     spot_at_trade: Optional[float]
     spot_trade_ts: Optional[datetime]
@@ -189,28 +187,38 @@ def parse_trades(
     text = gzip.decompress(raw_gz).decode("utf-8")
     reader = csv.reader(io.StringIO(text))
     header = next(reader, None)
-    if header is None or tuple(c.strip() for c in header) != _TRADE_COLUMNS:
-        raise ValueError(f"unexpected trade-file columns: {header!r}")
+    if header is None:
+        raise ValueError("empty trade file (no header)")
+    cols = [c.strip() for c in header]
+    idx = {name: i for i, name in enumerate(cols)}
+    missing = [c for c in _REQUIRED_COLUMNS if c not in idx]
+    if missing:
+        raise ValueError(f"trade file missing required columns {missing}: header={cols!r}")
+    ncols = len(cols)
+    p_idx = idx.get(_PARTICIPANT_COLUMN)  # None when the file omits participant_timestamp
+    ti, ci, ri, ei, pi, si, zi = (
+        idx["ticker"], idx["conditions"], idx["correction"], idx["exchange"],
+        idx["price"], idx["sip_timestamp"], idx["size"],
+    )
     out: dict[OsiSymbol, list[FlatTradePrint]] = defaultdict(list)
     for row in reader:
-        if len(row) != len(_TRADE_COLUMNS):
-            raise ValueError(f"malformed trade row (got {len(row)} cols): {row!r}")
-        bare = strip_massive_prefix(row[0])
-        sym = OsiSymbol(bare)
+        if len(row) != ncols:
+            raise ValueError(f"malformed trade row (got {len(row)} of {ncols}): {row!r}")
+        sym = OsiSymbol(strip_massive_prefix(row[ti]))
         if sym not in keep:
             continue
-        cond = _opt_int(row[1])
+        cond = _opt_int(row[ci])
         out[sym].append(
             FlatTradePrint(
                 symbol=sym,
                 ordinal=len(out[sym]),  # 0-based position within this contract, file order
-                sip_timestamp_ns=int(row[6]),
-                participant_timestamp_ns=_opt_int(row[4]),
-                price=float(row[5]),
-                size=float(row[7]),
-                exchange=_opt_int(row[3]),
+                sip_timestamp_ns=int(row[si]),
+                participant_timestamp_ns=(_opt_int(row[p_idx]) if p_idx is not None else None),
+                price=float(row[pi]),
+                size=float(row[zi]),
+                exchange=_opt_int(row[ei]),
                 conditions=(cond,) if cond is not None else (),
-                correction=_opt_int(row[2]),
+                correction=_opt_int(row[ri]),
             )
         )
     return dict(out)
