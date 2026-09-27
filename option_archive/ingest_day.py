@@ -1,0 +1,393 @@
+"""PR3 — per-day trade flat-file ingest.
+
+The historical trade drain is one job per trading day: download that day's
+whole-market OPRA trade file (<100 MB, gzipped CSV) from the vendor's S3, keep only
+the contracts enumerated for that day, attach the as-of raw spot from one equity
+tape per underlying, insert complete rows to ``trading.option_trade`` (quote columns
+NULL — the enrichment pass fills them later), mark the day's jobs done, discard the
+file. Per-contract REST (`greeks/pull/massive_trades`) is retained for PR5
+incremental/new-name fills; it is not the bulk path.
+
+Identity: the trade file has no ``sequence_number`` and can contain byte-identical
+prints, so each print gets a stable within-(contract,day) ``ordinal`` in file order
+(decision 7) — distinct same-nanosecond prints survive and re-ingest is idempotent.
+
+No ``asyncio`` / ``threading`` (process fleet only). The network calls live in
+module functions so tests inject fakes.
+"""
+
+from __future__ import annotations
+
+import csv
+import gzip
+import io
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional, Sequence
+
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
+from clickhouse_connect.driver.client import Client
+
+from greeks.occ import parse_occ, strip_massive_prefix
+from greeks.pull.alpaca_spot import EquityTradePrint, fetch_equity_trades
+from greeks.pull.massive_trades import ns_to_utc
+from option_archive.config import ArchiveConfig
+from option_archive.domain import OsiSymbol, TaskFailure, WorkTask
+from option_archive.queue import WorkQueue
+
+log = logging.getLogger(__name__)
+
+MASSIVE_S3_ENDPOINT = "https://files.massive.com"
+FLATFILES_BUCKET = "flatfiles"
+TRADES_KEY_TEMPLATE = "us_options_opra/trades_v1/{y:04d}/{m:02d}/{y:04d}-{m:02d}-{d:02d}.csv.gz"
+
+# Trade flat-file columns (confirmed from a sample day).
+_TRADE_COLUMNS = (
+    "ticker",
+    "conditions",
+    "correction",
+    "exchange",
+    "participant_timestamp",
+    "price",
+    "sip_timestamp",
+    "size",
+)
+
+
+@dataclass(frozen=True)
+class FlatTradePrint:
+    """One row of the trade flat file, keyed for the archive by (symbol, sip, ordinal)."""
+
+    symbol: OsiSymbol  # bare OSI
+    ordinal: int  # stable within-(contract,day) position, file order
+    sip_timestamp_ns: int
+    participant_timestamp_ns: Optional[int]
+    price: float
+    size: float
+    exchange: Optional[int]
+    conditions: tuple[int, ...]
+    correction: Optional[int]
+
+    @property
+    def trade_ts(self) -> datetime:
+        return ns_to_utc(self.sip_timestamp_ns)
+
+
+@dataclass(frozen=True)
+class OptionTradeRow:
+    """A row for ``trading.option_trade`` (quote columns NULL at ingest)."""
+
+    symbol: str
+    underlying: str
+    session_date: date
+    trade_ts: datetime
+    price: float
+    size: float
+    exchange: Optional[int]
+    conditions: tuple[int, ...]
+    sip_timestamp_ns: int
+    ordinal: int
+    sequence_number: Optional[int]  # None for flat-file rows
+    participant_timestamp_ns: Optional[int]
+    correction: Optional[int]
+    spot_at_trade: Optional[float]
+    spot_trade_ts: Optional[datetime]
+    source: str = "massive"
+
+
+@dataclass(frozen=True)
+class DayReport:
+    work_date: date
+    contracts_claimed: int
+    trades_inserted: int
+    no_trade_contracts: int
+    outcome: str  # "done" | "transport" | "vendor"
+
+
+@dataclass(frozen=True)
+class WorkerReport:
+    days_done: int
+    trades_inserted: int
+
+
+# ---------------------------------------------------------------------------
+# network seams (module-level so tests inject fakes)
+# ---------------------------------------------------------------------------
+
+
+def make_s3_client(access_key: str, secret_key: str) -> object:
+    """S3 client for the vendor's S3-compatible endpoint. Credentials come from
+    env (never committed); constructed once and passed to the worker."""
+    if not access_key or not secret_key:
+        raise ValueError("flat-file S3 access key and secret are required")
+    session = boto3.Session(
+        aws_access_key_id=access_key, aws_secret_access_key=secret_key
+    )
+    return session.client(
+        "s3", endpoint_url=MASSIVE_S3_ENDPOINT, config=BotoConfig(signature_version="s3v4")
+    )
+
+
+def download_trades_day(s3: object, work_date: date, *, bucket: str = FLATFILES_BUCKET) -> bytes:
+    """Fetch one day's gzipped trade file. Caller discards after ingest."""
+    key = TRADES_KEY_TEMPLATE.format(y=work_date.year, m=work_date.month, d=work_date.day)
+    obj = s3.get_object(Bucket=bucket, Key=key)  # type: ignore[attr-defined]
+    body = obj["Body"].read()
+    if not isinstance(body, (bytes, bytearray)):
+        raise ValueError(f"unexpected S3 body type for {key}: {type(body)!r}")
+    return bytes(body)
+
+
+def equity_tape(alpaca: object, underlying: str, work_date: date) -> list[EquityTradePrint]:
+    """RAW SIP equity tape for one underlying-day (fetched once, reused across that
+    underlying's contracts)."""
+    return fetch_equity_trades(alpaca, underlying, work_date)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# parse + join (pure)
+# ---------------------------------------------------------------------------
+
+
+def _opt_int(cell: str) -> Optional[int]:
+    cell = cell.strip()
+    return int(cell) if cell else None
+
+
+def parse_trades(
+    raw_gz: bytes, keep: frozenset[OsiSymbol]
+) -> dict[OsiSymbol, list[FlatTradePrint]]:
+    """Parse the gzipped trade CSV, keeping only ``keep`` contracts, assigning each
+    kept print a stable ordinal in file order per contract."""
+    text = gzip.decompress(raw_gz).decode("utf-8")
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader, None)
+    if header is None or tuple(c.strip() for c in header) != _TRADE_COLUMNS:
+        raise ValueError(f"unexpected trade-file columns: {header!r}")
+    out: dict[OsiSymbol, list[FlatTradePrint]] = defaultdict(list)
+    for row in reader:
+        if len(row) != len(_TRADE_COLUMNS):
+            raise ValueError(f"malformed trade row (got {len(row)} cols): {row!r}")
+        bare = strip_massive_prefix(row[0])
+        sym = OsiSymbol(bare)
+        if sym not in keep:
+            continue
+        cond = _opt_int(row[1])
+        out[sym].append(
+            FlatTradePrint(
+                symbol=sym,
+                ordinal=len(out[sym]),  # 0-based position within this contract, file order
+                sip_timestamp_ns=int(row[6]),
+                participant_timestamp_ns=_opt_int(row[4]),
+                price=float(row[5]),
+                size=float(row[7]),
+                exchange=_opt_int(row[3]),
+                conditions=(cond,) if cond is not None else (),
+                correction=_opt_int(row[2]),
+            )
+        )
+    return dict(out)
+
+
+def _attach_spot(
+    trades_by_ts: Sequence[FlatTradePrint], tape: Sequence[EquityTradePrint]
+) -> dict[tuple[str, int, int], EquityTradePrint]:
+    """Merge-walk as-of join (last equity print at-or-before each trade), the same
+    algorithm as ``attach_spot_to_option_trades``. ``trades_by_ts`` and ``tape`` must
+    be sorted ascending by timestamp. Keyed by (symbol, sip_ns, ordinal)."""
+    out: dict[tuple[str, int, int], EquityTradePrint] = {}
+    j = 0
+    last: Optional[EquityTradePrint] = None
+    for t in trades_by_ts:
+        while j < len(tape) and tape[j].trade_ts <= t.trade_ts:
+            last = tape[j]
+            j += 1
+        if last is not None:
+            out[(t.symbol, t.sip_timestamp_ns, t.ordinal)] = last
+    return out
+
+
+def _build_rows(
+    by_symbol: dict[OsiSymbol, list[FlatTradePrint]],
+    spot: dict[tuple[str, int, int], EquityTradePrint],
+    work_date: date,
+) -> list[OptionTradeRow]:
+    rows: list[OptionTradeRow] = []
+    for sym, prints in by_symbol.items():
+        underlying = parse_occ(sym).root
+        for p in prints:
+            eq = spot.get((p.symbol, p.sip_timestamp_ns, p.ordinal))
+            rows.append(
+                OptionTradeRow(
+                    symbol=sym,
+                    underlying=underlying,
+                    session_date=work_date,
+                    trade_ts=p.trade_ts,
+                    price=p.price,
+                    size=p.size,
+                    exchange=p.exchange,
+                    conditions=p.conditions,
+                    sip_timestamp_ns=p.sip_timestamp_ns,
+                    ordinal=p.ordinal,
+                    sequence_number=None,  # flat file supplies none
+                    participant_timestamp_ns=p.participant_timestamp_ns,
+                    correction=p.correction,
+                    spot_at_trade=eq.price if eq is not None else None,
+                    spot_trade_ts=eq.trade_ts if eq is not None else None,
+                )
+            )
+    return rows
+
+
+_INSERT_COLUMNS = (
+    "symbol", "underlying", "session_date", "trade_ts", "price", "size", "exchange",
+    "conditions", "sip_timestamp_ns", "ordinal", "sequence_number",
+    "participant_timestamp_ns", "correction", "spot_at_trade", "spot_trade_ts",
+    "quote_ts", "bid", "ask", "bid_size", "ask_size", "quote_lag_ms", "source",
+)
+
+
+def insert_option_trades(ch: Client, rows: Sequence[OptionTradeRow], *, table: str) -> int:
+    """Batch-insert complete rows (quote columns NULL). ``ingested_at`` uses the CH
+    DEFAULT now64(3), so it is not supplied here."""
+    if not rows:
+        return 0
+    data = [
+        [
+            r.symbol, r.underlying, r.session_date, r.trade_ts, r.price, r.size,
+            r.exchange, list(r.conditions), r.sip_timestamp_ns, r.ordinal,
+            r.sequence_number, r.participant_timestamp_ns, r.correction,
+            r.spot_at_trade, r.spot_trade_ts,
+            None, None, None, None, None, None,  # quote_ts, bid, ask, bid_size, ask_size, quote_lag_ms
+            r.source,
+        ]
+        for r in rows
+    ]
+    db, name = (table.split(".", 1) if "." in table else (None, table))
+    ch.insert(name, data, column_names=list(_INSERT_COLUMNS), database=db)
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# worker
+# ---------------------------------------------------------------------------
+
+
+def _claim_day(queue: WorkQueue, *, now: Optional[datetime]) -> list[WorkTask]:
+    """Claim the oldest claimable day's tasks. Existing ORDER BY (work_date, contract)
+    yields a day contiguously; a later-day claim is released back."""
+    first = queue.claim_next(now=now)
+    if first is None:
+        return []
+    day = first.work_date
+    claimed = [first]
+    while True:
+        nxt = queue.claim_next(now=now)
+        if nxt is None:
+            break
+        if nxt.work_date == day:
+            claimed.append(nxt)
+        else:
+            queue.release_transport(nxt, "deferred: belongs to a later day-batch")
+            break
+    return claimed
+
+
+def ingest_day(
+    queue: WorkQueue,
+    ch: Client,
+    s3: object,
+    alpaca: object,
+    cfg: ArchiveConfig,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[DayReport]:
+    """Ingest one trading day's trades for the claimed contract-set. Returns None
+    when the queue is drained."""
+    claimed = _claim_day(queue, now=now)
+    if not claimed:
+        return None
+    day = claimed[0].work_date
+    keep = frozenset(t.contract for t in claimed)
+
+    try:
+        raw = download_trades_day(s3, day)
+    except (ClientError, BotoCoreError, OSError) as e:
+        for t in claimed:
+            queue.release_transport(t, f"s3 download failed: {e}")
+        log.warning("day %s: S3 download failed, released %d tasks: %s", day, len(claimed), e)
+        return DayReport(day, len(claimed), 0, 0, "transport")
+
+    try:
+        by_symbol = parse_trades(raw, keep)
+    except (ValueError, gzip.BadGzipFile) as e:
+        for t in claimed:
+            queue.fail_vendor(t, TaskFailure.VENDOR_ERROR, f"parse failed: {e}", now=now)
+        log.error("day %s: trade file parse failed, failed %d tasks: %s", day, len(claimed), e)
+        return DayReport(day, len(claimed), 0, 0, "vendor")
+
+    try:
+        spot: dict[tuple[str, int, int], EquityTradePrint] = {}
+        by_underlying: dict[str, list[FlatTradePrint]] = defaultdict(list)
+        for sym, prints in by_symbol.items():
+            by_underlying[parse_occ(sym).root].extend(prints)
+        for underlying, prints in by_underlying.items():
+            tape = equity_tape(alpaca, underlying, day)
+            spot.update(_attach_spot(sorted(prints, key=lambda p: p.trade_ts), tape))
+    except (RuntimeError, OSError) as e:  # equity fetch = infra/transport
+        for t in claimed:
+            queue.release_transport(t, f"equity tape failed: {e}")
+        log.warning("day %s: equity tape failed, released %d tasks: %s", day, len(claimed), e)
+        return DayReport(day, len(claimed), 0, 0, "transport")
+
+    rows = _build_rows(by_symbol, spot, day)
+
+    try:
+        inserted = insert_option_trades(ch, rows, table=cfg.tables.option_trade)
+    except Exception as e:  # CH insert failure = infra; retry without penalty
+        for t in claimed:
+            queue.release_transport(t, f"clickhouse insert failed: {e}")
+        log.warning("day %s: insert failed, released %d tasks: %s", day, len(claimed), e)
+        return DayReport(day, len(claimed), 0, 0, "transport")
+
+    # Commit succeeded — mark done (fenced). Contracts absent from the file are the
+    # reasoned no-trades outcome: DONE with zero rows, no queue change.
+    for t in claimed:
+        queue.mark_done(t, now=now)
+    no_trades = sum(1 for t in claimed if t.contract not in by_symbol)
+    log.info(
+        "day %s: %d contracts, %d trades inserted, %d no-trades",
+        day, len(claimed), inserted, no_trades,
+    )
+    return DayReport(day, len(claimed), inserted, no_trades, "done")
+
+
+def run_worker(
+    queue: WorkQueue,
+    ch: Client,
+    s3: object,
+    alpaca: object,
+    cfg: ArchiveConfig,
+    *,
+    poll: timedelta,
+) -> WorkerReport:
+    """Drain the queue day by day. Empty claim + pending → sleep(poll); empty +
+    drained → return."""
+    days = 0
+    trades = 0
+    while True:
+        rep = ingest_day(queue, ch, s3, alpaca, cfg, now=datetime.now(timezone.utc))
+        if rep is None:
+            if queue.pending_exists():
+                time.sleep(poll.total_seconds())
+                continue
+            break
+        if rep.outcome == "done":
+            days += 1
+            trades += rep.trades_inserted
+    return WorkerReport(days_done=days, trades_inserted=trades)

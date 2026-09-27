@@ -25,6 +25,7 @@ backfill_start_date: "2022-03-07"
 quotes_available_from: "2022-03-07"
 excluded_dates: ["2026-06-08"]
 roll_off: {assumed_retention_years: 5, alert_margin_days: 60}
+queue: {lease_seconds: 1800, max_attempts: 5, backoff_base_seconds: 60}
 schedule:
   - {kind: polite, start_et: "07:00", requests_per_sec: 1.0, worker_count: 1}
   - {kind: aggressive, start_et: "20:00", requests_per_sec: 5.0, worker_count: 4}

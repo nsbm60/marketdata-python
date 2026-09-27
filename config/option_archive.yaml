@@ -57,6 +57,14 @@ schedule:
     requests_per_sec: 5.0
     worker_count: 4
 
+# Work-queue policy: claim lease (dead-worker recovery), vendor-failure retry cap,
+# exponential backoff base. A day-ingest holds its claims while downloading +
+# spot-joining, so the lease must comfortably exceed that; tune from measurement.
+queue:
+  lease_seconds: 1800
+  max_attempts: 5
+  backoff_base_seconds: 60
+
 # SQLite work-queue DB — MUST be outside the repo, git-ignored (Resolved decision 1).
 # On the Linux box this points under the mdapps data dir; here it defaults to the
 # per-user data dir. load_config() rejects any path inside the repo.

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, time
+from datetime import date, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -100,6 +100,23 @@ class Schedule:
 
 
 @dataclass(frozen=True)
+class QueuePolicy:
+    """Work-queue tuning: claim lease, vendor-failure retry cap, backoff base."""
+
+    lease: timedelta
+    max_attempts: int
+    backoff_base: timedelta
+
+    def __post_init__(self) -> None:
+        if self.lease <= timedelta(0):
+            raise ValueError("queue.lease_seconds must be > 0")
+        if self.max_attempts < 1:
+            raise ValueError("queue.max_attempts must be >= 1")
+        if self.backoff_base <= timedelta(0):
+            raise ValueError("queue.backoff_base_seconds must be > 0")
+
+
+@dataclass(frozen=True)
 class RollOffAlerting:
     """Worst-case retention assumption and the alert margin against roll-off."""
 
@@ -135,6 +152,7 @@ class ArchiveConfig:
     backfill_start_date: date       # oldest date the queue enumerates (trades exist to 2014; we start 2022)
     quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
     excluded_dates: tuple[date, ...]
+    queue: QueuePolicy
     roll_off: RollOffAlerting
     schedule: Schedule
     queue_db_path: Path
@@ -221,6 +239,15 @@ def _parse_roll_off(raw: Any) -> RollOffAlerting:
     )
 
 
+def _parse_queue(raw: Any) -> QueuePolicy:
+    m = _require_mapping(raw, "queue")
+    return QueuePolicy(
+        lease=timedelta(seconds=int(m["lease_seconds"])),
+        max_attempts=int(m["max_attempts"]),
+        backoff_base=timedelta(seconds=int(m["backoff_base_seconds"])),
+    )
+
+
 def _parse_tables(raw: Any) -> ArchiveTableNames:
     m = _require_mapping(raw, "tables")
     return ArchiveTableNames(
@@ -298,6 +325,7 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
         backfill_start_date=backfill_start_date,
         quotes_available_from=quotes_available_from,
         excluded_dates=excluded,
+        queue=_parse_queue(raw.get("queue")),
         roll_off=_parse_roll_off(raw.get("roll_off")),
         schedule=_parse_schedule(raw.get("schedule")),
         queue_db_path=_parse_queue_db_path(raw.get("queue_db_path")),
