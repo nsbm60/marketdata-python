@@ -1,0 +1,71 @@
+# Sole application config for the option_archive package.
+# Read only via option_archive.config.load_config(). Do not parse this file elsewhere.
+
+# Backfill span. Per Massive flat-file docs, option trades reach back to 2014 but
+# the options quotes flat file (S3 /options/quotes) has history only from
+# 2022-03-07. We start at that exact date so trades and quotes are coterminous —
+# every in-scope trade can carry its as-of quote, none land quote-less. (Trades
+# before 2022-03-07 are available but out of scope by this choice.)
+backfill_start_date: "2022-03-07"
+
+# QUOTE tasks are enqueued only on/after this quote-history floor (Massive quotes
+# flat file: records from 2022-03-07). Equal to the backfill start today; kept as
+# its own field so that if the start is ever moved earlier, pre-quote trades land
+# with NULL quote columns (the honest "quote unavailable") rather than failing.
+quotes_available_from: "2022-03-07"
+
+# Screened universe (the flat-file volume screen is DEFERRED — first data is
+# seeded from the watchlist only; these params drive the screen when it runs).
+universe:
+  top_n: 100
+  ranking_years: [2022, 2023, 2024, 2025, 2026]
+  index_products: [SPY, QQQ]
+  watchlist_always_include: true
+
+# Per-era capture bands (resolved parameters — do not widen/narrow without a spec change).
+bands:
+  perishable:            # within a year of roll-off; err wide, never re-pullable
+    moneyness_band: 0.50
+    max_dte_days: 365
+  routine:               # re-pullable if regretted
+    moneyness_band: 0.30
+    max_dte_days: 90
+quotes_band:             # quotes-at-trades everywhere (trade record is the unrecoverable thing)
+  moneyness_band: 0.30
+  max_dte_days: 90
+
+# Dates dropped entirely (collector-side outages, etc.). List, not a hardcode.
+excluded_dates: []
+
+# Worst-case rolling retention assumption + alert margin before a year rolls off.
+roll_off:
+  assumed_retention_years: 5
+  alert_margin_days: 60
+
+# Pacing windows. requests_per_sec is a PLACEHOLDER calibrated on the first live
+# day (spec Open item 1) — the queue is resumable, so an under-rate only slows,
+# never truncates. Worker counts likewise tuned from measured bytes/hour.
+schedule_windows:
+  - kind: aggressive     # overnight, full throttle
+    start_et: "20:00"
+    end_et: "04:00"
+    requests_per_sec: 5.0
+    worker_count: 4
+  - kind: polite         # daytime, reduced so the link stays usable
+    start_et: "04:00"
+    end_et: "20:00"
+    requests_per_sec: 1.0
+    worker_count: 1
+
+# SQLite work-queue DB — MUST be outside the repo, git-ignored (Resolved decision 1).
+# On the Linux box this points under the mdapps data dir; here it defaults to the
+# per-user data dir. load_config() rejects any path inside the repo.
+queue_db_path: "~/.local/share/option_archive/queue.db"
+
+# ClickHouse table names (DDL lives in the Scala MarketData schema/migrations).
+tables:
+  option_trades: "trading.option_trades"   # trades carry the as-of quote on the same row
+  splits: "trading.splits"
+  universe_ranking: "trading.option_universe_ranking"
+  dividend: "trading.dividend"
+  option_contract: "trading.option_contract"

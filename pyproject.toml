@@ -30,10 +30,10 @@ tier2 = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["greeks*"]
+include = ["greeks*", "option_archive*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/greeks"]
+testpaths = ["tests/greeks", "tests/option_archive"]
 pythonpath = ["."]
 
 [tool.mypy]
@@ -42,7 +42,7 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "."
-packages = ["greeks"]
+packages = ["greeks", "option_archive"]
 exclude = [
   "venv/",
   "tools/venv/",
