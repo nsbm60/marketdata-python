@@ -124,6 +124,10 @@ class WorkTask:
     work_date: date
     status: TaskStatus
     attempt_count: int
+    # Fencing token of the claim that produced this WorkTask. Every queue mutation
+    # is conditioned on it — if a lease reclaim superseded the claim, the token no
+    # longer matches and the stale worker's verdict is a logged no-op, not applied.
+    claim_id: Optional[str] = None
     batch_id: Optional[str] = None
     claimed_at: Optional[datetime] = None
     last_error: Optional[str] = None
