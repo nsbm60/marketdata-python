@@ -42,20 +42,20 @@ roll_off:
   assumed_retention_years: 5
   alert_margin_days: 60
 
-# Pacing windows. requests_per_sec is a PLACEHOLDER calibrated on the first live
-# day (spec Open item 1) — the queue is resumable, so an under-rate only slows,
-# never truncates. Worker counts likewise tuned from measured bytes/hour.
-schedule_windows:
-  - kind: aggressive     # overnight, full throttle
-    start_et: "20:00"
-    end_et: "04:00"
-    requests_per_sec: 5.0
-    worker_count: 4
-  - kind: polite         # daytime, reduced so the link stays usable
-    start_et: "04:00"
-    end_et: "20:00"
+# Pacing schedule as clock boundaries: each window begins at start_et and runs
+# until the next window starts (wrapping midnight). One number per boundary — no
+# end times to keep consistent, so overlap/gap can't happen. requests_per_sec is a
+# PLACEHOLDER calibrated on the first live day (spec Open item 1) — the queue is
+# resumable, so an under-rate only slows, never truncates.
+schedule:
+  - kind: polite         # daytime (07:00–20:00), reduced so the link stays usable
+    start_et: "07:00"
     requests_per_sec: 1.0
     worker_count: 1
+  - kind: aggressive     # overnight (20:00–07:00), full throttle
+    start_et: "20:00"
+    requests_per_sec: 5.0
+    worker_count: 4
 
 # SQLite work-queue DB — MUST be outside the repo, git-ignored (Resolved decision 1).
 # On the Linux box this points under the mdapps data dir; here it defaults to the

@@ -25,9 +25,9 @@ backfill_start_date: "2022-03-07"
 quotes_available_from: "2022-03-07"
 excluded_dates: ["2026-06-08"]
 roll_off: {assumed_retention_years: 5, alert_margin_days: 60}
-schedule_windows:
-  - {kind: aggressive, start_et: "20:00", end_et: "04:00", requests_per_sec: 5.0, worker_count: 4}
-  - {kind: polite, start_et: "04:00", end_et: "20:00", requests_per_sec: 1.0, worker_count: 1}
+schedule:
+  - {kind: polite, start_et: "07:00", requests_per_sec: 1.0, worker_count: 1}
+  - {kind: aggressive, start_et: "20:00", requests_per_sec: 5.0, worker_count: 4}
 queue_db_path: "{queue_db}"
 tables:
   option_trades: "trading.option_trades"
@@ -60,12 +60,20 @@ def test_temp_config_parses_all_fields(tmp_path: Path) -> None:
     cfg = load_config(_write(tmp_path, _BASE))
     assert cfg.universe.ranking_years == (2022, 2023)
     assert cfg.universe.index_products == ("SPY", "QQQ")
-    assert len(cfg.schedule_windows) == 2
-    # window kind is an enum and times are real time objects, not strings
-    assert cfg.schedule_windows[0].kind is ScheduleWindowKind.AGGRESSIVE
-    assert cfg.schedule_windows[0].start_et == time(20, 0)
-    assert cfg.schedule_windows[0].end_et == time(4, 0)
+    assert len(cfg.schedule.windows) == 2
+    # windows are ordered by boundary; kind is an enum, start is a real time
+    assert cfg.schedule.windows[0].kind is ScheduleWindowKind.POLITE
+    assert cfg.schedule.windows[0].start_et == time(7, 0)
     assert cfg.roll_off.alert_margin_days == 60
+
+
+def test_schedule_active_window_tiles_the_clock(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, _BASE))
+    # 07:00–20:00 is polite; 20:00–07:00 (wrapping midnight) is aggressive.
+    assert cfg.schedule.active_at(time(10, 0)) is cfg.schedule.windows[0]  # polite
+    assert cfg.schedule.active_at(time(22, 0)) is cfg.schedule.windows[1]  # aggressive
+    assert cfg.schedule.active_at(time(3, 0)).kind is ScheduleWindowKind.AGGRESSIVE  # wraps
+    assert cfg.schedule.active_at(time(7, 0)).kind is ScheduleWindowKind.POLITE  # boundary
     assert cfg.excluded_dates[0].isoformat() == "2026-06-08"
     assert cfg.backfill_start_date.isoformat() == "2022-03-07"
     assert cfg.quotes_available_from.isoformat() == "2022-03-07"

@@ -47,16 +47,17 @@ class UniverseParams:
 
 @dataclass(frozen=True)
 class ScheduleWindow:
-    """A pacing window. Workers read the active window at claim time.
+    """One pacing regime that begins at ``start_et`` (America/New_York) and runs
+    until the next window starts (see :class:`Schedule`).
 
-    ``start_et``/``end_et`` are wall-clock times in America/New_York; a window may
-    wrap midnight (aggressive is 20:00→04:00). They are real ``time`` values, not
-    "HH:MM" strings — the format is enforced at parse, not carried as text.
+    There is deliberately **no** end time: a window is defined by where it begins,
+    and the day is a sequence of boundaries. That makes overlap and gaps
+    unrepresentable — the thing two start/end pairs could never guarantee.
+    ``start_et`` is a real ``time``, parsed at load, not an "HH:MM" string.
     """
 
     kind: ScheduleWindowKind
     start_et: time
-    end_et: time
     requests_per_sec: float
     worker_count: int
 
@@ -65,6 +66,37 @@ class ScheduleWindow:
             raise ValueError(f"{self.kind.value}: requests_per_sec must be > 0")
         if self.worker_count <= 0:
             raise ValueError(f"{self.kind.value}: worker_count must be > 0")
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """The pacing day as clock boundaries. Each window runs from its ``start_et``
+    to the next window's, wrapping past midnight, so exactly one window is active
+    at any instant — no overlap, no gap, nothing to keep consistent by hand.
+    """
+
+    windows: tuple[ScheduleWindow, ...]
+
+    def __post_init__(self) -> None:
+        if not self.windows:
+            raise ValueError("schedule must have at least one window")
+        starts = [w.start_et for w in self.windows]
+        if len(set(starts)) != len(starts):
+            raise ValueError("schedule windows must have distinct start_et")
+        if starts != sorted(starts):
+            raise ValueError("schedule windows must be ordered by start_et")
+
+    def active_at(self, t: time) -> ScheduleWindow:
+        """The window in force at wall-clock ``t``: the latest one that has begun.
+        Before the first boundary, the last window is active — it began the prior
+        day and wraps midnight."""
+        active = self.windows[-1]
+        for w in self.windows:
+            if w.start_et <= t:
+                active = w
+            else:
+                break
+        return active
 
 
 @dataclass(frozen=True)
@@ -100,10 +132,10 @@ class ArchiveConfig:
     bands: Mapping[Era, BandSpec]
     quotes_band: BandSpec
     backfill_start_date: date       # oldest date the queue enumerates (trades exist to 2014; we start 2022)
-    quotes_available_from: date     # QUOTE tasks only on/after this (quote history floor)
+    quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
     excluded_dates: tuple[date, ...]
     roll_off: RollOffAlerting
-    schedule_windows: tuple[ScheduleWindow, ...]
+    schedule: Schedule
     queue_db_path: Path
     tables: ArchiveTableNames
     api_keys: ApiKeys
@@ -159,24 +191,25 @@ def _parse_universe(raw: Any) -> UniverseParams:
     )
 
 
-def _parse_schedule_windows(raw: Any) -> tuple[ScheduleWindow, ...]:
+def _parse_schedule(raw: Any) -> Schedule:
     if not isinstance(raw, list) or not raw:
-        raise ValueError("schedule_windows must be a non-empty list")
+        raise ValueError("schedule must be a non-empty list")
     out: list[ScheduleWindow] = []
     for item in raw:
-        m = _require_mapping(item, "schedule_windows[]")
+        m = _require_mapping(item, "schedule[]")
         # ScheduleWindowKind(...) and time.fromisoformat(...) both reject bad input
         # here, at the boundary — never carried forward as an unvalidated string.
         out.append(
             ScheduleWindow(
                 kind=ScheduleWindowKind(str(m["kind"])),
                 start_et=time.fromisoformat(str(m["start_et"])),
-                end_et=time.fromisoformat(str(m["end_et"])),
                 requests_per_sec=float(m["requests_per_sec"]),
                 worker_count=int(m["worker_count"]),
             )
         )
-    return tuple(out)
+    # sort by boundary so config order is irrelevant; Schedule validates the rest.
+    out.sort(key=lambda w: w.start_et)
+    return Schedule(windows=tuple(out))
 
 
 def _parse_roll_off(raw: Any) -> RollOffAlerting:
@@ -264,7 +297,7 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
         quotes_available_from=quotes_available_from,
         excluded_dates=excluded,
         roll_off=_parse_roll_off(raw.get("roll_off")),
-        schedule_windows=_parse_schedule_windows(raw.get("schedule_windows")),
+        schedule=_parse_schedule(raw.get("schedule")),
         queue_db_path=_parse_queue_db_path(raw.get("queue_db_path")),
         tables=_parse_tables(raw.get("tables")),
         api_keys=_api_keys_from_env(),
