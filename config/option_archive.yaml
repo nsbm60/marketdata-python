@@ -69,3 +69,4 @@ tables:
   universe_ranking: "trading.option_universe_ranking"
   dividend: "trading.dividend"
   option_contract: "trading.option_contract"
+  watchlist: "trading.watchlist"

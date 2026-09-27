@@ -122,6 +122,7 @@ class ArchiveTableNames:
     universe_ranking: str
     dividend: str  # existing table, reused
     option_contract: str  # existing table, cross-check
+    watchlist: str  # existing table, seed source (watchlist-first)
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,7 @@ def _parse_tables(raw: Any) -> ArchiveTableNames:
         ),
         dividend=str(m.get("dividend", "trading.dividend")),
         option_contract=str(m.get("option_contract", "trading.option_contract")),
+        watchlist=str(m.get("watchlist", "trading.watchlist")),
     )
 
 
