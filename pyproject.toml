@@ -66,6 +66,13 @@ module = [
 ]
 ignore_missing_imports = true
 
+# option_archive uses the repo's canonical CH connector; don't pull the untyped
+# ml/ tree into the strict gate — treat it as Any.
+[[tool.mypy.overrides]]
+module = ["ml.shared.clickhouse"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
 # Pre-existing untyped discovery layer; greeks only uses wait_for_service.
 [[tool.mypy.overrides]]
 module = [

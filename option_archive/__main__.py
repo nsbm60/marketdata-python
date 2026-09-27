@@ -14,8 +14,8 @@ import logging
 import os
 from datetime import timedelta
 
-from greeks.ch import get_ch_client
 from greeks.pull.alpaca_spot import make_stock_client
+from ml.shared.clickhouse import get_ch_client  # canonical connector (carries the CH password)
 from option_archive.config import get_config
 from option_archive.ingest_day import make_s3_client, run_worker
 from option_archive.queue import WorkQueue
