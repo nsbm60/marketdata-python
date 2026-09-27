@@ -100,6 +100,26 @@ class OptionTradeRow:
     source: str = "massive"
 
 
+TRANSPORT_FLATFILE = "flatfile"
+
+
+@dataclass(frozen=True)
+class LedgerRow:
+    """One `trading.ingest_log` row — the durable record of a completed day."""
+
+    session_date: date
+    transport: str
+    tasks_success: int
+    tasks_no_trades: int
+    tasks_failed: int
+    rows_inserted: int
+    bytes_downloaded: int
+    wall_seconds: float
+    vendor_volume_delta: Optional[int]  # None until acceptance check 2 runs
+    started_at: datetime
+    finished_at: datetime
+
+
 @dataclass(frozen=True)
 class DayReport:
     work_date: date
@@ -134,7 +154,9 @@ def make_s3_client(access_key: str, secret_key: str) -> object:
 
 
 def download_trades_day(s3: object, work_date: date, *, bucket: str = FLATFILES_BUCKET) -> bytes:
-    """Fetch one day's gzipped trade file. Caller discards after ingest."""
+    """Fetch one day's gzipped trade file **into memory** (<100 MB) — never written
+    to disk, so there is nothing to clean up: the bytes are freed on every exit
+    path (parse error, insert failure, hard kill) by normal scope exit."""
     key = TRADES_KEY_TEMPLATE.format(y=work_date.year, m=work_date.month, d=work_date.day)
     obj = s3.get_object(Bucket=bucket, Key=key)  # type: ignore[attr-defined]
     body = obj["Body"].read()
@@ -273,6 +295,25 @@ def insert_option_trades(ch: Client, rows: Sequence[OptionTradeRow], *, table: s
     return len(rows)
 
 
+_LEDGER_COLUMNS = (
+    "session_date", "transport", "tasks_success", "tasks_no_trades", "tasks_failed",
+    "rows_inserted", "bytes_downloaded", "wall_seconds", "vendor_volume_delta",
+    "started_at", "finished_at",
+)
+
+
+def insert_ingest_log(ch: Client, row: LedgerRow, *, table: str) -> None:
+    """Append one ledger row. Best-effort analytics written after mark_done — a
+    failure here is logged, never rolled back onto the (already-done) tasks."""
+    db, name = (table.split(".", 1) if "." in table else (None, table))
+    data = [[
+        row.session_date, row.transport, row.tasks_success, row.tasks_no_trades,
+        row.tasks_failed, row.rows_inserted, row.bytes_downloaded, row.wall_seconds,
+        row.vendor_volume_delta, row.started_at, row.finished_at,
+    ]]
+    ch.insert(name, data, column_names=list(_LEDGER_COLUMNS), database=db)
+
+
 # ---------------------------------------------------------------------------
 # worker
 # ---------------------------------------------------------------------------
@@ -314,6 +355,8 @@ def ingest_day(
         return None
     day = claimed[0].work_date
     keep = frozenset(t.contract for t in claimed)
+    started_at = datetime.now(timezone.utc)
+    t0 = time.monotonic()
 
     try:
         raw = download_trades_day(s3, day)
@@ -360,6 +403,27 @@ def ingest_day(
     for t in claimed:
         queue.mark_done(t, now=now)
     no_trades = sum(1 for t in claimed if t.contract not in by_symbol)
+
+    # Final act: the durable ledger row (what WAS DONE). Best-effort — the tasks
+    # are already DONE, so a ledger failure is logged, not rolled back.
+    ledger = LedgerRow(
+        session_date=day,
+        transport=TRANSPORT_FLATFILE,
+        tasks_success=len(claimed) - no_trades,
+        tasks_no_trades=no_trades,
+        tasks_failed=0,
+        rows_inserted=inserted,
+        bytes_downloaded=len(raw),
+        wall_seconds=time.monotonic() - t0,
+        vendor_volume_delta=None,  # filled when acceptance check 2 runs
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc),
+    )
+    try:
+        insert_ingest_log(ch, ledger, table=cfg.tables.ingest_log)
+    except Exception as e:  # analytics only; do not un-mark done work
+        log.warning("day %s: ingest_log write failed (tasks remain done): %s", day, e)
+
     log.info(
         "day %s: %d contracts, %d trades inserted, %d no-trades",
         day, len(claimed), inserted, no_trades,

@@ -137,6 +137,7 @@ class ArchiveTableNames:
     option_trade: str  # trades carry the as-of quote on the same row
     split: str
     universe_ranking: str
+    ingest_log: str  # append-only ledger of completed ingest days
     dividend: str  # existing table, reused
     option_contract: str  # existing table, cross-check
     watchlist: str  # existing table, seed source (watchlist-first)
@@ -256,6 +257,7 @@ def _parse_tables(raw: Any) -> ArchiveTableNames:
         universe_ranking=str(
             m.get("universe_ranking", "trading.option_universe_ranking")
         ),
+        ingest_log=str(m.get("ingest_log", "trading.ingest_log")),
         dividend=str(m.get("dividend", "trading.dividend")),
         option_contract=str(m.get("option_contract", "trading.option_contract")),
         watchlist=str(m.get("watchlist", "trading.watchlist")),

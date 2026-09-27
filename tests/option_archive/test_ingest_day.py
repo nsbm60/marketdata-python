@@ -124,6 +124,13 @@ def test_ingest_day_inserts_and_marks_done(tmp_path: Path, monkeypatch: pytest.M
     assert all(row[spot_idx] == 180.0 for row in data)
     # both jobs terminal DONE (C2 = no-trades = DONE + zero rows)
     assert q.counts() == {TaskStatus.DONE: 2}
+    # ledger row written as the final act, after mark_done
+    (_ln, ldata, lcols, _ldb) = next(i for i in ch.inserts if i[0] == "ingest_log")
+    lrow = dict(zip(lcols, ldata[0]))
+    assert lrow["transport"] == "flatfile"
+    assert lrow["tasks_success"] == 1 and lrow["tasks_no_trades"] == 1
+    assert lrow["tasks_failed"] == 0 and lrow["rows_inserted"] == 3
+    assert lrow["vendor_volume_delta"] is None
 
 
 def test_ingest_day_s3_failure_releases_without_penalty(

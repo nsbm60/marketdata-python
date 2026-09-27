@@ -75,6 +75,7 @@ tables:
   option_trade: "trading.option_trade"   # trades carry the as-of quote on the same row
   split: "trading.split"
   universe_ranking: "trading.option_universe_ranking"
+  ingest_log: "trading.ingest_log"
   dividend: "trading.dividend"
   option_contract: "trading.option_contract"
   watchlist: "trading.watchlist"
