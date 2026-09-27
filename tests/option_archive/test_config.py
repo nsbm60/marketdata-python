@@ -30,8 +30,8 @@ schedule:
   - {kind: aggressive, start_et: "20:00", requests_per_sec: 5.0, worker_count: 4}
 queue_db_path: "{queue_db}"
 tables:
-  option_trades: "trading.option_trades"
-  splits: "trading.splits"
+  option_trade: "trading.option_trade"
+  split: "trading.split"
   universe_ranking: "trading.option_universe_ranking"
   dividend: "trading.dividend"
   option_contract: "trading.option_contract"

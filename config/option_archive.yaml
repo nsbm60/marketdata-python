@@ -64,8 +64,8 @@ queue_db_path: "~/.local/share/option_archive/queue.db"
 
 # ClickHouse table names (DDL lives in the Scala MarketData schema/migrations).
 tables:
-  option_trades: "trading.option_trades"   # trades carry the as-of quote on the same row
-  splits: "trading.splits"
+  option_trade: "trading.option_trade"   # trades carry the as-of quote on the same row
+  split: "trading.split"
   universe_ranking: "trading.option_universe_ranking"
   dividend: "trading.dividend"
   option_contract: "trading.option_contract"

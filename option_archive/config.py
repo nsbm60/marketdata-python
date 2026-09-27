@@ -117,8 +117,8 @@ class RollOffAlerting:
 class ArchiveTableNames:
     """Fully-qualified CH table names. DDL lives in the Scala schema."""
 
-    option_trades: str  # trades carry the as-of quote on the same row
-    splits: str
+    option_trade: str  # trades carry the as-of quote on the same row
+    split: str
     universe_ranking: str
     dividend: str  # existing table, reused
     option_contract: str  # existing table, cross-check
@@ -224,8 +224,8 @@ def _parse_roll_off(raw: Any) -> RollOffAlerting:
 def _parse_tables(raw: Any) -> ArchiveTableNames:
     m = _require_mapping(raw, "tables")
     return ArchiveTableNames(
-        option_trades=str(m.get("option_trades", "trading.option_trades")),
-        splits=str(m.get("splits", "trading.splits")),
+        option_trade=str(m.get("option_trade", "trading.option_trade")),
+        split=str(m.get("split", "trading.split")),
         universe_ranking=str(
             m.get("universe_ranking", "trading.option_universe_ranking")
         ),
