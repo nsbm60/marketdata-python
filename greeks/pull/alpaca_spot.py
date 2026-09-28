@@ -123,6 +123,7 @@ def fetch_equity_trades(
                     start=cursor,
                     end=chunk_end,
                     feed=feed,
+                    limit=10000,  # API max page size — 10x fewer round-trips than the default
                 )
                 raw = client.get_stock_trades(req)
                 out.extend(_trades_from_response(raw, sym))
@@ -222,6 +223,7 @@ def fetch_equity_session_close_print(
                 start=start_local,
                 end=end_local,
                 feed=feed,
+                limit=10000,  # API max page size — 10x fewer round-trips than the default
             )
             prints = _trades_from_response(client.get_stock_trades(req), sym)
             if not prints:
