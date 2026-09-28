@@ -24,6 +24,9 @@ log = logging.getLogger("option_archive.seed")
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    # httpx logs each request URL at INFO, and vendor URLs carry the API key as a
+    # query param — keep httpx at WARNING so the key never reaches the journal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = get_config()
     ch = get_ch_client()
     alpaca = make_stock_client(cfg.api_keys.alpaca_api_key, cfg.api_keys.alpaca_api_secret)

@@ -27,6 +27,9 @@ log = logging.getLogger("option_archive")
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    # httpx logs each request URL at INFO, and vendor URLs carry the API key as a
+    # query param — keep httpx at WARNING so the key never reaches the journal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = get_config()
     s3 = make_s3_client(
         os.environ.get("MASSIVE_S3_ACCESS_KEY", ""),
