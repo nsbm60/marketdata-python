@@ -1,0 +1,26 @@
+[Unit]
+Description=option_archive trade backfill worker %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mdapps
+Group=mdapps
+# WorkingDirectory puts the app on sys.path so the top-level ml/ and discovery/
+# packages (not pip-installed) resolve; greeks/option_archive resolve via the
+# editable install in the venv.
+WorkingDirectory=/opt/option_archive/app
+EnvironmentFile=/etc/option_archive/env
+Environment=PYTHONUNBUFFERED=1                      # logs land in journald live
+ExecStart=/opt/option_archive/venv/bin/python -m option_archive
+
+# A crash or kill -> restart. A clean drain-to-empty exit (0) does NOT restart —
+# the historical backfill is finished. Because the unit is enabled, a power cut
+# mid-run also resumes on boot. Idempotent + fenced queue makes restart safe.
+Restart=on-failure
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

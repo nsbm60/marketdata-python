@@ -1,0 +1,18 @@
+[Unit]
+Description=option_archive one-time queue seed (2016-01-04 forward, full watchlist)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mdapps
+Group=mdapps
+WorkingDirectory=/opt/option_archive/app
+EnvironmentFile=/etc/option_archive/env
+Environment=PYTHONUNBUFFERED=1                     # per-name progress lands in journald live
+ExecStart=/opt/option_archive/venv/bin/python -m option_archive.seed
+# The seed enumerates a decade x the full watchlist — hours. No deadline.
+TimeoutStartSec=infinity
+
+# Run once, watch progress:  systemctl start option_archive-seed
+#                            journalctl -u option_archive-seed -f

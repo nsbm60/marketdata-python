@@ -64,11 +64,11 @@ schedule:
   - kind: polite         # daytime (07:00–20:00), reduced so the link stays usable
     start_et: "07:00"
     requests_per_sec: 1.0
-    worker_count: 1
+    worker_count: 2       # 2 systemd instances run continuously; the endpoint stalls
   - kind: aggressive     # overnight (20:00–07:00), full throttle
     start_et: "20:00"
     requests_per_sec: 5.0
-    worker_count: 4
+    worker_count: 2       # under load, so start at 2 (x multipart 16 = 32 connections)
 
 # Work-queue policy: claim lease (dead-worker recovery), vendor-failure retry cap,
 # exponential backoff base. A day-ingest holds its claims while downloading +
