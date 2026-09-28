@@ -1,22 +1,15 @@
-"""PR2 — watchlist enumeration: turn the watchlist into queue jobs.
+"""Watchlist, trading-day, and spot helpers used by ``archive.py``.
 
-For each watchlist underlying, across the backfill span: one Alpaca **RAW** daily-
-bars call gives the trading days and the unadjusted close (the moneyness spot — a
-bar exists only on a trading day, so there is no separate calendar and no way to
-mistake an API hiccup for a holiday). The Massive contract reference, sampled once
-per ISO week, gives what was listed as-of each day. The per-era band selects the
-in-band contracts. Every surviving (contract, day) becomes one queue job — so
-nothing is ever pulled at PR3 that was not enumerated here (a trade outside the
-enumerated set is a hard error at pull time).
-
-Reuses greeks primitives (contract fetch/filter, the RAW adjustment guard). No new
-dependencies. The two network calls live in module functions so tests inject fakes.
+For each watchlist underlying, one Alpaca **RAW** daily-bars call gives the trading
+days and the unadjusted close (the moneyness spot — a bar exists only on a trading
+day, so there is no separate calendar and no way to mistake an API hiccup for a
+holiday). Reuses greeks primitives (the RAW adjustment guard). The network calls
+live in module functions so tests inject fakes.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -26,31 +19,16 @@ from alpaca.data.timeframe import TimeFrame
 from clickhouse_connect.driver.client import Client
 
 from greeks.pull.alpaca_spot import REQUIRED_ADJUSTMENT, REQUIRED_FEED, assert_raw_adjustment
-from greeks.pull.contracts import ContractRef, fetch_massive_contracts, filter_contracts
 from option_archive.config import ArchiveConfig
-from option_archive.domain import Era, OsiSymbol, to_osi
-from option_archive.queue import WorkQueue
+from option_archive.domain import Era
 
 log = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class SeedReport:
-    """What one seeding pass enumerated. No silent drops — every eligible
-    contract-day is either enqueued or already present."""
-
-    underlyings: int
-    trading_days: int
-    enqueued: int  # newly-inserted queue jobs (existing ones left untouched)
-    eligible_contract_days: int
-    nonstandard_excluded: int
-    days_without_bar: int
 
 
 def watchlist_underlyings(
     ch: Client, *, table: str, list_name: Optional[str] = None
 ) -> tuple[str, ...]:
-    """Distinct underlyings to seed, from ``trading.watchlist`` (FINAL). With
+    """Distinct underlyings to archive, from ``trading.watchlist`` (FINAL). With
     ``list_name`` set, only that list; otherwise every symbol on the watchlist."""
     sql = f"SELECT DISTINCT symbol FROM {table} FINAL"
     params: dict[str, str] = {}
@@ -94,101 +72,6 @@ def _fetch_daily_raw_closes(
 
 
 def _week_anchor(d: date) -> date:
-    """Monday of ``d``'s ISO week — the as-of date used to sample contracts once
-    per week rather than once per day."""
+    """Monday of ``d``'s ISO week — the as-of date used to sample contracts once per
+    week rather than once per day."""
     return d - timedelta(days=d.weekday())
-
-
-def _contracts_asof(
-    api_key: str,
-    underlying: str,
-    work_date: date,
-    max_dte_days: int,
-    cache: dict[tuple[str, date, int], list[ContractRef]],
-) -> list[ContractRef]:
-    key = (underlying, _week_anchor(work_date), max_dte_days)
-    if key not in cache:
-        cache[key] = fetch_massive_contracts(
-            api_key, underlying, as_of=_week_anchor(work_date), max_dte_days=max_dte_days
-        )
-    return cache[key]
-
-
-def seed_watchlist(
-    queue: WorkQueue,
-    ch: Client,
-    cfg: ArchiveConfig,
-    *,
-    massive_api_key: str,
-    alpaca: StockHistoricalDataClient,
-    now: date,
-    list_name: Optional[str] = None,
-) -> SeedReport:
-    """Enumerate eligible (contract, day) jobs for every watchlist underlying over
-    ``[cfg.backfill_start_date, now]`` and enqueue them. Idempotent — re-running
-    adds only new jobs (``WorkQueue.enqueue_many`` is INSERT OR IGNORE)."""
-    if not massive_api_key:
-        raise ValueError("Massive API key is required")
-    unders = watchlist_underlyings(ch, table=cfg.tables.watchlist, list_name=list_name)
-    start = cfg.backfill_start_date
-
-    trading_days = 0
-    eligible = 0
-    nonstandard = 0
-    days_without_bar = 0
-    enqueued = 0
-
-    for underlying in unders:
-        closes = _fetch_daily_raw_closes(alpaca, underlying, start, now)
-        # Every calendar day in span with no bar is a non-trading day — expected,
-        # counted, never treated as missing data.
-        span_days = (now - start).days + 1
-        days_without_bar += span_days - len(closes)
-        # Per-underlying cache and pairs list: enqueue after each name so the pairs
-        # buffer never holds the whole watchlist × decade (that would exhaust memory).
-        contract_cache: dict[tuple[str, date, int], list[ContractRef]] = {}
-        excluded_wd = cfg.excluded_expiry_weekdays(underlying)
-        pairs: list[tuple[OsiSymbol, date]] = []
-        for work_date in sorted(closes):
-            if work_date in cfg.excluded_dates:
-                continue  # dropped day (collector outage etc.) — never enumerated
-            trading_days += 1
-            band = cfg.band_for_underlying(underlying, era_for(work_date, now=now, cfg=cfg))
-            contracts = _contracts_asof(
-                massive_api_key, underlying, work_date, band.max_dte_days, contract_cache
-            )
-            result = filter_contracts(
-                contracts,
-                as_of=work_date,
-                spot=closes[work_date],
-                max_dte_days=band.max_dte_days,
-                moneyness_band=band.moneyness_band,
-            )
-            nonstandard += len(result.nonstandard)
-            for c in result.eligible:
-                if c.expiry.weekday() in excluded_wd:
-                    continue  # per-underlying expiry-weekday exclusion (e.g. SPY/QQQ Tue/Thu)
-                eligible += 1
-                pairs.append((to_osi(c.osi), work_date))
-        enqueued += queue.enqueue_many(pairs)
-        log.info("seed_watchlist: %s done — %d jobs (eligible so far %d)", underlying, len(pairs), eligible)
-
-    report = SeedReport(
-        underlyings=len(unders),
-        trading_days=trading_days,
-        enqueued=enqueued,
-        eligible_contract_days=eligible,
-        nonstandard_excluded=nonstandard,
-        days_without_bar=days_without_bar,
-    )
-    log.info(
-        "seed_watchlist: unders=%d trading_days=%d eligible=%d enqueued=%d "
-        "nonstandard_excluded=%d days_without_bar=%d",
-        report.underlyings,
-        report.trading_days,
-        report.eligible_contract_days,
-        report.enqueued,
-        report.nonstandard_excluded,
-        report.days_without_bar,
-    )
-    return report

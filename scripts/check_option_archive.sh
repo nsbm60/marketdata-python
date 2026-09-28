@@ -23,12 +23,11 @@ if [[ -z "$PYTHON" ]]; then
   fi
 fi
 
-echo "== import smoke: seed + worker entry modules =="
-# Import the two entry points with the venv python so a MISSING RUNTIME DEP (or a
-# forbidden live-services import sneaking back) fails setup here, loudly, rather
-# than at `systemctl start`. Importing the module does NOT run main() — the
-# __name__ == "__main__" guard is False under import.
-"$PYTHON" -c "import option_archive.seed; import option_archive.__main__"
+echo "== import smoke: archive entry module =="
+# Import the entry point with the venv python so a MISSING RUNTIME DEP fails setup
+# here, loudly, rather than at `systemctl start`. Importing does NOT run main() —
+# the __name__ == "__main__" guard is False under import.
+"$PYTHON" -c "import option_archive.archive; import option_archive.__main__"
 echo "ok"
 
 echo "== mypy --strict (option_archive) =="

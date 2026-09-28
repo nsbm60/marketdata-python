@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly option_archive backfill (8pm America/Denver)
+
+[Timer]
+# 8pm Mountain. systemd resolves the timezone (>= v240); Persistent=true runs a
+# missed firing (box off at 8pm) on the next boot, so no night is silently skipped.
+OnCalendar=*-*-* 20:00:00 America/Denver
+Persistent=true
+
+[Install]
+WantedBy=timers.target

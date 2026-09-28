@@ -9,7 +9,7 @@
 # (so the box is self-sufficient), and as its FINAL act runs the full test suite
 # with the venv python, failing loudly if it is not green.
 #
-# It does NOT enable or start any worker or the seed. Idempotent — safe to re-run.
+# It does NOT enable the timer or start a run. Idempotent — safe to re-run.
 # (Ongoing code updates use deploy.sh from a dev checkout; this is the bootstrap.)
 set -euo pipefail
 
@@ -51,24 +51,15 @@ rsync -a --delete \
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q -e "${APP_DIR}[dev]"
 
-# 4b. Queue DB parent directory. WorkQueue mkdirs the parent at runtime, but that
-#     can fail if mdapps' home was empty; create it here, owned by mdapps, resolving
-#     the path from the config itself (single source of truth) as mdapps so ~ expands
-#     to mdapps' home. SQLite then creates only the file inside it.
-QUEUE_DB="$(sudo -u "${SERVICE_USER}" env HOME="${HOME_DIR}" "${VENV}/bin/python" \
-  -c 'from option_archive.config import get_config; print(get_config().queue_db_path)')"
-install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$(dirname "${QUEUE_DB}")"
-echo ">>> Queue DB parent: $(dirname "${QUEUE_DB}") (owner ${SERVICE_USER})"
-
 # 5. credentials file — TEMPLATE ONLY (never real keys), mode 0600, mdapps-readable
 if [[ ! -f /etc/option_archive/env ]]; then
   install -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0600 "${HERE}/env.example" /etc/option_archive/env
   echo ">>> Created /etc/option_archive/env from template — FILL IN the credentials (0600)."
 fi
 
-# 6. units + daemon-reload — NOT enabled, NOT started
-install -m 0644 "${HERE}/option_archive-worker@.service" /etc/systemd/system/
-install -m 0644 "${HERE}/option_archive-seed.service" /etc/systemd/system/
+# 6. unit + timer + daemon-reload — NOT enabled, NOT started
+install -m 0644 "${HERE}/option-archive.service" /etc/systemd/system/
+install -m 0644 "${HERE}/option-archive.timer" /etc/systemd/system/
 systemctl daemon-reload
 
 # 7. FINAL ACT: certify on the pinned interpreter (no-asyncio grep + mypy --strict +
@@ -82,9 +73,9 @@ fi
 
 cat <<NEXT
 >>> Certification PASSED on $(hostname) (python $(${VENV}/bin/python -c 'import sys; print(sys.version.split()[0])')).
->>> Setup complete. No worker or seed was started. Next:
-      1) fill in /etc/option_archive/env
+>>> Setup complete. Nothing was started. Next:
+      1) fill in /etc/option_archive/env  (Massive + Alpaca keys only)
       2) (ongoing updates) ./deploy/deploy.sh from a dev checkout
-      3) seed once:  systemctl start option_archive-seed   (watch: journalctl -u option_archive-seed -f)
-      4) after the enqueued= count is checked:  systemctl enable --now option_archive-worker@{1,2}
+      3) enable the nightly run:  systemctl enable --now option-archive.timer
+         or run one pass now:     systemctl start option-archive   (watch: journalctl -u option-archive -f)
 NEXT

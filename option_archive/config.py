@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, time, timedelta
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -24,7 +24,7 @@ from typing import Any, Mapping, Optional
 import yaml
 
 from greeks.config import ApiKeys  # reuse the frozen credential type
-from option_archive.domain import BandSpec, Era, ScheduleWindowKind
+from option_archive.domain import BandSpec, Era
 
 # marketdata-python/ (repo root); config default sits at config/option_archive.yaml
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -48,60 +48,6 @@ class UniverseParams:
 
 
 @dataclass(frozen=True)
-class ScheduleWindow:
-    """One pacing regime that begins at ``start_et`` (America/New_York) and runs
-    until the next window starts (see :class:`Schedule`).
-
-    There is deliberately **no** end time: a window is defined by where it begins,
-    and the day is a sequence of boundaries. That makes overlap and gaps
-    unrepresentable — the thing two start/end pairs could never guarantee.
-    ``start_et`` is a real ``time``, parsed at load, not an "HH:MM" string.
-    """
-
-    kind: ScheduleWindowKind
-    start_et: time
-    requests_per_sec: float
-    worker_count: int
-
-    def __post_init__(self) -> None:
-        if self.requests_per_sec <= 0:
-            raise ValueError(f"{self.kind.value}: requests_per_sec must be > 0")
-        if self.worker_count <= 0:
-            raise ValueError(f"{self.kind.value}: worker_count must be > 0")
-
-
-@dataclass(frozen=True)
-class Schedule:
-    """The pacing day as clock boundaries. Each window runs from its ``start_et``
-    to the next window's, wrapping past midnight, so exactly one window is active
-    at any instant — no overlap, no gap, nothing to keep consistent by hand.
-    """
-
-    windows: tuple[ScheduleWindow, ...]
-
-    def __post_init__(self) -> None:
-        if not self.windows:
-            raise ValueError("schedule must have at least one window")
-        starts = [w.start_et for w in self.windows]
-        if len(set(starts)) != len(starts):
-            raise ValueError("schedule windows must have distinct start_et")
-        if starts != sorted(starts):
-            raise ValueError("schedule windows must be ordered by start_et")
-
-    def active_at(self, t: time) -> ScheduleWindow:
-        """The window in force at wall-clock ``t``: the latest one that has begun.
-        Before the first boundary, the last window is active — it began the prior
-        day and wraps midnight."""
-        active = self.windows[-1]
-        for w in self.windows:
-            if w.start_et <= t:
-                active = w
-            else:
-                break
-        return active
-
-
-@dataclass(frozen=True)
 class S3Transfer:
     """Flat-file S3 client + managed-transfer tuning. The vendor throttles a single
     connection (~0.9 MB/s measured); managed multipart across `max_concurrency`
@@ -121,23 +67,6 @@ class S3Transfer:
             raise ValueError("s3.max_concurrency must be >= 1")
         if self.multipart_chunksize <= 0 or self.multipart_threshold <= 0:
             raise ValueError("s3 multipart sizes must be > 0")
-
-
-@dataclass(frozen=True)
-class QueuePolicy:
-    """Work-queue tuning: claim lease, vendor-failure retry cap, backoff base."""
-
-    lease: timedelta
-    max_attempts: int
-    backoff_base: timedelta
-
-    def __post_init__(self) -> None:
-        if self.lease <= timedelta(0):
-            raise ValueError("queue.lease_seconds must be > 0")
-        if self.max_attempts < 1:
-            raise ValueError("queue.max_attempts must be >= 1")
-        if self.backoff_base <= timedelta(0):
-            raise ValueError("queue.backoff_base_seconds must be > 0")
 
 
 @dataclass(frozen=True)
@@ -164,6 +93,7 @@ class ArchiveTableNames:
     ingest_log: str  # append-only ledger of completed ingest days
     dividend: str  # existing table, reused
     option_contract: str  # existing table, cross-check
+    option_contract_asof: str  # weekly as-of contract reference (self-describing archive)
     watchlist: str  # existing table, seed source (watchlist-first)
 
 
@@ -176,14 +106,11 @@ class ArchiveConfig:
     band_overrides: Mapping[str, BandSpec]  # per-underlying, applies in BOTH eras
     expiry_weekday_exclude: Mapping[str, frozenset[int]]  # per-underlying, Python weekday ints
     quotes_band: BandSpec
-    backfill_start_date: date       # oldest date the queue enumerates (trades exist to 2014; we start 2022)
+    backfill_start_date: date       # oldest date the archive walks (trades exist to 2014; we start 2016)
     quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
     excluded_dates: tuple[date, ...]
-    queue: QueuePolicy
     s3: S3Transfer
     roll_off: RollOffAlerting
-    schedule: Schedule
-    queue_db_path: Path
     tables: ArchiveTableNames
     api_keys: ApiKeys
     config_path: Path
@@ -287,41 +214,11 @@ def _parse_universe(raw: Any) -> UniverseParams:
     )
 
 
-def _parse_schedule(raw: Any) -> Schedule:
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("schedule must be a non-empty list")
-    out: list[ScheduleWindow] = []
-    for item in raw:
-        m = _require_mapping(item, "schedule[]")
-        # ScheduleWindowKind(...) and time.fromisoformat(...) both reject bad input
-        # here, at the boundary — never carried forward as an unvalidated string.
-        out.append(
-            ScheduleWindow(
-                kind=ScheduleWindowKind(str(m["kind"])),
-                start_et=time.fromisoformat(str(m["start_et"])),
-                requests_per_sec=float(m["requests_per_sec"]),
-                worker_count=int(m["worker_count"]),
-            )
-        )
-    # sort by boundary so config order is irrelevant; Schedule validates the rest.
-    out.sort(key=lambda w: w.start_et)
-    return Schedule(windows=tuple(out))
-
-
 def _parse_roll_off(raw: Any) -> RollOffAlerting:
     m = _require_mapping(raw, "roll_off")
     return RollOffAlerting(
         assumed_retention_years=int(m.get("assumed_retention_years", 5)),
         alert_margin_days=int(m.get("alert_margin_days", 60)),
-    )
-
-
-def _parse_queue(raw: Any) -> QueuePolicy:
-    m = _require_mapping(raw, "queue")
-    return QueuePolicy(
-        lease=timedelta(seconds=int(m["lease_seconds"])),
-        max_attempts=int(m["max_attempts"]),
-        backoff_base=timedelta(seconds=int(m["backoff_base_seconds"])),
     )
 
 
@@ -347,30 +244,11 @@ def _parse_tables(raw: Any) -> ArchiveTableNames:
         ingest_log=str(m.get("ingest_log", "trading.ingest_log")),
         dividend=str(m.get("dividend", "trading.dividend")),
         option_contract=str(m.get("option_contract", "trading.option_contract")),
+        option_contract_asof=str(
+            m.get("option_contract_asof", "trading.option_contract_asof")
+        ),
         watchlist=str(m.get("watchlist", "trading.watchlist")),
     )
-
-
-def _parse_queue_db_path(raw: Any) -> Path:
-    """Resolve and enforce the ruling: the queue DB lives OUTSIDE the repo."""
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("queue_db_path is required")
-    p = Path(raw).expanduser()
-    if not p.is_absolute():
-        raise ValueError(
-            f"queue_db_path must be absolute and outside the repo, got {raw!r}"
-        )
-    try:
-        p.resolve().relative_to(_REPO_ROOT)
-        inside_repo = True
-    except ValueError:
-        inside_repo = False
-    if inside_repo:
-        raise ValueError(
-            f"queue_db_path must be OUTSIDE the repo ({_REPO_ROOT}); got {p}. "
-            "The queue DB is never committed (Resolved decision 1)."
-        )
-    return p
 
 
 def _api_keys_from_env() -> ApiKeys:
@@ -416,11 +294,8 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
         backfill_start_date=backfill_start_date,
         quotes_available_from=quotes_available_from,
         excluded_dates=excluded,
-        queue=_parse_queue(raw.get("queue")),
         s3=_parse_s3(raw.get("s3")),
         roll_off=_parse_roll_off(raw.get("roll_off")),
-        schedule=_parse_schedule(raw.get("schedule")),
-        queue_db_path=_parse_queue_db_path(raw.get("queue_db_path")),
         tables=_parse_tables(raw.get("tables")),
         api_keys=_api_keys_from_env(),
         config_path=cfg_path.resolve(),

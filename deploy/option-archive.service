@@ -1,0 +1,27 @@
+[Unit]
+Description=option_archive backfill — one pass: resume from ledger, walk trading days, exit
+# No ordering dependency on the discovery locator: the ClickHouse connector resolves
+# via the locator with retry/backoff under any boot order. Only the network is a
+# genuine start-ordering prerequisite.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mdapps
+Group=mdapps
+# WorkingDirectory puts the app on sys.path so the top-level ml/ and discovery/
+# packages (not pip-installed) resolve; option_archive/greeks resolve via the venv.
+WorkingDirectory=/opt/option_archive/app
+EnvironmentFile=/etc/option_archive/env
+# PYTHONUNBUFFERED=1 so progress lands in journald live. systemd Environment= takes
+# no trailing comment — a '# ...' after the value is parsed as more assignments.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/option_archive/venv/bin/python -m option_archive
+# One pass can run for hours (the whole decade on the first run). No deadline. On a
+# nonzero exit (download exhausted) the ledger means the next run resumes; the timer
+# retries nightly, or start it again by hand.
+TimeoutStartSec=infinity
+
+# Started by option-archive.timer, or manually: systemctl start option-archive
+# Watch: journalctl -u option-archive -f

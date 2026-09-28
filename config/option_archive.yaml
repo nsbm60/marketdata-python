@@ -55,29 +55,6 @@ roll_off:
   assumed_retention_years: 5
   alert_margin_days: 60
 
-# Pacing schedule as clock boundaries: each window begins at start_et and runs
-# until the next window starts (wrapping midnight). One number per boundary — no
-# end times to keep consistent, so overlap/gap can't happen. requests_per_sec is a
-# PLACEHOLDER calibrated on the first live day (spec Open item 1) — the queue is
-# resumable, so an under-rate only slows, never truncates.
-schedule:
-  - kind: polite         # daytime (07:00–20:00), reduced so the link stays usable
-    start_et: "07:00"
-    requests_per_sec: 1.0
-    worker_count: 2       # 2 systemd instances run continuously; the endpoint stalls
-  - kind: aggressive     # overnight (20:00–07:00), full throttle
-    start_et: "20:00"
-    requests_per_sec: 5.0
-    worker_count: 2       # under load, so start at 2 (x multipart 16 = 32 connections)
-
-# Work-queue policy: claim lease (dead-worker recovery), vendor-failure retry cap,
-# exponential backoff base. A day-ingest holds its claims while downloading +
-# spot-joining, so the lease must comfortably exceed that; tune from measurement.
-queue:
-  lease_seconds: 1800
-  max_attempts: 5
-  backoff_base_seconds: 60
-
 # S3 flat-file transfer. The vendor throttles a single connection (~0.9 MB/s
 # measured 2026-09-25); managed multipart across max_concurrency connections hit
 # ~4.7 MB/s (5x). read_timeout is generous — the 60s default aborts a slow large
@@ -88,11 +65,6 @@ s3:
   max_concurrency: 16
   multipart_chunksize_mb: 8
   multipart_threshold_mb: 8
-
-# SQLite work-queue DB — MUST be outside the repo, git-ignored (Resolved decision 1).
-# On the Linux box this points under the mdapps data dir; here it defaults to the
-# per-user data dir. load_config() rejects any path inside the repo.
-queue_db_path: "~/.local/share/option_archive/queue.db"
 
 # ClickHouse connection is NOT configured here. The archive uses the canonical
 # ml.shared.clickhouse.get_ch_client connector, resolved via service discovery
@@ -106,4 +78,5 @@ tables:
   ingest_log: "trading.ingest_log"
   dividend: "trading.dividend"
   option_contract: "trading.option_contract"
+  option_contract_asof: "trading.option_contract_asof"   # weekly as-of contract reference
   watchlist: "trading.watchlist"
