@@ -36,6 +36,13 @@ bands:
 band_overrides:
   SPY: {moneyness_pct: 10, dte_max: 90}
   QQQ: {moneyness_pct: 10, dte_max: 90}
+
+# Per-underlying expiry-weekday exclusion. SPY/QQQ are dominated by short-dated
+# expirations, not OTM wings, so moneyness is not the reduction lever — dropping the
+# Tue/Thu dailies is. Small on 2024 dates, dense 2026-forward (where the value is).
+expiry_weekday_exclude:
+  SPY: [Tue, Thu]
+  QQQ: [Tue, Thu]
 quotes_band:             # quotes-at-trades everywhere (trade record is the unrecoverable thing)
   moneyness_band: 0.30
   max_dte_days: 90

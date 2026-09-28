@@ -147,6 +147,7 @@ def seed_watchlist(
         # Per-underlying cache and pairs list: enqueue after each name so the pairs
         # buffer never holds the whole watchlist × decade (that would exhaust memory).
         contract_cache: dict[tuple[str, date, int], list[ContractRef]] = {}
+        excluded_wd = cfg.excluded_expiry_weekdays(underlying)
         pairs: list[tuple[OsiSymbol, date]] = []
         for work_date in sorted(closes):
             if work_date in cfg.excluded_dates:
@@ -165,6 +166,8 @@ def seed_watchlist(
             )
             nonstandard += len(result.nonstandard)
             for c in result.eligible:
+                if c.expiry.weekday() in excluded_wd:
+                    continue  # per-underlying expiry-weekday exclusion (e.g. SPY/QQQ Tue/Thu)
                 eligible += 1
                 pairs.append((to_osi(c.osi), work_date))
         enqueued += queue.enqueue_many(pairs)

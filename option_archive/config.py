@@ -172,6 +172,7 @@ class ArchiveConfig:
     universe: UniverseParams
     bands: Mapping[Era, BandSpec]
     band_overrides: Mapping[str, BandSpec]  # per-underlying, applies in BOTH eras
+    expiry_weekday_exclude: Mapping[str, frozenset[int]]  # per-underlying, Python weekday ints
     quotes_band: BandSpec
     backfill_start_date: date       # oldest date the queue enumerates (trades exist to 2014; we start 2022)
     quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
@@ -194,6 +195,13 @@ class ArchiveConfig:
         their ATM/term-structure core is wanted, the deep wings are a non-goal."""
         override = self.band_overrides.get(underlying.upper())
         return override if override is not None else self.band_for(era)
+
+    def excluded_expiry_weekdays(self, underlying: str) -> frozenset[int]:
+        """Python weekday ints (Mon=0 … Sun=6) whose expirations are dropped for this
+        underlying. SPY/QQQ exclude Tue/Thu: their count is dominated by short-dated
+        expirations, and the Tue/Thu dailies (dense 2026-forward) are the reduction
+        lever — moneyness is not."""
+        return self.expiry_weekday_exclude.get(underlying.upper(), frozenset())
 
 
 def _require_mapping(raw: Any, key: str) -> Mapping[str, Any]:
@@ -243,6 +251,27 @@ def _parse_band_overrides(raw: Any) -> dict[str, BandSpec]:
             moneyness_band=float(s["moneyness_pct"]) / 100.0,
             max_dte_days=int(s["dte_max"]),
         )
+    return out
+
+
+_WEEKDAY = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
+
+
+def _parse_expiry_weekday_exclude(raw: Any) -> dict[str, frozenset[int]]:
+    if raw is None:
+        return {}
+    m = _require_mapping(raw, "expiry_weekday_exclude")
+    out: dict[str, frozenset[int]] = {}
+    for underlying, days in m.items():
+        if not isinstance(days, list):
+            raise TypeError(f"expiry_weekday_exclude.{underlying} must be a list")
+        wds: set[int] = set()
+        for d in days:
+            key = str(d).strip().upper()[:3]
+            if key not in _WEEKDAY:
+                raise ValueError(f"expiry_weekday_exclude.{underlying}: bad weekday {d!r}")
+            wds.add(_WEEKDAY[key])
+        out[str(underlying).upper()] = frozenset(wds)
     return out
 
 
@@ -380,6 +409,7 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
         universe=_parse_universe(raw.get("universe")),
         bands=_parse_bands(raw.get("bands")),
         band_overrides=_parse_band_overrides(raw.get("band_overrides")),
+        expiry_weekday_exclude=_parse_expiry_weekday_exclude(raw.get("expiry_weekday_exclude")),
         quotes_band=_parse_band(raw.get("quotes_band"), "quotes_band"),
         backfill_start_date=backfill_start_date,
         quotes_available_from=quotes_available_from,

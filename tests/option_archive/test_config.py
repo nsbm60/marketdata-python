@@ -22,6 +22,8 @@ bands:
   routine: {moneyness_band: 0.30, max_dte_days: 90}
 band_overrides:
   SPY: {moneyness_pct: 10, dte_max: 90}
+expiry_weekday_exclude:
+  SPY: [Tue, Thu]
 quotes_band: {moneyness_band: 0.30, max_dte_days: 90}
 backfill_start_date: "2022-03-07"
 quotes_available_from: "2022-03-07"
@@ -78,6 +80,12 @@ def test_band_override_applies_in_both_eras(tmp_path: Path) -> None:
     spy_r = cfg.band_for_underlying("SPY", Era.ROUTINE)
     assert spy_p == spy_r and spy_p.moneyness_band == 0.10 and spy_p.max_dte_days == 90
     assert cfg.band_for_underlying("NVDA", Era.PERISHABLE) == cfg.band_for(Era.PERISHABLE)
+
+
+def test_expiry_weekday_exclude(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, _BASE))
+    assert cfg.excluded_expiry_weekdays("SPY") == frozenset({1, 3})  # Tue, Thu
+    assert cfg.excluded_expiry_weekdays("NVDA") == frozenset()       # no exclusion
 
 
 def test_schedule_active_window_tiles_the_clock(tmp_path: Path) -> None:
