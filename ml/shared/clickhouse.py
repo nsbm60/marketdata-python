@@ -54,7 +54,7 @@ def get_ch_client():
     return clickhouse_connect.get_client(
         host=ch_endpoint.host,
         port=ch_endpoint.port,
-        username=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ.get("CLICKHOUSE_PASSWORD", "Aector99"),
-        database=os.environ.get("CLICKHOUSE_DATABASE", "trading"),
+        username=os.environ.get("CLICKHOUSE_USER") or "default",
+        password=os.environ.get("CLICKHOUSE_PASSWORD") or "Aector99",
+        database=os.environ.get("CLICKHOUSE_DATABASE") or "trading",
     )
