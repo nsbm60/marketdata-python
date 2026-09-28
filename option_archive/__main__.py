@@ -29,6 +29,8 @@ def main() -> None:
     s3 = make_s3_client(
         os.environ.get("MASSIVE_S3_ACCESS_KEY", ""),
         os.environ.get("MASSIVE_S3_SECRET_KEY", ""),
+        connect_timeout=cfg.s3.connect_timeout,
+        read_timeout=cfg.s3.read_timeout,
     )
     alpaca = make_stock_client(cfg.api_keys.alpaca_api_key, cfg.api_keys.alpaca_api_secret)
     ch = get_ch_client()

@@ -39,22 +39,14 @@ _ROWS = [
 ]
 
 
-class _Body:
-    def __init__(self, b: bytes) -> None:
-        self._b = b
-
-    def read(self) -> bytes:
-        return self._b
-
-
 class _FakeS3:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
 
-    def get_object(self, Bucket: str, Key: str) -> Any:
+    def download_fileobj(self, Bucket: str, Key: str, Fileobj: Any, Config: Any = None) -> None:
         if isinstance(self._payload, Exception):
             raise self._payload
-        return {"Body": _Body(self._payload)}
+        Fileobj.write(self._payload)
 
 
 class _FakeCH:

@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
 from clickhouse_connect.driver.client import Client
@@ -138,29 +139,54 @@ class WorkerReport:
 # ---------------------------------------------------------------------------
 
 
-def make_s3_client(access_key: str, secret_key: str) -> object:
-    """S3 client for the vendor's S3-compatible endpoint. Credentials come from
-    env (never committed); constructed once and passed to the worker."""
+def make_s3_client(
+    access_key: str,
+    secret_key: str,
+    *,
+    connect_timeout: float = 30.0,
+    read_timeout: float = 600.0,
+) -> object:
+    """S3 client for the vendor's S3-compatible endpoint. Credentials come from env
+    (never committed); constructed once and passed to the worker. read_timeout is
+    generous: the botocore 60s default aborts a slow large download mid-stream on
+    this throttled link — a client deadline shorter than the work needs."""
     if not access_key or not secret_key:
         raise ValueError("flat-file S3 access key and secret are required")
-    session = boto3.Session(
-        aws_access_key_id=access_key, aws_secret_access_key=secret_key
-    )
+    session = boto3.Session(aws_access_key_id=access_key, aws_secret_access_key=secret_key)
     return session.client(
-        "s3", endpoint_url=MASSIVE_S3_ENDPOINT, config=BotoConfig(signature_version="s3v4")
+        "s3",
+        endpoint_url=MASSIVE_S3_ENDPOINT,
+        config=BotoConfig(
+            signature_version="s3v4",
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+        ),
     )
 
 
-def download_trades_day(s3: object, work_date: date, *, bucket: str = FLATFILES_BUCKET) -> bytes:
-    """Fetch one day's gzipped trade file **into memory** (<100 MB) — never written
-    to disk, so there is nothing to clean up: the bytes are freed on every exit
-    path (parse error, insert failure, hard kill) by normal scope exit."""
+def download_trades_day(
+    s3: object,
+    work_date: date,
+    *,
+    bucket: str = FLATFILES_BUCKET,
+    max_concurrency: int = 16,
+    multipart_chunksize: int = 8 * 1024 * 1024,
+    multipart_threshold: int = 8 * 1024 * 1024,
+) -> bytes:
+    """Fetch one day's gzipped trade file **into memory** via boto3 managed
+    multipart transfer — the object is split into byte-range parts pulled over
+    `max_concurrency` connections (~5x the single-stream rate on the throttled
+    link). `download_fileobj` into a BytesIO keeps it in memory: still no disk temp,
+    so nothing to clean up on any exit path (the buffer frees on scope exit)."""
     key = TRADES_KEY_TEMPLATE.format(y=work_date.year, m=work_date.month, d=work_date.day)
-    obj = s3.get_object(Bucket=bucket, Key=key)  # type: ignore[attr-defined]
-    body = obj["Body"].read()
-    if not isinstance(body, (bytes, bytearray)):
-        raise ValueError(f"unexpected S3 body type for {key}: {type(body)!r}")
-    return bytes(body)
+    cfg = TransferConfig(
+        multipart_threshold=multipart_threshold,
+        multipart_chunksize=multipart_chunksize,
+        max_concurrency=max_concurrency,
+    )
+    buf = io.BytesIO()
+    s3.download_fileobj(bucket, key, buf, Config=cfg)  # type: ignore[attr-defined]
+    return buf.getvalue()
 
 
 def equity_tape(alpaca: object, underlying: str, work_date: date) -> list[EquityTradePrint]:
@@ -367,7 +393,12 @@ def ingest_day(
     t0 = time.monotonic()
 
     try:
-        raw = download_trades_day(s3, day)
+        raw = download_trades_day(
+            s3, day,
+            max_concurrency=cfg.s3.max_concurrency,
+            multipart_chunksize=cfg.s3.multipart_chunksize,
+            multipart_threshold=cfg.s3.multipart_threshold,
+        )
     except (ClientError, BotoCoreError, OSError) as e:
         for t in claimed:
             queue.release_transport(t, f"s3 download failed: {e}")

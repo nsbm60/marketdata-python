@@ -100,6 +100,28 @@ class Schedule:
 
 
 @dataclass(frozen=True)
+class S3Transfer:
+    """Flat-file S3 client + managed-transfer tuning. The vendor throttles a single
+    connection (~0.9 MB/s measured); managed multipart across `max_concurrency`
+    connections reached ~4.7 MB/s. `read_timeout` is generous because the 60s default
+    aborts a slow large download mid-stream."""
+
+    connect_timeout: float  # seconds
+    read_timeout: float  # seconds
+    max_concurrency: int
+    multipart_chunksize: int  # bytes
+    multipart_threshold: int  # bytes
+
+    def __post_init__(self) -> None:
+        if self.connect_timeout <= 0 or self.read_timeout <= 0:
+            raise ValueError("s3 timeouts must be > 0")
+        if self.max_concurrency < 1:
+            raise ValueError("s3.max_concurrency must be >= 1")
+        if self.multipart_chunksize <= 0 or self.multipart_threshold <= 0:
+            raise ValueError("s3 multipart sizes must be > 0")
+
+
+@dataclass(frozen=True)
 class QueuePolicy:
     """Work-queue tuning: claim lease, vendor-failure retry cap, backoff base."""
 
@@ -154,6 +176,7 @@ class ArchiveConfig:
     quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
     excluded_dates: tuple[date, ...]
     queue: QueuePolicy
+    s3: S3Transfer
     roll_off: RollOffAlerting
     schedule: Schedule
     queue_db_path: Path
@@ -249,6 +272,17 @@ def _parse_queue(raw: Any) -> QueuePolicy:
     )
 
 
+def _parse_s3(raw: Any) -> S3Transfer:
+    m = _require_mapping(raw, "s3")
+    return S3Transfer(
+        connect_timeout=float(m.get("connect_timeout_seconds", 30)),
+        read_timeout=float(m.get("read_timeout_seconds", 600)),
+        max_concurrency=int(m.get("max_concurrency", 16)),
+        multipart_chunksize=int(m.get("multipart_chunksize_mb", 8)) * 1024 * 1024,
+        multipart_threshold=int(m.get("multipart_threshold_mb", 8)) * 1024 * 1024,
+    )
+
+
 def _parse_tables(raw: Any) -> ArchiveTableNames:
     m = _require_mapping(raw, "tables")
     return ArchiveTableNames(
@@ -328,6 +362,7 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
         quotes_available_from=quotes_available_from,
         excluded_dates=excluded,
         queue=_parse_queue(raw.get("queue")),
+        s3=_parse_s3(raw.get("s3")),
         roll_off=_parse_roll_off(raw.get("roll_off")),
         schedule=_parse_schedule(raw.get("schedule")),
         queue_db_path=_parse_queue_db_path(raw.get("queue_db_path")),
