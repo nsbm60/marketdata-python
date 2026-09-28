@@ -17,6 +17,11 @@ dependencies = [
   "python-dotenv>=1.0.0",
   "PyYAML>=6.0",
   "boto3>=1.34",
+  # option_archive's entry points use ml.shared.clickhouse.get_ch_client, whose
+  # discovery fallback imports discovery -> zmq. Declaring pyzmq is truth in
+  # packaging: the connector needs it even though the batch env-override path
+  # (CLICKHOUSE_HOST set) never reaches discovery at runtime.
+  "pyzmq>=25.0",
 ]
 
 [project.optional-dependencies]

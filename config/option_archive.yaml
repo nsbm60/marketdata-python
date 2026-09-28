@@ -94,6 +94,10 @@ s3:
 # per-user data dir. load_config() rejects any path inside the repo.
 queue_db_path: "~/.local/share/option_archive/queue.db"
 
+# ClickHouse connection is NOT configured here. The archive uses the canonical
+# ml.shared.clickhouse.get_ch_client connector, resolved via service discovery
+# (the locator) for every process, batch included — no env override.
+
 # ClickHouse table names (DDL lives in the Scala MarketData schema/migrations).
 tables:
   option_trade: "trading.option_trade"   # trades carry the as-of quote on the same row

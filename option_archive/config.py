@@ -4,10 +4,12 @@ All configuration loads through :func:`load_config`. Other modules must not read
 env vars or YAML for archive settings except via the returned
 :class:`ArchiveConfig`. Mirrors ``greeks/config.py``.
 
-ClickHouse is *not* configured here: the archive connects via
-``greeks.ch.get_ch_client`` (service discovery), so this file carries only
-table-name pointers and the vendor API keys the pull needs. Each package owns its
-own config chokepoint — the small env read below is intentional, not shared state.
+ClickHouse is *not* configured here: the archive connects via the canonical
+``ml.shared.clickhouse.get_ch_client`` connector, which resolves the endpoint via
+service discovery (the ServiceLocator) for every process, batch included — there
+is no env override. This file carries only table-name pointers and the vendor API
+keys the pull needs. Each package owns its own config chokepoint — the small env
+read below is intentional, not shared state.
 """
 
 from __future__ import annotations

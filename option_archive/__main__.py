@@ -3,9 +3,11 @@
     python -m option_archive            # run one worker until the queue drains
 
 Credentials: the flat-file S3 key/secret come from env
-(``MASSIVE_S3_ACCESS_KEY`` / ``MASSIVE_S3_SECRET_KEY``); Alpaca and ClickHouse
-resolve as in the greeks package. Queue policy (lease, retries, backoff) and the
-queue DB path come from config, not flags.
+(``MASSIVE_S3_ACCESS_KEY`` / ``MASSIVE_S3_SECRET_KEY``); Alpaca keys from
+config/env; ClickHouse via the canonical ``ml.shared.clickhouse.get_ch_client``
+connector, resolved through service discovery (the locator), same as every other
+process. Queue policy (lease, retries, backoff) and the queue DB path come from
+config, not flags.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import os
 from datetime import timedelta
 
 from greeks.pull.alpaca_spot import make_stock_client
-from ml.shared.clickhouse import get_ch_client  # canonical connector (carries the CH password)
+from ml.shared.clickhouse import get_ch_client  # canonical connector (discovery for all)
 from option_archive.config import get_config
 from option_archive.ingest_day import make_s3_client, run_worker
 from option_archive.queue import WorkQueue

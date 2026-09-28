@@ -14,7 +14,7 @@ import logging
 from datetime import date
 
 from greeks.pull.alpaca_spot import make_stock_client
-from ml.shared.clickhouse import get_ch_client  # canonical connector (carries the CH password)
+from ml.shared.clickhouse import get_ch_client  # canonical connector (discovery for all)
 from option_archive.config import get_config
 from option_archive.queue import WorkQueue
 from option_archive.reference import seed_watchlist

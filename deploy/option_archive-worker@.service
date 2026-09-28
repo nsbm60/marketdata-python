@@ -1,5 +1,8 @@
 [Unit]
 Description=option_archive trade backfill worker %i
+# No ordering dependency on the discovery locator: the ClickHouse connector's
+# retry-with-backoff is the mechanism that waits for it. Only the network is a
+# genuine start-ordering prerequisite.
 After=network-online.target
 Wants=network-online.target
 
@@ -12,7 +15,10 @@ Group=mdapps
 # editable install in the venv.
 WorkingDirectory=/opt/option_archive/app
 EnvironmentFile=/etc/option_archive/env
-Environment=PYTHONUNBUFFERED=1                      # logs land in journald live
+# PYTHONUNBUFFERED=1 so logs land in journald live. systemd Environment= takes no
+# trailing comment — a '# ...' after the value is parsed as more VAR=VAL
+# assignments and shows up as junk in the journal. Keep it value-only.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/option_archive/venv/bin/python -m option_archive
 
 # A crash or kill -> restart. A clean drain-to-empty exit (0) does NOT restart —
