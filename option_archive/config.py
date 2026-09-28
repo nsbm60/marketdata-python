@@ -171,6 +171,7 @@ class ArchiveConfig:
 
     universe: UniverseParams
     bands: Mapping[Era, BandSpec]
+    band_overrides: Mapping[str, BandSpec]  # per-underlying, applies in BOTH eras
     quotes_band: BandSpec
     backfill_start_date: date       # oldest date the queue enumerates (trades exist to 2014; we start 2022)
     quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
@@ -186,6 +187,13 @@ class ArchiveConfig:
 
     def band_for(self, era: Era) -> BandSpec:
         return self.bands[era]
+
+    def band_for_underlying(self, underlying: str, era: Era) -> BandSpec:
+        """Per-underlying override (applies in BOTH eras — no wide perishable band)
+        if configured, else the per-era band. SPY/QQQ use a tight ±10%/90 override:
+        their ATM/term-structure core is wanted, the deep wings are a non-goal."""
+        override = self.band_overrides.get(underlying.upper())
+        return override if override is not None else self.band_for(era)
 
 
 def _require_mapping(raw: Any, key: str) -> Mapping[str, Any]:
@@ -222,6 +230,20 @@ def _parse_bands(raw: Any) -> dict[Era, BandSpec]:
             raise ValueError(f"bands.{era.value} is required")
         bands[era] = _parse_band(m[era.value], f"bands.{era.value}")
     return bands
+
+
+def _parse_band_overrides(raw: Any) -> dict[str, BandSpec]:
+    if raw is None:
+        return {}
+    m = _require_mapping(raw, "band_overrides")
+    out: dict[str, BandSpec] = {}
+    for underlying, spec in m.items():
+        s = _require_mapping(spec, f"band_overrides.{underlying}")
+        out[str(underlying).upper()] = BandSpec(
+            moneyness_band=float(s["moneyness_pct"]) / 100.0,
+            max_dte_days=int(s["dte_max"]),
+        )
+    return out
 
 
 def _parse_universe(raw: Any) -> UniverseParams:
@@ -357,6 +379,7 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
     return ArchiveConfig(
         universe=_parse_universe(raw.get("universe")),
         bands=_parse_bands(raw.get("bands")),
+        band_overrides=_parse_band_overrides(raw.get("band_overrides")),
         quotes_band=_parse_band(raw.get("quotes_band"), "quotes_band"),
         backfill_start_date=backfill_start_date,
         quotes_available_from=quotes_available_from,

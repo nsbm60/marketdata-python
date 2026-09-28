@@ -28,7 +28,7 @@ from clickhouse_connect.driver.client import Client
 from greeks.pull.alpaca_spot import REQUIRED_ADJUSTMENT, REQUIRED_FEED, assert_raw_adjustment
 from greeks.pull.contracts import ContractRef, fetch_massive_contracts, filter_contracts
 from option_archive.config import ArchiveConfig
-from option_archive.domain import Era, to_osi
+from option_archive.domain import Era, OsiSymbol, to_osi
 from option_archive.queue import WorkQueue
 
 log = logging.getLogger(__name__)
@@ -136,8 +136,7 @@ def seed_watchlist(
     eligible = 0
     nonstandard = 0
     days_without_bar = 0
-    pairs: list[tuple[str, date]] = []
-    contract_cache: dict[tuple[str, date, int], list[ContractRef]] = {}
+    enqueued = 0
 
     for underlying in unders:
         closes = _fetch_daily_raw_closes(alpaca, underlying, start, now)
@@ -145,11 +144,15 @@ def seed_watchlist(
         # counted, never treated as missing data.
         span_days = (now - start).days + 1
         days_without_bar += span_days - len(closes)
+        # Per-underlying cache and pairs list: enqueue after each name so the pairs
+        # buffer never holds the whole watchlist × decade (that would exhaust memory).
+        contract_cache: dict[tuple[str, date, int], list[ContractRef]] = {}
+        pairs: list[tuple[OsiSymbol, date]] = []
         for work_date in sorted(closes):
             if work_date in cfg.excluded_dates:
                 continue  # dropped day (collector outage etc.) — never enumerated
             trading_days += 1
-            band = cfg.band_for(era_for(work_date, now=now, cfg=cfg))
+            band = cfg.band_for_underlying(underlying, era_for(work_date, now=now, cfg=cfg))
             contracts = _contracts_asof(
                 massive_api_key, underlying, work_date, band.max_dte_days, contract_cache
             )
@@ -163,9 +166,10 @@ def seed_watchlist(
             nonstandard += len(result.nonstandard)
             for c in result.eligible:
                 eligible += 1
-                pairs.append((c.osi, work_date))
+                pairs.append((to_osi(c.osi), work_date))
+        enqueued += queue.enqueue_many(pairs)
+        log.info("seed_watchlist: %s done — %d jobs (eligible so far %d)", underlying, len(pairs), eligible)
 
-    enqueued = queue.enqueue_many((to_osi(sym), d) for sym, d in pairs)
     report = SeedReport(
         underlyings=len(unders),
         trading_days=trading_days,

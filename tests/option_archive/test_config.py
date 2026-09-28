@@ -20,6 +20,8 @@ universe:
 bands:
   perishable: {moneyness_band: 0.50, max_dte_days: 365}
   routine: {moneyness_band: 0.30, max_dte_days: 90}
+band_overrides:
+  SPY: {moneyness_pct: 10, dte_max: 90}
 quotes_band: {moneyness_band: 0.30, max_dte_days: 90}
 backfill_start_date: "2022-03-07"
 quotes_available_from: "2022-03-07"
@@ -67,6 +69,15 @@ def test_temp_config_parses_all_fields(tmp_path: Path) -> None:
     assert cfg.schedule.windows[0].kind is ScheduleWindowKind.POLITE
     assert cfg.schedule.windows[0].start_et == time(7, 0)
     assert cfg.roll_off.alert_margin_days == 60
+
+
+def test_band_override_applies_in_both_eras(tmp_path: Path) -> None:
+    cfg = load_config(_write(tmp_path, _BASE))
+    # SPY overridden to ±10%/90 regardless of era; NVDA falls through to the per-era band
+    spy_p = cfg.band_for_underlying("SPY", Era.PERISHABLE)
+    spy_r = cfg.band_for_underlying("SPY", Era.ROUTINE)
+    assert spy_p == spy_r and spy_p.moneyness_band == 0.10 and spy_p.max_dte_days == 90
+    assert cfg.band_for_underlying("NVDA", Era.PERISHABLE) == cfg.band_for(Era.PERISHABLE)
 
 
 def test_schedule_active_window_tiles_the_clock(tmp_path: Path) -> None:
