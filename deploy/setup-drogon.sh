@@ -1,44 +1,90 @@
 #!/usr/bin/env bash
-# One-time setup on drogon. Run as root (sudo). Idempotent — safe to re-run.
+# One-time bootstrap on drogon. Run as root, from a checkout of this repo:
+#   git clone <repo> && cd marketdata-python && sudo ./deploy/setup-drogon.sh
 #
-# Creates the service user, the app/venv/state/config dirs, the venv with a PINNED
-# interpreter, the credentials file (from template), and installs the systemd units.
-# It does NOT deploy code (that is deploy.sh from a dev checkout) and does NOT start
-# workers (that is manual, after seeding).
+# Creates everything deploy.sh assumes exists — the mdapps service user, the app /
+# venv / config dirs, the venv built with the pinned /usr/bin/python3.14, the
+# credentials file (template only; you fill in the real keys), and the systemd
+# units + daemon-reload — then does a FIRST install of the code from this checkout
+# (so the box is self-sufficient), and as its FINAL act runs the full test suite
+# with the venv python, failing loudly if it is not green.
+#
+# It does NOT enable or start any worker or the seed. Idempotent — safe to re-run.
+# (Ongoing code updates use deploy.sh from a dev checkout; this is the bootstrap.)
 set -euo pipefail
 
 SERVICE_USER="${SERVICE_USER:-mdapps}"
 PYTHON="${PYTHON:-/usr/bin/python3.14}"   # PINNED interpreter (deadsnakes on drogon)
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${HERE}/.." && pwd)"
+APP_DIR=/opt/option_archive/app
+VENV=/opt/option_archive/venv
 
-id "${SERVICE_USER}" >/dev/null 2>&1 \
-  || useradd --system --create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+[[ $EUID -eq 0 ]] || { echo "run as root (sudo)"; exit 1; }
+[[ -x "${PYTHON}" ]] || { echo "pinned interpreter ${PYTHON} not found — install it first (deadsnakes)"; exit 1; }
 
-install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" /opt/option_archive/app /opt/option_archive/venv
+# 1. service user. mdapps likely pre-exists (Scala batch), so --create-home never
+#    fires — assert the home dir exists on disk (the queue DB resolves under it).
+if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+  useradd --system --create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+fi
+HOME_DIR="$(getent passwd "${SERVICE_USER}" | cut -d: -f6)"
+[[ -n "${HOME_DIR}" ]] || { echo "cannot determine ${SERVICE_USER} home dir"; exit 1; }
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${HOME_DIR}"
+
+# 2. directories, owned by the service user
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${APP_DIR}" "${VENV}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 /etc/option_archive
 
-# venv OUTSIDE the app tree, built with the pinned interpreter.
-"${PYTHON}" -m venv /opt/option_archive/venv
-chown -R "${SERVICE_USER}:${SERVICE_USER}" /opt/option_archive/venv
-sudo -u "${SERVICE_USER}" /opt/option_archive/venv/bin/pip install -q --upgrade pip
+# 3. venv OUTSIDE the app tree, built with the pinned interpreter
+"${PYTHON}" -m venv "${VENV}"
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"
+sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q --upgrade pip
 
-# Credentials file — created once from the template; fill in real values (0600).
+# 4. FIRST code install from this checkout (tests INCLUDED — certification needs
+#    them), then editable install with dev extras so deps + pytest/mypy land in the
+#    venv. Same mirror-with-guards rule as deploy.sh.
+rsync -a --delete \
+  --exclude '.git/' --exclude 'venv/' --exclude 'data/' \
+  --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.db' \
+  "${REPO_ROOT}/" "${APP_DIR}/"
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q -e "${APP_DIR}[dev]"
+
+# 4b. Queue DB parent directory. WorkQueue mkdirs the parent at runtime, but that
+#     can fail if mdapps' home was empty; create it here, owned by mdapps, resolving
+#     the path from the config itself (single source of truth) as mdapps so ~ expands
+#     to mdapps' home. SQLite then creates only the file inside it.
+QUEUE_DB="$(sudo -u "${SERVICE_USER}" env HOME="${HOME_DIR}" "${VENV}/bin/python" \
+  -c 'from option_archive.config import get_config; print(get_config().queue_db_path)')"
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$(dirname "${QUEUE_DB}")"
+echo ">>> Queue DB parent: $(dirname "${QUEUE_DB}") (owner ${SERVICE_USER})"
+
+# 5. credentials file — TEMPLATE ONLY (never real keys), mode 0600, mdapps-readable
 if [[ ! -f /etc/option_archive/env ]]; then
   install -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0600 "${HERE}/env.example" /etc/option_archive/env
-  echo "Created /etc/option_archive/env from template — FILL IN the credentials."
+  echo ">>> Created /etc/option_archive/env from template — FILL IN the credentials (0600)."
 fi
 
+# 6. units + daemon-reload — NOT enabled, NOT started
 install -m 0644 "${HERE}/option_archive-worker@.service" /etc/systemd/system/
 install -m 0644 "${HERE}/option_archive-seed.service" /etc/systemd/system/
 systemctl daemon-reload
 
-cat <<'NEXT'
-Setup complete. Next:
-  1) fill in /etc/option_archive/env (credentials, mode 0600)
-  2) from a dev checkout:  ./deploy/deploy.sh
-  3) seed once:            systemctl start option_archive-seed
-                           journalctl -u option_archive-seed -f     # watch, get the final task count
-  4) start the fleet:      systemctl enable --now option_archive-worker@{1,2}
-                           (2 instances x multipart-16 = 32 connections; the endpoint
-                            stalls under load, so start at 2 and let ingest_log decide)
+# 7. FINAL ACT: certify on the pinned interpreter (no-asyncio grep + mypy --strict +
+#    pytest). Fail loudly and stop if not green — a box that can't run the suite
+#    green does not proceed to seed/workers.
+echo ">>> Certifying with ${VENV}/bin/python (hygiene + mypy --strict + pytest) ..."
+if ! sudo -u "${SERVICE_USER}" env PYTHON="${VENV}/bin/python" bash "${APP_DIR}/scripts/check_option_archive.sh"; then
+  echo "!!! CERTIFICATION FAILED on $(hostname) — the suite is not green. Do NOT seed or start workers." >&2
+  exit 1
+fi
+
+cat <<NEXT
+>>> Certification PASSED on $(hostname) (python $(${VENV}/bin/python -c 'import sys; print(sys.version.split()[0])')).
+>>> Setup complete. No worker or seed was started. Next:
+      1) fill in /etc/option_archive/env
+      2) (ongoing updates) ./deploy/deploy.sh from a dev checkout
+      3) seed once:  systemctl start option_archive-seed   (watch: journalctl -u option_archive-seed -f)
+      4) after the enqueued= count is checked:  systemctl enable --now option_archive-worker@{1,2}
 NEXT
