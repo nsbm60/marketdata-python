@@ -329,23 +329,33 @@ def _process_day(
     day: date,
     spots: dict[str, dict[date, float]],
     cache: dict[tuple[str, date, int], list[ContractRef]],
-) -> LedgerRow:
+) -> tuple[LedgerRow, dict[str, float]]:
     """Download → parse → enumerate/store → keep → insert trades. Returns the ledger
-    row; the caller writes it last as the completion marker."""
+    row (written last as the completion marker) and the per-phase seconds so the
+    caller can log where the time actually went."""
     started = datetime.now(timezone.utc)
     t0 = time.monotonic()
     watchlist = frozenset(spots.keys())
     with _download_day(s3, cfg, day) as path:
         raw = path.read_bytes()
     nbytes = len(raw)
+    t_dl = time.monotonic()
     by_symbol = parse_trades(raw, watchlist)
+    t_parse = time.monotonic()
     spots_for_day = {u: closes[day] for u, closes in spots.items() if day in closes}
     keep, misses = _classify_day(
         by_symbol, spots_for_day, cfg, cfg.api_keys.massive_api_key, ch, day, cache
     )
+    t_enum = time.monotonic()  # enumerate covers the Massive reference fetch + as-of write
     rows = _rows_for_day(alpaca, keep, day)
+    t_tape = time.monotonic()  # tape covers the per-underlying equity-tape fetch + row build
     inserted = insert_option_trades(ch, rows, table=cfg.tables.option_trade)
-    return LedgerRow(
+    t_ins = time.monotonic()
+    phases = {
+        "dl": t_dl - t0, "parse": t_parse - t_dl, "enum": t_enum - t_parse,
+        "tape": t_tape - t_enum, "insert": t_ins - t_tape,
+    }
+    ledger = LedgerRow(
         session_date=day,
         transport=TRANSPORT_FLATFILE,
         tasks_success=len(keep),
@@ -353,12 +363,13 @@ def _process_day(
         tasks_failed=0,
         rows_inserted=inserted,
         bytes_downloaded=nbytes,
-        wall_seconds=time.monotonic() - t0,
+        wall_seconds=t_ins - t0,
         vendor_volume_delta=None,
         enumeration_misses=misses,
         started_at=started,
         finished_at=datetime.now(timezone.utc),
     )
+    return ledger, phases
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +399,16 @@ def run(cfg: ArchiveConfig, ch: Client, alpaca: object, s3: object) -> int:
     total_rows = total_misses = 0
     try:
         for i, day in enumerate(days, 1):
-            ledger = _process_day(ch, alpaca, s3, cfg, day, spots, cache)
+            ledger, ph = _process_day(ch, alpaca, s3, cfg, day, spots, cache)
             insert_ingest_log(ch, ledger, table=cfg.tables.ingest_log)  # completion marker, LAST
             total_rows += ledger.rows_inserted
             total_misses += ledger.enumeration_misses
-            log.info("[%d/%d] %s: %d trades, %d misses, %.1fs",
-                     i, len(days), day, ledger.rows_inserted, ledger.enumeration_misses,
-                     ledger.wall_seconds)
+            log.info(
+                "[%d/%d] %s: %d trades, %d misses, %.1fs "
+                "(dl %.0f parse %.0f enum %.0f tape %.0f ins %.0f)",
+                i, len(days), day, ledger.rows_inserted, ledger.enumeration_misses,
+                ledger.wall_seconds, ph["dl"], ph["parse"], ph["enum"], ph["tape"], ph["insert"],
+            )
     except DownloadExhausted as e:
         log.error("%s — exiting; the next run resumes from this day", e)
         return 2
