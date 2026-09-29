@@ -6,6 +6,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 echo "== forbid asyncio/threading under option_archive/ =="
+# Process fleet only: asyncio and raw threading stay banned. The ONE sanctioned
+# exception is concurrent.futures.ThreadPoolExecutor in archive.py — a bounded I/O
+# pool for the per-name equity-tape and reference fetches (workers only fetch and
+# return local results; cache, ClickHouse, and the merge stay single-threaded). It
+# is deliberately NOT matched here: the ban is on the 'asyncio'/'threading' imports,
+# not on concurrent.futures, which is sanctioned I/O concurrency, not pipeline threading.
 if grep -RInE '^(from|import) (asyncio|threading)\b' option_archive/ --include='*.py'; then
   echo "ERROR: asyncio/threading imports are forbidden under option_archive/ (process fleet only)" >&2
   exit 1

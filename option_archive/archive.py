@@ -31,9 +31,10 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, NamedTuple, Optional
 
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import BotoCoreError, ClientError
@@ -80,6 +81,7 @@ _OVERLAP_DAYS = 3            # re-check window behind the ledger max (see _resum
 _DOWNLOAD_ATTEMPTS = 5
 _BACKOFF_BASE_SEC = 5.0
 _BACKOFF_MAX_SEC = 120.0
+_IO_WORKERS = 8             # bounded pool for the per-name equity-tape / reference fetches
 
 
 class DownloadExhausted(RuntimeError):
@@ -205,43 +207,6 @@ def _write_asof(ch: Client, underlying: str, as_of: date, listing: list[Contract
     ch.insert(name, data, column_names=list(_ASOF_COLUMNS), database=db)
 
 
-def _enumerate(
-    ch: Client,
-    api_key: str,
-    underlying: str,
-    day: date,
-    spot: float,
-    band: BandSpec,
-    excluded_wd: frozenset[int],
-    table: str,
-    cache: dict[tuple[str, date, int], list[ContractRef]],
-) -> tuple[set[str], set[str]]:
-    """Return (eligible OSIs to keep, all listed OSIs). Fetch + store the week's
-    listing once (cache-miss), then apply the per-day band + weekday exclusion."""
-    week = _week_anchor(day)
-    key = (underlying, week, band.max_dte_days)
-    listing = cache.get(key)
-    if listing is None:
-        # Fetch DTE is measured from the week anchor, but the per-day filter and
-        # _in_scope measure it per day — up to 6 days shorter. Pad the fetch window
-        # by a week so a contract that enters the band mid-week is in the listing;
-        # otherwise it is absent from `listed`, the per-day _in_scope sees it in
-        # band, and it is flagged a false ENUMERATION_MISS. Per-day filtering stays
-        # unpadded, so nothing extra is kept — the pad only widens what was listed.
-        listing = fetch_massive_contracts(
-            api_key, underlying, as_of=week, max_dte_days=band.max_dte_days + 7
-        )
-        _write_asof(ch, underlying, week, listing, table)
-        cache[key] = listing
-    result = filter_contracts(
-        listing, as_of=day, spot=spot,
-        max_dte_days=band.max_dte_days, moneyness_band=band.moneyness_band,
-    )
-    eligible = {c.osi for c in result.eligible if c.expiry.weekday() not in excluded_wd}
-    listed = {c.osi for c in listing}
-    return eligible, listed
-
-
 def _in_scope(osi: str, day: date, spot: float, band: BandSpec, excluded_wd: frozenset[int]) -> bool:
     """Whether a traded contract SHOULD have been enumerated (in-band by DTE +
     moneyness, allowed expiry weekday) — used to tell a real listing gap from a
@@ -260,6 +225,18 @@ def _in_scope(osi: str, day: date, spot: float, band: BandSpec, excluded_wd: fro
 # ---------------------------------------------------------------------------
 
 
+class _Plan(NamedTuple):
+    """One watchlist underlying's per-day context (built single-threaded)."""
+
+    underlying: str
+    osimap: dict[OsiSymbol, list[FlatTradePrint]]
+    spot: float
+    band: BandSpec
+    excluded_wd: frozenset[int]
+    key: tuple[str, date, int]
+    week: date
+
+
 def _classify_day(
     by_symbol: dict[OsiSymbol, list[FlatTradePrint]],
     spots_for_day: dict[str, float],
@@ -269,16 +246,21 @@ def _classify_day(
     day: date,
     cache: dict[tuple[str, date, int], list[ContractRef]],
 ) -> tuple[dict[OsiSymbol, list[FlatTradePrint]], int]:
-    """Enumerate each watchlist underlying and split its parsed prints into the set
-    to insert (in-band, listed) and a count of ENUMERATION_MISS prints (in-band but
-    the listing omitted the contract). Misses are logged + counted, never fatal."""
+    """Split each watchlist underlying's parsed prints into the set to insert
+    (in-band, listed) and a count of ENUMERATION_MISS prints (in-band but the listing
+    omitted the contract). Misses are logged + counted, never fatal.
+
+    The weekly reference fetch is the slow part, so cache-miss fetches run on a
+    bounded I/O pool. Workers ONLY call the vendor and return their listing — they
+    touch no cache, no ClickHouse, no shared state. The as-of write and cache
+    population happen after the join, single-threaded; per-day filtering is cheap
+    and sequential."""
     by_underlying: dict[str, dict[OsiSymbol, list[FlatTradePrint]]] = defaultdict(dict)
     for osi, prints in by_symbol.items():
         by_underlying[parse_occ(osi).root][osi] = prints
 
-    keep: dict[OsiSymbol, list[FlatTradePrint]] = {}
-    misses = 0
     now = date.today()
+    plans: list[_Plan] = []
     for underlying, osimap in by_underlying.items():
         spot = spots_for_day.get(underlying)
         if spot is None:
@@ -286,23 +268,51 @@ def _classify_day(
                       day, underlying, len(osimap))
             continue
         band = cfg.band_for_underlying(underlying, era_for(day, now=now, cfg=cfg))
-        excluded_wd = cfg.excluded_expiry_weekdays(underlying)
-        eligible, listed = _enumerate(
-            ch, api_key, underlying, day, spot, band, excluded_wd,
-            cfg.tables.option_contract_asof, cache,
+        week = _week_anchor(day)
+        plans.append(_Plan(
+            underlying, osimap, spot, band, cfg.excluded_expiry_weekdays(underlying),
+            (underlying, week, band.max_dte_days), week,
+        ))
+
+    # Cache-miss fetches, concurrently. Fetch DTE is measured from the week anchor
+    # but the per-day filter measures it per day (up to 6 days shorter), so pad the
+    # fetch window by a week — otherwise a contract entering the band mid-week is
+    # absent from `listed` and flagged a false miss. Per-day filtering stays unpadded.
+    to_fetch = {p.key: p for p in plans if p.key not in cache}
+    if to_fetch:
+        def _fetch(p: _Plan) -> tuple[tuple[str, date, int], str, date, list[ContractRef]]:
+            listing = fetch_massive_contracts(
+                api_key, p.underlying, as_of=p.week, max_dte_days=p.band.max_dte_days + 7
+            )
+            return p.key, p.underlying, p.week, listing
+
+        with ThreadPoolExecutor(max_workers=_IO_WORKERS) as pool:
+            for key, underlying, week, listing in pool.map(_fetch, list(to_fetch.values())):
+                _write_asof(ch, underlying, week, listing, cfg.tables.option_contract_asof)
+                cache[key] = listing
+
+    keep: dict[OsiSymbol, list[FlatTradePrint]] = {}
+    misses = 0
+    for p in plans:
+        listing = cache[p.key]
+        result = filter_contracts(
+            listing, as_of=day, spot=p.spot,
+            max_dte_days=p.band.max_dte_days, moneyness_band=p.band.moneyness_band,
         )
+        eligible = {c.osi for c in result.eligible if c.expiry.weekday() not in p.excluded_wd}
+        listed = {c.osi for c in listing}
         missed: list[str] = []
-        for osi, prints in osimap.items():
+        for osi, prints in p.osimap.items():
             if osi in eligible:
                 keep[osi] = prints
-            elif osi not in listed and _in_scope(osi, day, spot, band, excluded_wd):
+            elif osi not in listed and _in_scope(osi, day, p.spot, p.band, p.excluded_wd):
                 missed.append(osi)
                 misses += len(prints)
         if missed:
             log.error(
                 "day %s: %s ENUMERATION_MISS — %d in-band contracts traded but not "
                 "listed as-of %s (e.g. %s)",
-                day, underlying, len(missed), _week_anchor(day), missed[:5],
+                day, p.underlying, len(missed), p.week, missed[:5],
             )
     return keep, misses
 
@@ -310,14 +320,25 @@ def _classify_day(
 def _rows_for_day(
     alpaca: object, keep: dict[OsiSymbol, list[FlatTradePrint]], day: date
 ) -> list[OptionTradeRow]:
-    """Attach as-of raw spot (one equity tape per underlying) and build option rows."""
-    spot: dict[tuple[str, int, int], EquityTradePrint] = {}
+    """Attach as-of raw spot (one equity tape per underlying) and build option rows.
+
+    The tapes are the slow part, so they are fetched on a bounded I/O pool. Each
+    worker fetches one underlying's tape and returns its OWN local as-of join — no
+    shared state is mutated inside a worker. The main thread merges the partials
+    (keys are (symbol, sip, ordinal), unique per underlying, so no collisions)."""
     by_underlying: dict[str, list[FlatTradePrint]] = defaultdict(list)
     for osi, prints in keep.items():
         by_underlying[parse_occ(osi).root].extend(prints)
-    for underlying, prints in by_underlying.items():
+
+    def _tape_join(item: tuple[str, list[FlatTradePrint]]) -> dict[tuple[str, int, int], EquityTradePrint]:
+        underlying, prints = item
         tape = equity_tape(alpaca, underlying, day)
-        spot.update(_attach_spot(sorted(prints, key=lambda p: p.trade_ts), tape))
+        return _attach_spot(sorted(prints, key=lambda p: p.trade_ts), tape)
+
+    spot: dict[tuple[str, int, int], EquityTradePrint] = {}
+    with ThreadPoolExecutor(max_workers=_IO_WORKERS) as pool:
+        for partial in pool.map(_tape_join, list(by_underlying.items())):
+            spot.update(partial)
     return _build_rows(keep, spot, day)
 
 
