@@ -13,8 +13,10 @@ from greeks.pull.massive_trades import ns_to_utc
 from option_archive.domain import to_osi
 from option_archive.ingest_day import (
     LedgerRow,
+    NbboQuote,
     _attach_spot,
     _build_rows,
+    attach_quotes,
     insert_ingest_log,
     insert_option_trades,
     parse_trades,
@@ -100,7 +102,7 @@ def test_insert_option_trades_shapes_rows_with_spot() -> None:
     by = parse_trades(_gz(_ROWS), frozenset({"NVDA"}))
     tape = [EquityTradePrint("NVDA", ns_to_utc(_SIP - 1_000_000), 180.0, 100.0)]
     spot = _attach_spot(sorted(by[_C1], key=lambda p: p.trade_ts), tape)
-    rows = _build_rows(by, spot, date(2026, 4, 1))
+    rows = _build_rows(by, spot, {}, date(2026, 4, 1))  # no quotes -> quote columns NULL
     ch = _FakeCH()
     assert insert_option_trades(ch, rows, table="trading.option_trade") == 3
     name, data, cols, db = ch.inserts[0]
@@ -108,6 +110,32 @@ def test_insert_option_trades_shapes_rows_with_spot() -> None:
     assert cols[9] == "ordinal" and {r[9] for r in data} == {0, 1, 2}
     si = cols.index("spot_at_trade")
     assert all(r[si] == 180.0 for r in data)
+    bi = cols.index("bid")
+    assert all(r[bi] is None for r in data)  # no quotes attached -> NULL
+
+
+def test_attach_quotes_last_at_or_before() -> None:
+    prints = parse_trades(_gz(_ROWS), frozenset({"NVDA"}))[_C1]  # sips _SIP, _SIP, _SIP2
+    quotes = [
+        NbboQuote(_SIP - 1000, 1.0, 1.1, 5, 6),    # before the _SIP prints
+        NbboQuote(_SIP2 - 1000, 2.0, 2.1, 7, 8),   # before the _SIP2 print
+        NbboQuote(_SIP2 + 5000, 9.0, 9.1, 1, 1),   # after all -> never the as-of
+    ]
+    attached = attach_quotes(prints, quotes)
+    assert attached[(_C1, _SIP, 0)].bid == 1.0
+    assert attached[(_C1, _SIP, 1)].bid == 1.0
+    assert attached[(_C1, _SIP2, 2)].ask == 2.1  # last at-or-before the third print
+
+
+def test_build_rows_populates_quote_columns() -> None:
+    by = parse_trades(_gz(_ROWS), frozenset({"NVDA"}))
+    quotes = {(_C1, _SIP, 0): NbboQuote(_SIP - 2_000_000, 11.0, 11.2, 3, 4)}  # 2ms before
+    rows = _build_rows(by, {}, quotes, date(2026, 4, 1))
+    r0 = next(r for r in rows if r.ordinal == 0)
+    assert r0.bid == 11.0 and r0.ask == 11.2 and r0.bid_size == 3 and r0.ask_size == 4
+    assert r0.quote_lag_ms == 2  # (print_sip - quote_sip) / 1e6 ms
+    r2 = next(r for r in rows if r.ordinal == 2)  # no quote attached
+    assert r2.bid is None and r2.quote_ts is None and r2.quote_lag_ms is None
 
 
 def test_insert_ingest_log_carries_enumeration_misses() -> None:

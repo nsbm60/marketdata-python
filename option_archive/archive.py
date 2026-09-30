@@ -59,15 +59,18 @@ from option_archive.ingest_day import (
     TRANSPORT_FLATFILE,
     FlatTradePrint,
     LedgerRow,
+    NbboQuote,
     OptionTradeRow,
     _attach_spot,
     _build_rows,
+    attach_quotes,
     equity_tape,
     insert_ingest_log,
     insert_option_trades,
     make_s3_client,
     parse_trades,
 )
+from option_archive.quotes import fetch_option_quotes_day
 from option_archive.reference import (
     _fetch_daily_raw_closes,
     _week_anchor,
@@ -321,15 +324,13 @@ def _classify_day(
     return keep, misses
 
 
-def _rows_for_day(
+def _spots_for_day(
     alpaca: object, keep: dict[OsiSymbol, list[FlatTradePrint]], day: date
-) -> list[OptionTradeRow]:
-    """Attach as-of raw spot (one equity tape per underlying) and build option rows.
-
-    The tapes are the slow part, so they are fetched on a bounded I/O pool. Each
-    worker fetches one underlying's tape and returns its OWN local as-of join — no
-    shared state is mutated inside a worker. The main thread merges the partials
-    (keys are (symbol, sip, ordinal), unique per underlying, so no collisions)."""
+) -> dict[tuple[str, int, int], EquityTradePrint]:
+    """As-of raw spot per print (one equity tape per underlying, pooled). Each worker
+    fetches one underlying's tape and returns its OWN local as-of join — no shared
+    state mutated inside a worker; the main thread merges the partials (keys unique
+    per underlying, no collisions)."""
     by_underlying: dict[str, list[FlatTradePrint]] = defaultdict(list)
     for osi, prints in keep.items():
         by_underlying[parse_occ(osi).root].extend(prints)
@@ -343,7 +344,31 @@ def _rows_for_day(
     with ThreadPoolExecutor(max_workers=_IO_WORKERS) as pool:
         for partial in pool.map(_tape_join, list(by_underlying.items())):
             spot.update(partial)
-    return _build_rows(keep, spot, day)
+    return spot
+
+
+def _quotes_for_day(
+    cfg: ArchiveConfig, keep: dict[OsiSymbol, list[FlatTradePrint]], day: date
+) -> dict[tuple[str, int, int], NbboQuote]:
+    """As-of NBBO per print: pull each kept contract's day of quotes (REST /v3/quotes,
+    pooled at cfg.quote_pool_size) and merge-walk to its prints. Only on/after
+    quotes_available_from — before that no vendor quotes exist and every quote column
+    stays NULL. Each worker pulls one contract and returns its own local join; the
+    per-page 429/5xx/transport retry lives in the fetcher."""
+    if day < cfg.quotes_available_from:
+        return {}
+    api_key = cfg.api_keys.massive_api_key
+
+    def _one(item: tuple[OsiSymbol, list[FlatTradePrint]]) -> dict[tuple[str, int, int], NbboQuote]:
+        osi, prints = item
+        quotes = fetch_option_quotes_day(api_key, str(osi), day)
+        return attach_quotes(prints, quotes)  # prints already sip-sorted (parse_trades)
+
+    out: dict[tuple[str, int, int], NbboQuote] = {}
+    with ThreadPoolExecutor(max_workers=cfg.quote_pool_size) as pool:
+        for partial in pool.map(_one, list(keep.items())):
+            out.update(partial)
+    return out
 
 
 def _process_day(
@@ -372,13 +397,16 @@ def _process_day(
         by_symbol, spots_for_day, cfg, cfg.api_keys.massive_api_key, ch, day, cache
     )
     t_enum = time.monotonic()  # enumerate covers the Massive reference fetch + as-of write
-    rows = _rows_for_day(alpaca, keep, day)
-    t_tape = time.monotonic()  # tape covers the per-underlying equity-tape fetch + row build
+    quotes = _quotes_for_day(cfg, keep, day)
+    t_quotes = time.monotonic()  # quotes covers the per-contract /v3/quotes pull (>= 2022-03-07)
+    spot = _spots_for_day(alpaca, keep, day)
+    t_tape = time.monotonic()  # tape covers the per-underlying equity-tape pull
+    rows = _build_rows(keep, spot, quotes, day)
     inserted = insert_option_trades(ch, rows, table=cfg.tables.option_trade)
     t_ins = time.monotonic()
     phases = {
         "dl": t_dl - t0, "parse": t_parse - t_dl, "enum": t_enum - t_parse,
-        "tape": t_tape - t_enum, "insert": t_ins - t_tape,
+        "quotes": t_quotes - t_enum, "tape": t_tape - t_quotes, "insert": t_ins - t_tape,
     }
     ledger = LedgerRow(
         session_date=day,
@@ -430,9 +458,10 @@ def run(cfg: ArchiveConfig, ch: Client, alpaca: object, s3: object) -> int:
             total_misses += ledger.enumeration_misses
             log.info(
                 "[%d/%d] %s: %d trades, %d misses, %.1fs "
-                "(dl %.0f parse %.0f enum %.0f tape %.0f ins %.0f)",
+                "(dl %.0f parse %.0f enum %.0f quotes %.0f tape %.0f ins %.0f)",
                 i, len(days), day, ledger.rows_inserted, ledger.enumeration_misses,
-                ledger.wall_seconds, ph["dl"], ph["parse"], ph["enum"], ph["tape"], ph["insert"],
+                ledger.wall_seconds, ph["dl"], ph["parse"], ph["enum"], ph["quotes"],
+                ph["tape"], ph["insert"],
             )
     except DownloadExhausted as e:
         log.error("%s — exiting; the next run resumes from this day", e)

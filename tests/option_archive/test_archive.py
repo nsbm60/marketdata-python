@@ -154,3 +154,29 @@ def test_download_exhausts_and_leaves_no_tempfile(monkeypatch: pytest.MonkeyPatc
     import tempfile
     leftovers = list(Path(tempfile.gettempdir()).glob("optarch_2026-01-05_*"))
     assert leftovers == []
+
+
+# -- quote phase --------------------------------------------------------------
+
+
+def test_quotes_skipped_before_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = get_config()  # quotes_available_from = 2022-03-07
+    calls: list[int] = []
+    monkeypatch.setattr(archive, "fetch_option_quotes_day", lambda *a, **k: calls.append(1) or [])
+    osi = _osi(date(2020, 6, 30), 100.0)
+    q = archive._quotes_for_day(cfg, {osi: _prints(osi, 2)}, date(2020, 1, 15))
+    assert q == {} and calls == []  # pre-2022: no vendor quotes exist, no fetch attempted
+
+
+def test_quotes_pulled_and_attached_after_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    from option_archive.ingest_day import NbboQuote
+    cfg = get_config()
+    osi = _osi(date(2022, 5, 20), 100.0)
+    prints = _prints(osi, 1)
+    monkeypatch.setattr(
+        archive, "fetch_option_quotes_day",
+        lambda api, o, d: [NbboQuote(prints[0].sip_timestamp_ns - 1000, 1.0, 1.1, 2, 3)],
+    )
+    q = archive._quotes_for_day(cfg, {osi: prints}, date(2022, 3, 8))
+    ((_key, v),) = q.items()
+    assert v.bid == 1.0 and v.ask == 1.1  # last quote at-or-before the print, attached

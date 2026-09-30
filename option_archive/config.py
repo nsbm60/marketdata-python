@@ -110,6 +110,7 @@ class ArchiveConfig:
     quotes_available_from: date     # quotes only pulled on/after this (quote history floor)
     excluded_dates: tuple[date, ...]
     s3: S3Transfer
+    quote_pool_size: int  # per-contract quote-pull pool; config so it drops without a rebuild
     roll_off: RollOffAlerting
     tables: ArchiveTableNames
     api_keys: ApiKeys
@@ -285,6 +286,10 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
     backfill_start_date = date.fromisoformat(str(raw["backfill_start_date"]))
     quotes_available_from = date.fromisoformat(str(raw["quotes_available_from"]))
 
+    quote_pool_size = int(raw.get("quote_pool_size", 16))
+    if quote_pool_size < 1:
+        raise ValueError(f"quote_pool_size must be >= 1, got {quote_pool_size}")
+
     return ArchiveConfig(
         universe=_parse_universe(raw.get("universe")),
         bands=_parse_bands(raw.get("bands")),
@@ -295,6 +300,7 @@ def load_config(path: Optional[Path | str] = None) -> ArchiveConfig:
         quotes_available_from=quotes_available_from,
         excluded_dates=excluded,
         s3=_parse_s3(raw.get("s3")),
+        quote_pool_size=quote_pool_size,
         roll_off=_parse_roll_off(raw.get("roll_off")),
         tables=_parse_tables(raw.get("tables")),
         api_keys=_api_keys_from_env(),

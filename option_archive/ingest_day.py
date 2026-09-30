@@ -94,7 +94,31 @@ class OptionTradeRow:
     correction: Optional[int]
     spot_at_trade: Optional[float]
     spot_trade_ts: Optional[datetime]
+    # as-of NBBO quote (last at-or-before the print's sip timestamp); NULL = vendor
+    # had no quote, the only meaning. Filled inline by the quote phase.
+    quote_ts: Optional[datetime]
+    bid: Optional[float]
+    ask: Optional[float]
+    bid_size: Optional[int]
+    ask_size: Optional[int]
+    quote_lag_ms: Optional[int]
     source: str = "massive"
+
+
+@dataclass(frozen=True)
+class NbboQuote:
+    """One NBBO quote for a contract (SIP clock). The fetcher lives in
+    ``option_archive.quotes``; this is the record the quote phase joins to prints."""
+
+    sip_timestamp_ns: int
+    bid: Optional[float]
+    ask: Optional[float]
+    bid_size: Optional[int]
+    ask_size: Optional[int]
+
+    @property
+    def quote_ts(self) -> datetime:
+        return ns_to_utc(self.sip_timestamp_ns)
 
 
 @dataclass(frozen=True)
@@ -242,16 +266,39 @@ def _attach_spot(
     return out
 
 
+def attach_quotes(
+    prints: Sequence[FlatTradePrint], quotes: Sequence[NbboQuote]
+) -> dict[tuple[str, int, int], NbboQuote]:
+    """Merge-walk as-of join: last quote at-or-before each print's sip timestamp.
+    Both must be sorted ascending by ``sip_timestamp_ns``. Keyed by
+    (symbol, sip_ns, ordinal)."""
+    out: dict[tuple[str, int, int], NbboQuote] = {}
+    j = 0
+    last: Optional[NbboQuote] = None
+    for p in prints:
+        while j < len(quotes) and quotes[j].sip_timestamp_ns <= p.sip_timestamp_ns:
+            last = quotes[j]
+            j += 1
+        if last is not None:
+            out[(p.symbol, p.sip_timestamp_ns, p.ordinal)] = last
+    return out
+
+
 def _build_rows(
     by_symbol: dict[OsiSymbol, list[FlatTradePrint]],
     spot: dict[tuple[str, int, int], EquityTradePrint],
+    quotes: dict[tuple[str, int, int], NbboQuote],
     work_date: date,
 ) -> list[OptionTradeRow]:
     rows: list[OptionTradeRow] = []
     for sym, prints in by_symbol.items():
         underlying = parse_occ(sym).root
         for p in prints:
-            eq = spot.get((p.symbol, p.sip_timestamp_ns, p.ordinal))
+            key = (p.symbol, p.sip_timestamp_ns, p.ordinal)
+            eq = spot.get(key)
+            q = quotes.get(key)
+            # quote is at-or-before the print, so lag >= 0; NULL when there was no quote.
+            lag = None if q is None else (p.sip_timestamp_ns - q.sip_timestamp_ns) // 1_000_000
             rows.append(
                 OptionTradeRow(
                     symbol=sym,
@@ -269,6 +316,12 @@ def _build_rows(
                     correction=p.correction,
                     spot_at_trade=eq.price if eq is not None else None,
                     spot_trade_ts=eq.trade_ts if eq is not None else None,
+                    quote_ts=q.quote_ts if q is not None else None,
+                    bid=q.bid if q is not None else None,
+                    ask=q.ask if q is not None else None,
+                    bid_size=q.bid_size if q is not None else None,
+                    ask_size=q.ask_size if q is not None else None,
+                    quote_lag_ms=lag,
                 )
             )
     return rows
@@ -283,8 +336,8 @@ _INSERT_COLUMNS = (
 
 
 def insert_option_trades(ch: Client, rows: Sequence[OptionTradeRow], *, table: str) -> int:
-    """Batch-insert complete rows (quote columns NULL). ``ingested_at`` uses the CH
-    DEFAULT now64(3), so it is not supplied here."""
+    """Batch-insert complete rows — quote columns filled by the quote phase, NULL
+    only where the vendor had no quote. ``ingested_at`` uses the CH DEFAULT now64(3)."""
     if not rows:
         return 0
     data = [
@@ -293,7 +346,7 @@ def insert_option_trades(ch: Client, rows: Sequence[OptionTradeRow], *, table: s
             r.exchange, list(r.conditions), r.sip_timestamp_ns, r.ordinal,
             r.sequence_number, r.participant_timestamp_ns, r.correction,
             r.spot_at_trade, r.spot_trade_ts,
-            None, None, None, None, None, None,  # quote_ts, bid, ask, bid_size, ask_size, quote_lag_ms
+            r.quote_ts, r.bid, r.ask, r.bid_size, r.ask_size, r.quote_lag_ms,
             r.source,
         ]
         for r in rows
