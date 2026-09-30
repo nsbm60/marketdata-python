@@ -408,6 +408,9 @@ def _process_day(
         "dl": t_dl - t0, "parse": t_parse - t_dl, "enum": t_enum - t_parse,
         "quotes": t_quotes - t_enum, "tape": t_tape - t_quotes, "insert": t_ins - t_tape,
     }
+    # quote_contracts = the set the quote phase pulled (all kept contracts on/after
+    # the quote floor; 0 before it, when _quotes_for_day fetches nothing).
+    quote_contracts = len(keep) if day >= cfg.quotes_available_from else 0
     ledger = LedgerRow(
         session_date=day,
         transport=TRANSPORT_FLATFILE,
@@ -419,6 +422,8 @@ def _process_day(
         wall_seconds=t_ins - t0,
         vendor_volume_delta=None,
         enumeration_misses=misses,
+        quote_contracts=quote_contracts,
+        quote_seconds=phases["quotes"],
         started_at=started,
         finished_at=datetime.now(timezone.utc),
     )

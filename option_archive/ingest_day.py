@@ -137,6 +137,8 @@ class LedgerRow:
     wall_seconds: float
     vendor_volume_delta: Optional[int]  # None until acceptance check 2 runs
     enumeration_misses: int  # in-band trades on contracts the as-of listing omitted
+    quote_contracts: int  # contracts the quote phase pulled (0 before 2022-03-07)
+    quote_seconds: float  # quote-phase wall seconds
     started_at: datetime
     finished_at: datetime
 
@@ -359,7 +361,7 @@ def insert_option_trades(ch: Client, rows: Sequence[OptionTradeRow], *, table: s
 _LEDGER_COLUMNS = (
     "session_date", "transport", "tasks_success", "tasks_no_trades", "tasks_failed",
     "rows_inserted", "bytes_downloaded", "wall_seconds", "vendor_volume_delta",
-    "enumeration_misses", "started_at", "finished_at",
+    "enumeration_misses", "quote_contracts", "quote_seconds", "started_at", "finished_at",
 )
 
 
@@ -369,6 +371,7 @@ def insert_ingest_log(ch: Client, row: LedgerRow, *, table: str) -> None:
     data = [[
         row.session_date, row.transport, row.tasks_success, row.tasks_no_trades,
         row.tasks_failed, row.rows_inserted, row.bytes_downloaded, row.wall_seconds,
-        row.vendor_volume_delta, row.enumeration_misses, row.started_at, row.finished_at,
+        row.vendor_volume_delta, row.enumeration_misses, row.quote_contracts,
+        row.quote_seconds, row.started_at, row.finished_at,
     ]]
     ch.insert(name, data, column_names=list(_LEDGER_COLUMNS), database=db)
