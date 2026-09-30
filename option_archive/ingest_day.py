@@ -33,6 +33,7 @@ from greeks.occ import parse_occ, strip_massive_prefix
 from greeks.pull.alpaca_spot import EquityTradePrint, fetch_equity_trades
 from greeks.pull.massive_trades import ns_to_utc
 from option_archive.domain import OsiSymbol
+from option_archive.retry import with_retry
 
 log = logging.getLogger(__name__)
 
@@ -148,8 +149,11 @@ def make_s3_client(
 
 def equity_tape(alpaca: object, underlying: str, work_date: date) -> list[EquityTradePrint]:
     """RAW SIP equity tape for one underlying-day (fetched once, reused across that
-    underlying's contracts)."""
-    return fetch_equity_trades(alpaca, underlying, work_date)  # type: ignore[arg-type]
+    underlying's contracts). Retried on transient vendor errors."""
+    return with_retry(
+        lambda: fetch_equity_trades(alpaca, underlying, work_date),  # type: ignore[arg-type]
+        what=f"alpaca equity tape {underlying}@{work_date}",
+    )
 
 
 # ---------------------------------------------------------------------------

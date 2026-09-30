@@ -21,6 +21,7 @@ from clickhouse_connect.driver.client import Client
 from greeks.pull.alpaca_spot import REQUIRED_ADJUSTMENT, REQUIRED_FEED, assert_raw_adjustment
 from option_archive.config import ArchiveConfig
 from option_archive.domain import Era
+from option_archive.retry import with_retry
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def _fetch_daily_raw_closes(
         adjustment=REQUIRED_ADJUSTMENT,
         feed=REQUIRED_FEED,
     )
-    bars = alpaca.get_stock_bars(req)
+    bars = with_retry(lambda: alpaca.get_stock_bars(req), what=f"alpaca daily bars {underlying}")
     data = getattr(bars, "data", {}) or {}
     rows = data.get(underlying.upper()) or data.get(underlying) or []
     out: dict[date, float] = {}

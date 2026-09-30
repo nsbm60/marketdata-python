@@ -74,6 +74,7 @@ from option_archive.reference import (
     era_for,
     watchlist_underlyings,
 )
+from option_archive.retry import with_retry
 
 log = logging.getLogger("option_archive")
 
@@ -281,8 +282,11 @@ def _classify_day(
     to_fetch = {p.key: p for p in plans if p.key not in cache}
     if to_fetch:
         def _fetch(p: _Plan) -> tuple[tuple[str, date, int], str, date, list[ContractRef]]:
-            listing = fetch_massive_contracts(
-                api_key, p.underlying, as_of=p.week, max_dte_days=p.band.max_dte_days + 7
+            listing = with_retry(
+                lambda: fetch_massive_contracts(
+                    api_key, p.underlying, as_of=p.week, max_dte_days=p.band.max_dte_days + 7
+                ),
+                what=f"massive contracts {p.underlying}@{p.week}",
             )
             return p.key, p.underlying, p.week, listing
 
