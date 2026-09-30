@@ -62,8 +62,10 @@ def with_retry(fn: Callable[[], T], *, what: str) -> T:
         except Exception as e:  # noqa: BLE001 — classified by _is_retryable, re-raised otherwise
             if not _is_retryable(e) or attempt == _ATTEMPTS:
                 raise
-            log.warning("%s: attempt %d/%d failed (%s: %s); retry in %.0fs",
-                        what, attempt, _ATTEMPTS, type(e).__name__, e, backoff)
+            # Log type + HTTP status only, never the exception str — an
+            # httpx.HTTPStatusError embeds the full request URL, which carries apiKey.
+            log.warning("%s: attempt %d/%d failed (%s status=%s); retry in %.0fs",
+                        what, attempt, _ATTEMPTS, type(e).__name__, _status_of(e), backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
     raise AssertionError("unreachable: loop returns or raises")
