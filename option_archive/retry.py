@@ -2,7 +2,7 @@
 uses for the S3 transfer, applied to the fetches that had none.
 
 A dropped Massive connection (``httpx.RemoteProtocolError``) killed a run inside the
-pooled enumerate fetch, which had no retry. This wraps the vendor calls: 5 attempts,
+pooled enumerate fetch, which had no retry. This wraps the vendor calls: 8 attempts,
 exponential backoff, retry only on TRANSIENT failures — transport errors, HTTP 429,
 and 5xx — then raise. A non-transient error (a 4xx that isn't 429) raises immediately.
 
@@ -23,7 +23,10 @@ import httpx
 
 log = logging.getLogger("option_archive.retry")
 
-_ATTEMPTS = 5
+# 8 attempts, 5s base doubling to a 120s (~2 min) cap → ~6.6 min total ride-out
+# (sleeps 5+10+20+40+80+120+120) so a sustained 5xx/429 episode stalls the day
+# rather than killing it on one contract's patience.
+_ATTEMPTS = 8
 _BACKOFF_BASE_SEC = 5.0
 _BACKOFF_MAX_SEC = 120.0
 
