@@ -77,7 +77,7 @@ from option_archive.reference import (
     era_for,
     watchlist_underlyings,
 )
-from option_archive.retry import with_retry
+from option_archive.retry import reset_retry_count, retry_count, with_retry
 
 log = logging.getLogger("option_archive")
 
@@ -385,6 +385,7 @@ def _process_day(
     caller can log where the time actually went."""
     started = datetime.now(timezone.utc)
     t0 = time.monotonic()
+    reset_retry_count()  # count this day's vendor-REST retries across enum/quotes/tape
     watchlist = frozenset(spots.keys())
     with _download_day(s3, cfg, day) as path:
         raw = path.read_bytes()
@@ -424,6 +425,7 @@ def _process_day(
         enumeration_misses=misses,
         quote_contracts=quote_contracts,
         quote_seconds=phases["quotes"],
+        retry_count=retry_count(),
         started_at=started,
         finished_at=datetime.now(timezone.utc),
     )
@@ -463,10 +465,10 @@ def run(cfg: ArchiveConfig, ch: Client, alpaca: object, s3: object) -> int:
             total_misses += ledger.enumeration_misses
             log.info(
                 "[%d/%d] %s: %d trades, %d misses, %.1fs "
-                "(dl %.0f parse %.0f enum %.0f quotes %.0f tape %.0f ins %.0f)",
+                "(dl %.0f parse %.0f enum %.0f quotes %.0f retries %d tape %.0f ins %.0f)",
                 i, len(days), day, ledger.rows_inserted, ledger.enumeration_misses,
                 ledger.wall_seconds, ph["dl"], ph["parse"], ph["enum"], ph["quotes"],
-                ph["tape"], ph["insert"],
+                ledger.retry_count, ph["tape"], ph["insert"],
             )
     except DownloadExhausted as e:
         log.error("%s — exiting; the next run resumes from this day", e)

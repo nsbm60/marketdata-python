@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 
-from option_archive.retry import _ATTEMPTS, with_retry
+from option_archive.retry import _ATTEMPTS, reset_retry_count, retry_count, with_retry
 
 
 @pytest.fixture(autouse=True)
@@ -90,3 +92,37 @@ def test_exhausts_attempts_then_raises() -> None:
     with pytest.raises(httpx.ConnectError):
         with_retry(f, what="x")
     assert f.calls == _ATTEMPTS  # tried exactly _ATTEMPTS times, then re-raised
+
+
+def test_retry_count_increments_and_resets() -> None:
+    reset_retry_count()
+    with_retry(_Flaky(httpx.ConnectError("x"), fail_times=3), what="x")  # 3 retries, then ok
+    assert retry_count() == 3
+    with_retry(_Flaky(httpx.ConnectError("x"), fail_times=2), what="x")  # +2
+    assert retry_count() == 5
+    reset_retry_count()
+    assert retry_count() == 0
+
+
+def test_retries_log_debug_exhaustion_logs_error(caplog: pytest.LogCaptureFixture) -> None:
+    reset_retry_count()
+    f = _Flaky(httpx.ConnectError("refused"), fail_times=99)
+    with caplog.at_level(logging.DEBUG, logger="option_archive.retry"):
+        with pytest.raises(httpx.ConnectError):
+            with_retry(f, what="probe")
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(debugs) == _ATTEMPTS - 1          # each retry logged at DEBUG only
+    assert warnings == []                          # no WARNING noise anymore
+    assert len(errors) == 1 and "exhausted" in errors[0].message  # one ERROR on give-up
+    assert retry_count() == _ATTEMPTS - 1
+
+
+def test_non_transient_does_not_log_error(caplog: pytest.LogCaptureFixture) -> None:
+    reset_retry_count()
+    with caplog.at_level(logging.DEBUG, logger="option_archive.retry"):
+        with pytest.raises(ValueError):
+            with_retry(_Flaky(ValueError("bad"), fail_times=1), what="x")
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []  # not an exhaustion
+    assert retry_count() == 0

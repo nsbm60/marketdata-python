@@ -32,6 +32,22 @@ _BACKOFF_MAX_SEC = 120.0
 
 T = TypeVar("T")
 
+# Per-day retry tally. Retries are routine self-healing (logged at DEBUG, invisible
+# at the service's INFO), so the operator-facing signal is a COUNT, not warnings:
+# the archive resets it at the start of each _process_day and reads count() into the
+# day log line + ledger. list.append is atomic under the GIL; reset()/count() run on
+# the main thread between phases (pools joined), so no lock is needed — and
+# `import threading` is banned here anyway (process-fleet rule).
+_retry_tally: list[int] = []
+
+
+def reset_retry_count() -> None:
+    _retry_tally.clear()
+
+
+def retry_count() -> int:
+    return len(_retry_tally)
+
 
 def _status_of(e: Exception) -> Optional[int]:
     """HTTP status carried by the error, if any — from ``.status_code``
@@ -63,12 +79,18 @@ def with_retry(fn: Callable[[], T], *, what: str) -> T:
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 — classified by _is_retryable, re-raised otherwise
-            if not _is_retryable(e) or attempt == _ATTEMPTS:
-                raise
             # Log type + HTTP status only, never the exception str — an
             # httpx.HTTPStatusError embeds the full request URL, which carries apiKey.
-            log.warning("%s: attempt %d/%d failed (%s status=%s); retry in %.0fs",
-                        what, attempt, _ATTEMPTS, type(e).__name__, _status_of(e), backoff)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
+            if _is_retryable(e) and attempt < _ATTEMPTS:
+                _retry_tally.append(1)
+                # Routine self-healing — DEBUG, invisible at the service's INFO level.
+                log.debug("%s: attempt %d/%d failed (%s status=%s); retry in %.0fs",
+                          what, attempt, _ATTEMPTS, type(e).__name__, _status_of(e), backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
+                continue
+            if _is_retryable(e):  # retryable but out of attempts — the day aborts on this
+                log.error("%s: exhausted %d attempts (%s status=%s); day aborts",
+                          what, _ATTEMPTS, type(e).__name__, _status_of(e))
+            raise
     raise AssertionError("unreachable: loop returns or raises")
