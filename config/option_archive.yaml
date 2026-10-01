@@ -62,7 +62,7 @@ roll_off:
 s3:
   connect_timeout_seconds: 30
   read_timeout_seconds: 600
-  max_concurrency: 16
+  max_concurrency: 32
   multipart_chunksize_mb: 8
   multipart_threshold_mb: 8
 
