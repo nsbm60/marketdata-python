@@ -55,7 +55,7 @@ def test_default_shipped_config_loads() -> None:
     assert cfg.tables.dividend == "trading.dividend"
     assert cfg.tables.option_contract_asof == "trading.option_contract_asof"
     assert cfg.s3.max_concurrency == 16
-    assert cfg.quote_pool_size == 16
+    assert cfg.quote_pool_size == 32
 
 
 def test_temp_config_parses_all_fields(tmp_path: Path) -> None:
