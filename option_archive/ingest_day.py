@@ -154,23 +154,24 @@ def make_s3_client(
     *,
     connect_timeout: float = 30.0,
     read_timeout: float = 600.0,
+    max_attempts: Optional[int] = None,
 ) -> object:
     """S3 client for the vendor's S3-compatible endpoint. Credentials come from env
     (never committed); constructed once and passed in. read_timeout is generous: the
     botocore 60s default aborts a slow large download mid-stream on this throttled
-    link — a client deadline shorter than the work needs."""
+    link — a client deadline shorter than the work needs. ``max_attempts`` overrides
+    botocore's retry count (the probe passes 1 = no retry, for raw truth)."""
     if not access_key or not secret_key:
         raise ValueError("flat-file S3 access key and secret are required")
-    session = boto3.Session(aws_access_key_id=access_key, aws_secret_access_key=secret_key)
-    return session.client(
-        "s3",
-        endpoint_url=MASSIVE_S3_ENDPOINT,
-        config=BotoConfig(
-            signature_version="s3v4",
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-        ),
+    kw: dict[str, Any] = dict(
+        signature_version="s3v4",
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
     )
+    if max_attempts is not None:
+        kw["retries"] = {"max_attempts": max_attempts, "mode": "standard"}
+    session = boto3.Session(aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+    return session.client("s3", endpoint_url=MASSIVE_S3_ENDPOINT, config=BotoConfig(**kw))
 
 
 def equity_tape(alpaca: object, underlying: str, work_date: date) -> list[EquityTradePrint]:

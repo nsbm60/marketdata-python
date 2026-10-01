@@ -33,7 +33,7 @@ echo "== import smoke: archive entry module =="
 # Import the entry point with the venv python so a MISSING RUNTIME DEP fails setup
 # here, loudly, rather than at `systemctl start`. Importing does NOT run main() —
 # the __name__ == "__main__" guard is False under import.
-"$PYTHON" -c "import option_archive.archive; import option_archive.__main__"
+"$PYTHON" -c "import option_archive.archive; import option_archive.probe; import option_archive.__main__"
 echo "ok"
 
 echo "== mypy --strict (option_archive) =="
