@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -46,16 +48,32 @@ def _write(tmp_path: Path, body: str) -> Path:
 
 
 def test_default_shipped_config_loads() -> None:
-    # The committed config/option_archive.yaml must always be loadable.
-    cfg = load_config()
-    assert cfg.universe.top_n == 100
-    assert cfg.band_for(Era.PERISHABLE).moneyness_band == 0.50
-    assert cfg.band_for(Era.ROUTINE).max_dte_days == 90
-    assert cfg.quotes_band.moneyness_band == 0.30
-    assert cfg.tables.dividend == "trading.dividend"
-    assert cfg.tables.option_contract_asof == "trading.option_contract_asof"
-    assert cfg.s3.max_concurrency == 16
-    assert cfg.quote_pool_size == 32
+    """The committed config/option_archive.yaml must stay LOADABLE and structurally
+    valid. This asserts only what can be WRONG (missing keys, bad types, nonsensical
+    values) — never what is CHOSEN. Chosen values (bands, top_n, pool sizes, table
+    names) live in the YAML once; pinning them here would duplicate the config and
+    break on every deliberate edit, which a test can't tell from an accidental one."""
+    cfg = load_config()  # raises if a required key is missing or a type won't parse
+
+    # pool sizes / timeouts positive
+    assert cfg.quote_pool_size > 0
+    assert cfg.s3.max_concurrency > 0
+    assert cfg.s3.connect_timeout > 0 and cfg.s3.read_timeout > 0
+
+    # dates parsed to real dates
+    assert isinstance(cfg.backfill_start_date, date)
+    assert isinstance(cfg.quotes_available_from, date)
+
+    # bands present for both eras + quotes, each structurally valid
+    for era in (Era.PERISHABLE, Era.ROUTINE):
+        band = cfg.band_for(era)
+        assert band.moneyness_band > 0 and band.max_dte_days > 0
+    assert cfg.quotes_band.max_dte_days > 0
+
+    # universe sane; every table name a non-empty string
+    assert cfg.universe.top_n > 0
+    assert all(isinstance(getattr(cfg.tables, f.name), str) and getattr(cfg.tables, f.name)
+               for f in fields(cfg.tables))
 
 
 def test_temp_config_parses_all_fields(tmp_path: Path) -> None:
