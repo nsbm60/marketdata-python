@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import date
 
+import httpx
+
 from option_archive.ingest_day import NbboQuote
-from option_archive.quotes import _parse_quote, fetch_option_quotes_day
+from option_archive.quotes import _parse_quote, benchmark_quote_pull, fetch_option_quotes_day
 
 
 def test_parse_quote_maps_fields() -> None:
@@ -63,3 +65,63 @@ def test_fetch_counts_pages_and_raw_rows() -> None:
     assert pull.pages == 2
     assert pull.quotes_fetched == 3   # 2 + 1 raw rows, regardless of the filter
     assert pull.quotes == []          # all out-of-session: retained != fetched
+
+
+# -- benchmark_quote_pull (no retry; network/local split, status capture) -----
+
+
+class _BenchResp:
+    def __init__(self, status: int, payload: dict) -> None:
+        self.status_code = status
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _BenchClient:
+    """Serves (status, payload) pages in order; the sentinel 'BOOM' raises, standing
+    in for a transport error (no response at all)."""
+
+    def __init__(self, pages: list) -> None:
+        self._pages = list(pages)
+        self.calls = 0
+
+    def get(self, url: str, params: object = None) -> _BenchResp:
+        self.calls += 1
+        item = self._pages.pop(0)
+        if item == "BOOM":
+            raise httpx.ConnectError("https://api.massive.com/...apiKey=SECRET refused")
+        status, payload = item
+        return _BenchResp(status, payload)
+
+    def close(self) -> None:
+        pass
+
+
+def test_benchmark_pull_times_counts_two_pages() -> None:
+    p1 = (200, {"results": [{"sip_timestamp": "1"}, {"sip_timestamp": "2"}], "next_url": "https://x/n"})
+    p2 = (200, {"results": [{"sip_timestamp": "3"}]})
+    client = _BenchClient([p1, p2])
+    b = benchmark_quote_pull("k", "SPY220617C00380000", date(2022, 6, 13), [], client=client)
+    assert client.calls == 2 and b.pages == 2 and b.quotes_fetched == 3
+    assert [s.status for s in b.page_stats] == [200, 200]
+    assert b.network_s >= 0.0 and b.local_s >= 0.0  # both accumulators populated, disjoint
+
+
+def test_benchmark_pull_stops_on_429_without_retry() -> None:
+    p1 = (200, {"results": [{"sip_timestamp": "1"}], "next_url": "https://x/n"})
+    p2 = (429, {})
+    client = _BenchClient([p1, p2])
+    b = benchmark_quote_pull("k", "SPY220617C00380000", date(2022, 6, 13), [], client=client)
+    assert client.calls == 2           # the 429 is seen once, NOT retried
+    assert b.pages == 1                # only the successful page counts
+    assert b.quotes_fetched == 1
+    assert [s.status for s in b.page_stats] == [200, 429]  # ceiling stays visible
+
+
+def test_benchmark_pull_transport_error_is_status_zero() -> None:
+    client = _BenchClient(["BOOM"])
+    b = benchmark_quote_pull("k", "SPY220617C00380000", date(2022, 6, 13), [], client=client)
+    assert b.pages == 0 and b.quotes_fetched == 0
+    assert len(b.page_stats) == 1 and b.page_stats[0].status == 0

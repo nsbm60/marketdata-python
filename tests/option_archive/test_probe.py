@@ -93,3 +93,51 @@ def test_quotes_check_no_contract_is_not_answered() -> None:
 def test_s3_head_not_configured_is_not_answered() -> None:
     ok, line = probe._s3_head_check(None, date(2022, 6, 13))
     assert ok is False and "NOT-CONFIGURED" in line
+
+
+# -- --width-test aggregation (pure, no network) ------------------------------
+
+
+def test_parse_widths_rejects_nonpositive() -> None:
+    assert probe._parse_widths("16, 24,32 ,48") == [16, 24, 32, 48]
+    with pytest.raises(ValueError):
+        probe._parse_widths("16,0,32")
+
+
+def test_percentile_nearest_rank() -> None:
+    vals = [0.1, 0.2, 0.3, 0.4]  # already sorted
+    assert probe._percentile(vals, 0.50) == 0.3   # int(0.5*4)=2
+    assert probe._percentile(vals, 0.95) == 0.4   # int(0.95*4)=3
+    assert probe._percentile([], 0.5) == 0.0
+
+
+def test_summarize_aggregates_across_contracts() -> None:
+    from option_archive.quotes import BenchPull, PageStat
+
+    # two contracts: one clean 2-page pull, one that 200s then 5xxs (partial, no retry)
+    a = BenchPull(
+        pages=2, quotes_fetched=100, network_s=4.0, local_s=1.0,
+        page_stats=[PageStat(0.10, 200, 60), PageStat(0.30, 200, 40)],
+    )
+    b = BenchPull(
+        pages=1, quotes_fetched=50, network_s=2.0, local_s=0.0,
+        page_stats=[PageStat(0.20, 200, 50), PageStat(0.40, 503, 0)],
+    )
+    m = probe._summarize(wall=5.0, pulls=[a, b])
+    assert m["contracts"] == 2.0 and m["pages"] == 3.0
+    assert m["c_per_s"] == 2 / 5.0 and m["pg_per_s"] == 3 / 5.0
+    # latencies sorted: [0.10,0.20,0.30,0.40] -> p50 idx2=0.30, p95 idx3=0.40
+    assert m["p50_ms"] == 300.0 and m["p95_ms"] == 400.0
+    assert m["n429"] == 0.0 and m["n5xx"] == 1.0
+    assert m["net_s"] == 6.0 and m["cpu_s"] == 1.0
+    assert m["net_pct"] == pytest.approx(600 / 7) and m["cpu_pct"] == pytest.approx(100 / 7)
+
+
+def test_summarize_counts_429_and_formats_line() -> None:
+    from option_archive.quotes import BenchPull, PageStat
+
+    b = BenchPull(0, 0, 1.5, 0.0, [PageStat(0.05, 429, 0)])
+    m = probe._summarize(wall=1.0, pulls=[b])
+    assert m["n429"] == 1.0 and m["n5xx"] == 0.0 and m["pages"] == 0.0
+    line = probe._format_width_line(32, m)
+    assert line.startswith("width=32 ") and "429=1" in line and "net " in line and "cpu " in line
