@@ -168,9 +168,9 @@ def test_quotes_skipped_before_availability(monkeypatch: pytest.MonkeyPatch) -> 
         lambda *a, **k: calls.append(1) or QuotePull([], 0, 0),
     )
     osi = _osi(date(2020, 6, 30), 100.0)
-    q, pages, fetched = archive._quotes_for_day(cfg, {osi: _prints(osi, 2)}, date(2020, 1, 15))
+    q, pages, fetched, failures = archive._quotes_for_day(cfg, {osi: _prints(osi, 2)}, date(2020, 1, 15))
     # pre-2022: no vendor quotes exist, no fetch attempted, zero pull totals
-    assert q == {} and calls == [] and pages == 0 and fetched == 0
+    assert q == {} and calls == [] and pages == 0 and fetched == 0 and failures == 0
 
 
 def test_quotes_pulled_and_attached_after_availability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -184,7 +184,29 @@ def test_quotes_pulled_and_attached_after_availability(monkeypatch: pytest.Monke
             [NbboQuote(prints[0].sip_timestamp_ns - 1000, 1.0, 1.1, 2, 3)], pages=3, quotes_fetched=7
         ),
     )
-    q, pages, fetched = archive._quotes_for_day(cfg, {osi: prints}, date(2022, 3, 8))
+    q, pages, fetched, failures = archive._quotes_for_day(cfg, {osi: prints}, date(2022, 3, 8))
     ((_key, v),) = q.items()
     assert v.bid == 1.0 and v.ask == 1.1  # last quote at-or-before the print, attached
-    assert pages == 3 and fetched == 7  # pull totals summed across contracts (one here)
+    assert pages == 3 and fetched == 7 and failures == 0  # pull totals summed across contracts (one here)
+
+
+def test_quote_failure_recorded_skipped_day_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    from option_archive.ingest_day import NbboQuote
+    from option_archive.quotes import QuotePull
+    cfg = get_config()
+    good = _osi(date(2022, 5, 20), 100.0)
+    bad = _osi(date(2022, 5, 20), 110.0)
+    good_prints, bad_prints = _prints(good, 1), _prints(bad, 1)
+
+    def fake(_api: str, osi: str, _day: date) -> QuotePull:
+        if osi == bad:  # this contract's pull exhausted retries
+            raise RuntimeError("massive 503 ride-out exhausted")
+        return QuotePull([NbboQuote(good_prints[0].sip_timestamp_ns - 1000, 1.0, 1.1, 2, 3)], 1, 1)
+
+    monkeypatch.setattr(archive, "fetch_option_quotes_day", fake)
+    q, _pages, _fetched, failures = archive._quotes_for_day(
+        cfg, {good: good_prints, bad: bad_prints}, date(2022, 3, 8)
+    )
+    # the bad contract is recorded (not raised) and skipped; the good one still joins
+    assert failures == 1
+    assert any(k[0] == good for k in q) and not any(k[0] == bad for k in q)

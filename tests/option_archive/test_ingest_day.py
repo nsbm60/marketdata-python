@@ -146,13 +146,13 @@ def test_insert_ingest_log_carries_enumeration_misses() -> None:
         tasks_no_trades=0, tasks_failed=0, rows_inserted=42, bytes_downloaded=1000,
         wall_seconds=1.5, vendor_volume_delta=None, enumeration_misses=7,
         quote_contracts=5, quote_seconds=3.25, quotes_fetched=9100, quote_pages=14,
-        retry_count=212, started_at=now, finished_at=now,
+        quote_failures=3, retry_count=212, started_at=now, finished_at=now,
     )
     insert_ingest_log(ch, row, table="trading.ingest_log")
     _name, data, cols, _db = ch.inserts[0]
     d = dict(zip(cols, data[0]))
     assert {"enumeration_misses", "quote_contracts", "quote_seconds", "quotes_fetched",
-            "quote_pages", "retry_count"} <= set(cols)
+            "quote_pages", "quote_failures", "retry_count"} <= set(cols)
     assert d["enumeration_misses"] == 7 and d["rows_inserted"] == 42
     assert d["quote_contracts"] == 5 and d["quote_seconds"] == 3.25 and d["retry_count"] == 212
-    assert d["quotes_fetched"] == 9100 and d["quote_pages"] == 14
+    assert d["quotes_fetched"] == 9100 and d["quote_pages"] == 14 and d["quote_failures"] == 3

@@ -89,8 +89,9 @@ def with_retry(fn: Callable[[], T], *, what: str) -> T:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
                 continue
-            if _is_retryable(e):  # retryable but out of attempts — the day aborts on this
-                log.error("%s: exhausted %d attempts (%s status=%s); day aborts",
+            if _is_retryable(e):  # retryable but out of attempts — re-raise; the CALLER decides
+                # (enumerate/tape abort the day; the quote phase records + skips the contract).
+                log.error("%s: exhausted %d attempts (%s status=%s); propagating to caller",
                           what, _ATTEMPTS, type(e).__name__, _status_of(e))
             raise
     raise AssertionError("unreachable: loop returns or raises")

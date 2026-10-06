@@ -349,35 +349,49 @@ def _spots_for_day(
 
 def _quotes_for_day(
     cfg: ArchiveConfig, keep: dict[OsiSymbol, list[FlatTradePrint]], day: date
-) -> tuple[dict[tuple[str, int, int], NbboQuote], int, int]:
+) -> tuple[dict[tuple[str, int, int], NbboQuote], int, int, int]:
     """As-of NBBO per print: pull each kept contract's day of quotes (REST /v3/quotes,
     pooled at cfg.quote_pool_size) and merge-walk to its prints. Returns the join plus
-    the pull totals (quote_pages, quotes_fetched) summed across contracts. Only on/after
-    quotes_available_from — before that no vendor quotes exist and every quote column
-    stays NULL. Each worker pulls one contract and returns its own local join + pull
-    size; the per-page 429/5xx/transport retry lives in the fetcher."""
+    the pull totals (quote_pages, quotes_fetched) and quote_failures summed across
+    contracts. Only on/after quotes_available_from — before that no vendor quotes exist
+    and every quote column stays NULL.
+
+    A contract whose pull EXHAUSTS the per-page retries is RECORDED and SKIPPED (one
+    WARNING, counted in quote_failures), not fatal: its prints keep NULL quote columns
+    — meaning the vendor had no quote OR could not serve it — and the day COMPLETES
+    with the rest. Same record-and-continue rule as ENUMERATION_MISS: one flaky
+    contract must never discard a whole day's ~28k good pulls. The day's ledger row
+    carries quote_failures > 0, so it stays IDENTIFIABLE for a future targeted re-pull
+    (the exact contracts are the day's option_trade rows with quote_ts IS NULL)."""
     if day < cfg.quotes_available_from:
-        return {}, 0, 0
+        return {}, 0, 0, 0
     api_key = cfg.api_keys.massive_api_key
     # One line as the long, silent quote phase begins (observability during the pull).
     log.info("day %s: quote phase — pulling %d contracts", day, len(keep))
 
     def _one(
         item: tuple[OsiSymbol, list[FlatTradePrint]]
-    ) -> tuple[dict[tuple[str, int, int], NbboQuote], int, int]:
+    ) -> tuple[dict[tuple[str, int, int], NbboQuote], int, int, bool]:
         osi, prints = item
-        pull = fetch_option_quotes_day(api_key, str(osi), day)
+        try:
+            pull = fetch_option_quotes_day(api_key, str(osi), day)
+        except Exception as e:  # noqa: BLE001 — vendor could not serve this contract; record + skip, never abort the day
+            # Type + OSI only — the exception str embeds the key'd request URL.
+            log.warning("day %s: QUOTE_FAILURE %s (%s) — skipped; its quote columns stay NULL",
+                        day, osi, type(e).__name__)
+            return {}, 0, 0, True
         # prints already sip-sorted (parse_trades)
-        return attach_quotes(prints, pull.quotes), pull.pages, pull.quotes_fetched
+        return attach_quotes(prints, pull.quotes), pull.pages, pull.quotes_fetched, False
 
     out: dict[tuple[str, int, int], NbboQuote] = {}
-    pages = fetched = 0
+    pages = fetched = failures = 0
     with ThreadPoolExecutor(max_workers=cfg.quote_pool_size) as pool:
-        for partial, p, f in pool.map(_one, list(keep.items())):
+        for partial, p, f, failed in pool.map(_one, list(keep.items())):
             out.update(partial)
             pages += p
             fetched += f
-    return out, pages, fetched
+            failures += 1 if failed else 0
+    return out, pages, fetched, failures
 
 
 def _process_day(
@@ -407,7 +421,7 @@ def _process_day(
         by_symbol, spots_for_day, cfg, cfg.api_keys.massive_api_key, ch, day, cache
     )
     t_enum = time.monotonic()  # enumerate covers the Massive reference fetch + as-of write
-    quotes, quote_pages, quotes_fetched = _quotes_for_day(cfg, keep, day)
+    quotes, quote_pages, quotes_fetched, quote_failures = _quotes_for_day(cfg, keep, day)
     t_quotes = time.monotonic()  # quotes covers the per-contract /v3/quotes pull (>= 2022-03-07)
     spot = _spots_for_day(alpaca, keep, day)
     t_tape = time.monotonic()  # tape covers the per-underlying equity-tape pull
@@ -436,6 +450,7 @@ def _process_day(
         quote_seconds=phases["quotes"],
         quotes_fetched=quotes_fetched,
         quote_pages=quote_pages,
+        quote_failures=quote_failures,
         retry_count=retry_count(),
         started_at=started,
         finished_at=datetime.now(timezone.utc),
@@ -476,12 +491,12 @@ def run(cfg: ArchiveConfig, ch: Client, alpaca: object, s3: object) -> int:
             total_misses += ledger.enumeration_misses
             log.info(
                 "[%d/%d] %s: %d trades, %d misses, %.1fs "
-                "(dl %.0f parse %.0f enum %.0f quotes %.0f pg=%d q=%d retries %d "
+                "(dl %.0f parse %.0f enum %.0f quotes %.0f pg=%d q=%d qfail=%d retries %d "
                 "tape %.0f ins %.0f)",
                 i, len(days), day, ledger.rows_inserted, ledger.enumeration_misses,
                 ledger.wall_seconds, ph["dl"], ph["parse"], ph["enum"], ph["quotes"],
-                ledger.quote_pages, ledger.quotes_fetched, ledger.retry_count,
-                ph["tape"], ph["insert"],
+                ledger.quote_pages, ledger.quotes_fetched, ledger.quote_failures,
+                ledger.retry_count, ph["tape"], ph["insert"],
             )
     except DownloadExhausted as e:
         log.error("%s — exiting; the next run resumes from this day", e)

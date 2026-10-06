@@ -141,6 +141,7 @@ class LedgerRow:
     quote_seconds: float  # quote-phase wall seconds
     quotes_fetched: int  # total quote records pulled this day (data-size signal)
     quote_pages: int  # total quote pages pulled this day (pages/contract)
+    quote_failures: int  # contracts whose quote pull exhausted retries — recorded + skipped, day still done
     retry_count: int  # vendor-REST retries ridden out this day (storm evidence)
     started_at: datetime
     finished_at: datetime
@@ -366,7 +367,7 @@ _LEDGER_COLUMNS = (
     "session_date", "transport", "tasks_success", "tasks_no_trades", "tasks_failed",
     "rows_inserted", "bytes_downloaded", "wall_seconds", "vendor_volume_delta",
     "enumeration_misses", "quote_contracts", "quote_seconds", "quotes_fetched",
-    "quote_pages", "retry_count", "started_at", "finished_at",
+    "quote_pages", "quote_failures", "retry_count", "started_at", "finished_at",
 )
 
 
@@ -377,7 +378,7 @@ def insert_ingest_log(ch: Client, row: LedgerRow, *, table: str) -> None:
         row.session_date, row.transport, row.tasks_success, row.tasks_no_trades,
         row.tasks_failed, row.rows_inserted, row.bytes_downloaded, row.wall_seconds,
         row.vendor_volume_delta, row.enumeration_misses, row.quote_contracts,
-        row.quote_seconds, row.quotes_fetched, row.quote_pages, row.retry_count,
-        row.started_at, row.finished_at,
+        row.quote_seconds, row.quotes_fetched, row.quote_pages, row.quote_failures,
+        row.retry_count, row.started_at, row.finished_at,
     ]]
     ch.insert(name, data, column_names=list(_LEDGER_COLUMNS), database=db)
