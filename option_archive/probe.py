@@ -227,7 +227,12 @@ def _resolve_keep_subset(cfg: Any, day: date, n_contracts: int) -> list[tuple[An
         connect_timeout=cfg.s3.connect_timeout, read_timeout=cfg.s3.read_timeout,
     )
     unders = watchlist_underlyings(ch, table=cfg.tables.watchlist)
-    spots = archive._load_spots(alpaca, unders, day, day)
+    # Daily closes must be loaded over a window that BRACKETS the day. A zero-width
+    # [day, day] range returns no bars (Alpaca's end is effectively exclusive), which
+    # leaves spots_for_day empty and makes _classify_day skip every underlying (→ 0
+    # kept). _process_day gets these from the run-wide load + `if day in closes`; here
+    # we bracket the day (a week back absorbs any holiday gap) and pick that one close.
+    spots = archive._load_spots(alpaca, unders, day - timedelta(days=7), day + timedelta(days=1))
     spots_for_day = {u: closes[day] for u, closes in spots.items() if day in closes}
     with archive._download_day(s3, cfg, day) as path:
         raw = path.read_bytes()
