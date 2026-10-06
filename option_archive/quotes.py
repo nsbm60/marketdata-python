@@ -9,7 +9,7 @@ quote phase pools these per-contract pulls. Feeds the quote phase in ``archive.p
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, NamedTuple, Optional
 
 import httpx
 
@@ -54,6 +54,18 @@ def _parse_quote(row: Mapping[str, Any]) -> Optional[NbboQuote]:
     )
 
 
+class QuotePull(NamedTuple):
+    """One contract-day's quote pull: the in-session quotes joined to prints, plus the
+    RAW pull size — ``pages`` GET'd and ``quotes_fetched`` vendor rows served across
+    all pages (before the session-window filter). The two sizes isolate vendor data
+    volume (pages/contract, rows/page) from Massive service time (quote_seconds/page);
+    the quote phase sums them across contracts into the ledger."""
+
+    quotes: list[NbboQuote]
+    pages: int
+    quotes_fetched: int
+
+
 def _get_json(http: httpx.Client, url: str, params: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     resp = http.get(url, params=dict(params)) if params is not None else http.get(url)
     resp.raise_for_status()  # 429/5xx -> HTTPStatusError, classified retryable by with_retry
@@ -70,10 +82,10 @@ def fetch_option_quotes_day(
     *,
     timeout_s: float = 60.0,
     client: Optional[httpx.Client] = None,
-) -> list[NbboQuote]:
+) -> QuotePull:
     """All NBBO quotes for one contract on ``session_date`` (America/New_York),
-    sorted ascending by sip timestamp. Fully paginated; each page retried on
-    429 / 5xx / transport."""
+    sorted ascending by sip timestamp, with the raw pull size (pages, vendor rows).
+    Fully paginated; each page retried on 429 / 5xx / transport."""
     if not api_key:
         raise ValueError("Massive API key is required")
     massive = to_massive_ticker(strip_massive_prefix(osi))
@@ -86,6 +98,8 @@ def fetch_option_quotes_day(
     own = client is None
     http = client or httpx.Client(timeout=timeout_s)
     out: list[NbboQuote] = []
+    pages = 0
+    quotes_fetched = 0
     try:
         nxt: Optional[str] = None
         while True:
@@ -97,7 +111,10 @@ def fetch_option_quotes_day(
                 lambda: _get_json(http, page_url, page_params),
                 what=f"massive quotes {osi}@{session_date}",
             )
-            for row in body.get("results") or []:
+            results = body.get("results") or []
+            pages += 1
+            quotes_fetched += len(results)  # raw vendor rows served (pre session filter)
+            for row in results:
                 if not isinstance(row, Mapping):
                     continue
                 q = _parse_quote(row)
@@ -110,4 +127,4 @@ def fetch_option_quotes_day(
         if own:
             http.close()
     out.sort(key=lambda q: q.sip_timestamp_ns)
-    return out
+    return QuotePull(out, pages, quotes_fetched)

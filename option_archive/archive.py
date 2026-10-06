@@ -349,26 +349,35 @@ def _spots_for_day(
 
 def _quotes_for_day(
     cfg: ArchiveConfig, keep: dict[OsiSymbol, list[FlatTradePrint]], day: date
-) -> dict[tuple[str, int, int], NbboQuote]:
+) -> tuple[dict[tuple[str, int, int], NbboQuote], int, int]:
     """As-of NBBO per print: pull each kept contract's day of quotes (REST /v3/quotes,
-    pooled at cfg.quote_pool_size) and merge-walk to its prints. Only on/after
+    pooled at cfg.quote_pool_size) and merge-walk to its prints. Returns the join plus
+    the pull totals (quote_pages, quotes_fetched) summed across contracts. Only on/after
     quotes_available_from — before that no vendor quotes exist and every quote column
-    stays NULL. Each worker pulls one contract and returns its own local join; the
-    per-page 429/5xx/transport retry lives in the fetcher."""
+    stays NULL. Each worker pulls one contract and returns its own local join + pull
+    size; the per-page 429/5xx/transport retry lives in the fetcher."""
     if day < cfg.quotes_available_from:
-        return {}
+        return {}, 0, 0
     api_key = cfg.api_keys.massive_api_key
+    # One line as the long, silent quote phase begins (observability during the pull).
+    log.info("day %s: quote phase — pulling %d contracts", day, len(keep))
 
-    def _one(item: tuple[OsiSymbol, list[FlatTradePrint]]) -> dict[tuple[str, int, int], NbboQuote]:
+    def _one(
+        item: tuple[OsiSymbol, list[FlatTradePrint]]
+    ) -> tuple[dict[tuple[str, int, int], NbboQuote], int, int]:
         osi, prints = item
-        quotes = fetch_option_quotes_day(api_key, str(osi), day)
-        return attach_quotes(prints, quotes)  # prints already sip-sorted (parse_trades)
+        pull = fetch_option_quotes_day(api_key, str(osi), day)
+        # prints already sip-sorted (parse_trades)
+        return attach_quotes(prints, pull.quotes), pull.pages, pull.quotes_fetched
 
     out: dict[tuple[str, int, int], NbboQuote] = {}
+    pages = fetched = 0
     with ThreadPoolExecutor(max_workers=cfg.quote_pool_size) as pool:
-        for partial in pool.map(_one, list(keep.items())):
+        for partial, p, f in pool.map(_one, list(keep.items())):
             out.update(partial)
-    return out
+            pages += p
+            fetched += f
+    return out, pages, fetched
 
 
 def _process_day(
@@ -398,7 +407,7 @@ def _process_day(
         by_symbol, spots_for_day, cfg, cfg.api_keys.massive_api_key, ch, day, cache
     )
     t_enum = time.monotonic()  # enumerate covers the Massive reference fetch + as-of write
-    quotes = _quotes_for_day(cfg, keep, day)
+    quotes, quote_pages, quotes_fetched = _quotes_for_day(cfg, keep, day)
     t_quotes = time.monotonic()  # quotes covers the per-contract /v3/quotes pull (>= 2022-03-07)
     spot = _spots_for_day(alpaca, keep, day)
     t_tape = time.monotonic()  # tape covers the per-underlying equity-tape pull
@@ -425,6 +434,8 @@ def _process_day(
         enumeration_misses=misses,
         quote_contracts=quote_contracts,
         quote_seconds=phases["quotes"],
+        quotes_fetched=quotes_fetched,
+        quote_pages=quote_pages,
         retry_count=retry_count(),
         started_at=started,
         finished_at=datetime.now(timezone.utc),
@@ -465,10 +476,12 @@ def run(cfg: ArchiveConfig, ch: Client, alpaca: object, s3: object) -> int:
             total_misses += ledger.enumeration_misses
             log.info(
                 "[%d/%d] %s: %d trades, %d misses, %.1fs "
-                "(dl %.0f parse %.0f enum %.0f quotes %.0f retries %d tape %.0f ins %.0f)",
+                "(dl %.0f parse %.0f enum %.0f quotes %.0f pg=%d q=%d retries %d "
+                "tape %.0f ins %.0f)",
                 i, len(days), day, ledger.rows_inserted, ledger.enumeration_misses,
                 ledger.wall_seconds, ph["dl"], ph["parse"], ph["enum"], ph["quotes"],
-                ledger.retry_count, ph["tape"], ph["insert"],
+                ledger.quote_pages, ledger.quotes_fetched, ledger.retry_count,
+                ph["tape"], ph["insert"],
             )
     except DownloadExhausted as e:
         log.error("%s — exiting; the next run resumes from this day", e)

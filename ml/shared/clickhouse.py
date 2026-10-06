@@ -51,10 +51,20 @@ def get_ch_client():
             )
             time.sleep(backoff)
             backoff = min(backoff * 2, _RESOLVE_BACKOFF_MAX_SEC)
+    # Password comes from the environment with NO in-source default — a committed
+    # default is a leaked credential. The systemd EnvironmentFile supplies
+    # CLICKHOUSE_PASSWORD for the batch units; fail loud if it is unset rather than
+    # fall back to a baked-in secret.
+    password = os.environ.get("CLICKHOUSE_PASSWORD")
+    if not password:
+        raise RuntimeError(
+            "CLICKHOUSE_PASSWORD is not set — the ClickHouse connector requires it "
+            "(the unit's EnvironmentFile provides it); refusing to connect"
+        )
     return clickhouse_connect.get_client(
         host=ch_endpoint.host,
         port=ch_endpoint.port,
         username=os.environ.get("CLICKHOUSE_USER") or "default",
-        password=os.environ.get("CLICKHOUSE_PASSWORD") or "Aector99",
+        password=password,
         database=os.environ.get("CLICKHOUSE_DATABASE") or "trading",
     )

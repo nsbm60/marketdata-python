@@ -15,6 +15,7 @@ from greeks.pull.contracts import ContractRef
 from option_archive import archive
 from option_archive.config import get_config
 from option_archive.ingest_day import FlatTradePrint
+from option_archive.quotes import QuotePull
 
 
 class _FakeCH:
@@ -162,10 +163,14 @@ def test_download_exhausts_and_leaves_no_tempfile(monkeypatch: pytest.MonkeyPatc
 def test_quotes_skipped_before_availability(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = get_config()  # quotes_available_from = 2022-03-07
     calls: list[int] = []
-    monkeypatch.setattr(archive, "fetch_option_quotes_day", lambda *a, **k: calls.append(1) or [])
+    monkeypatch.setattr(
+        archive, "fetch_option_quotes_day",
+        lambda *a, **k: calls.append(1) or QuotePull([], 0, 0),
+    )
     osi = _osi(date(2020, 6, 30), 100.0)
-    q = archive._quotes_for_day(cfg, {osi: _prints(osi, 2)}, date(2020, 1, 15))
-    assert q == {} and calls == []  # pre-2022: no vendor quotes exist, no fetch attempted
+    q, pages, fetched = archive._quotes_for_day(cfg, {osi: _prints(osi, 2)}, date(2020, 1, 15))
+    # pre-2022: no vendor quotes exist, no fetch attempted, zero pull totals
+    assert q == {} and calls == [] and pages == 0 and fetched == 0
 
 
 def test_quotes_pulled_and_attached_after_availability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,8 +180,11 @@ def test_quotes_pulled_and_attached_after_availability(monkeypatch: pytest.Monke
     prints = _prints(osi, 1)
     monkeypatch.setattr(
         archive, "fetch_option_quotes_day",
-        lambda api, o, d: [NbboQuote(prints[0].sip_timestamp_ns - 1000, 1.0, 1.1, 2, 3)],
+        lambda api, o, d: QuotePull(
+            [NbboQuote(prints[0].sip_timestamp_ns - 1000, 1.0, 1.1, 2, 3)], pages=3, quotes_fetched=7
+        ),
     )
-    q = archive._quotes_for_day(cfg, {osi: prints}, date(2022, 3, 8))
+    q, pages, fetched = archive._quotes_for_day(cfg, {osi: prints}, date(2022, 3, 8))
     ((_key, v),) = q.items()
     assert v.bid == 1.0 and v.ask == 1.1  # last quote at-or-before the print, attached
+    assert pages == 3 and fetched == 7  # pull totals summed across contracts (one here)
