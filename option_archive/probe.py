@@ -251,19 +251,29 @@ def _width_test(cfg: Any, day: date, n_contracts: int, widths: list[int]) -> Non
     width. No retries (raw truth)."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from option_archive.quotes import benchmark_quote_pull
+    from option_archive.quotes import BenchPull, PageStat, benchmark_quote_pull
 
     api_key = cfg.api_keys.massive_api_key
     items = _resolve_keep_subset(cfg, day, n_contracts)
 
     def _one(item: tuple[Any, Any]) -> Any:
         osi, prints = item
-        return benchmark_quote_pull(api_key, str(osi), day, prints)
+        try:
+            return benchmark_quote_pull(api_key, str(osi), day, prints)
+        except Exception as e:  # noqa: BLE001 — one contract must never abort the sweep
+            log.warning("width-test: %s pull raised %s; counted as no-response", osi, type(e).__name__)
+            return BenchPull(0, 0, 0.0, 0.0, [PageStat(0.0, 0, 0)])
 
+    # Every width in --widths runs, independently: a failure inside one width's pool
+    # is logged and skipped, never allowed to stop the widths after it.
     for width in widths:
         t0 = time.monotonic()
-        with ThreadPoolExecutor(max_workers=width) as pool:
-            pulls = list(pool.map(_one, items))
+        try:
+            with ThreadPoolExecutor(max_workers=width) as pool:
+                pulls = list(pool.map(_one, items))
+        except Exception as e:  # noqa: BLE001
+            log.warning("width-test: width=%d aborted (%s); continuing to next width", width, type(e).__name__)
+            continue
         print(_format_width_line(width, _summarize(time.monotonic() - t0, pulls)))
 
 
