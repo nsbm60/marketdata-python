@@ -16,16 +16,16 @@ or under pytest:
 To exercise it end-to-end: open an options chain in the UI, run this — that underlying's contracts
 should appear with TTLs near the lease duration. Close the chain; after the grace period they lapse.
 """
-import json
 import re
 import sys
-import zmq
 
 try:
+    from control_client import ControlSocket
     from discovery.service_locator import ServiceLocator
 except ModuleNotFoundError:
     import pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+    from control_client import ControlSocket
     from discovery.service_locator import ServiceLocator
 
 # Canonical service name; ServiceLocator (via TopicBuilder.for_service) lowercases it to match
@@ -42,18 +42,8 @@ def _underlying(symbol: str) -> str:
 def query_option_subscriptions(timeout_sec: int = 15) -> dict:
     """Discover MDS, send the option_subscriptions op over a DEALER, return the parsed reply."""
     endpoint = ServiceLocator.wait_for_service(SERVICE, timeout_sec=timeout_sec)
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 5000)
-    dealer.setsockopt(zmq.LINGER, 0)
-    dealer.connect(endpoint.router)
-    try:
-        dealer.send_multipart([b"", json.dumps({"op": "option_subscriptions"}).encode()])
-        frames = dealer.recv_multipart()
-    finally:
-        dealer.close()
-        ctx.term()
-    return json.loads(frames[-1].decode("utf-8"))
+    with ControlSocket(endpoint.router, timeout_ms=5000) as dealer:
+        return dealer.request({"op": "option_subscriptions"})
 
 
 def test_option_subscriptions() -> dict:

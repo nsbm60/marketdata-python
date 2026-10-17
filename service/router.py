@@ -99,10 +99,12 @@ class Router:
                 log.warning("[Router] Recv error: %s", e)
                 return False
 
-            if len(frames) < 2:
+            if len(frames) < 3:
+                log.warning("[Router] Request with %d frame(s), expected [identity][rid][json]", len(frames))
                 return False
 
             identity = frames[0]
+            rid = frames[1]
             payload_frame = frames[-1]
             recv_gen = self._generation
 
@@ -120,7 +122,7 @@ class Router:
                 log.warning("[Router] Socket recreated during handler — dropping reply (gen %d → %d)", recv_gen, self._generation)
                 return True
             try:
-                self._socket.send_multipart([identity, b"", response.encode("utf-8")])
+                self._socket.send_multipart([identity, rid, response.encode("utf-8")])
             except Exception as e:
                 log.warning("[Router] Reply send failed: %s", e)
 

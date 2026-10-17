@@ -5,14 +5,12 @@ MDS (Market Data Service) RPC client for bar data access.
 Uses ZMQ DEALER/ROUTER pattern for JSON-RPC style requests.
 """
 
-import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import zmq
-
+from control_client import ControlSocket, ControlTimeout
 from ml.models.breakout.types import PivotPoint
 
 NY = ZoneInfo("America/New_York")
@@ -75,10 +73,7 @@ def get_bars(
     Raises:
         RuntimeError: If MDS unreachable or returns error
     """
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    dealer.connect(router_url)
+    sock = ControlSocket(router_url, timeout_ms)
 
     try:
         request = {
@@ -90,10 +85,12 @@ def get_bars(
         if bar_date:
             request["date"] = bar_date.isoformat()
 
-        dealer.send_string(json.dumps(request))
+        try:
+            response = sock.request(request)
+        except ControlTimeout:
+            response = None
 
-        if dealer.poll(timeout=timeout_ms):
-            response = json.loads(dealer.recv_string())
+        if response is not None:
             if not response.get("ok"):
                 raise RuntimeError(
                     f"MDS error for get_bars({symbol}): "
@@ -126,8 +123,7 @@ def get_bars(
         else:
             raise RuntimeError(f"MDS timeout for get_bars({symbol})")
     finally:
-        dealer.close(linger=0)
-        ctx.term()
+        sock.close()
 
 
 def get_prior_session(
@@ -149,10 +145,7 @@ def get_prior_session(
     Raises:
         RuntimeError: If MDS unreachable
     """
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    dealer.connect(router_url)
+    sock = ControlSocket(router_url, timeout_ms)
 
     try:
         request = {
@@ -160,10 +153,12 @@ def get_prior_session(
             "symbol": symbol.upper(),
         }
 
-        dealer.send_string(json.dumps(request))
+        try:
+            response = sock.request(request)
+        except ControlTimeout:
+            response = None
 
-        if dealer.poll(timeout=timeout_ms):
-            response = json.loads(dealer.recv_string())
+        if response is not None:
             if not response.get("ok"):
                 # No prior session is not an error, just return None
                 error = response.get("error", "")
@@ -185,8 +180,7 @@ def get_prior_session(
         else:
             raise RuntimeError(f"MDS timeout for get_prior_session({symbol})")
     finally:
-        dealer.close(linger=0)
-        ctx.term()
+        sock.close()
 
 
 def subscribe_with_backfill(
@@ -217,10 +211,7 @@ def subscribe_with_backfill(
     Raises:
         RuntimeError: If MDS unreachable
     """
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    dealer.connect(router_url)
+    sock = ControlSocket(router_url, timeout_ms)
 
     try:
         request = {
@@ -230,16 +221,17 @@ def subscribe_with_backfill(
             "timeframe": timeframe,
         }
 
-        dealer.send_string(json.dumps(request))
+        try:
+            response = sock.request(request)
+        except ControlTimeout:
+            response = None
 
-        if dealer.poll(timeout=timeout_ms):
-            response = json.loads(dealer.recv_string())
+        if response is not None:
             return response
         else:
             return None
     finally:
-        dealer.close(linger=0)
-        ctx.term()
+        sock.close()
 
 
 def get_trading_sessions(
@@ -260,10 +252,7 @@ def get_trading_sessions(
     Returns:
         List of TradingSession in chronological order
     """
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    dealer.connect(router_url)
+    sock = ControlSocket(router_url, timeout_ms)
 
     try:
         request = {
@@ -271,10 +260,12 @@ def get_trading_sessions(
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
         }
-        dealer.send_string(json.dumps(request))
+        try:
+            response = sock.request(request)
+        except ControlTimeout:
+            response = None
 
-        if dealer.poll(timeout=timeout_ms):
-            response = json.loads(dealer.recv_string())
+        if response is not None:
             if not response.get("ok"):
                 raise RuntimeError(
                     f"MDS error for get_trading_sessions: "
@@ -294,8 +285,7 @@ def get_trading_sessions(
         else:
             raise RuntimeError("MDS timeout for get_trading_sessions")
     finally:
-        dealer.close(linger=0)
-        ctx.term()
+        sock.close()
 
 
 def parse_pivot_backfill(response: dict) -> list[PivotPoint]:

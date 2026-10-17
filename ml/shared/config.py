@@ -146,31 +146,21 @@ def fetch_symbol_list(mds_router_url: str, list_name: str) -> list[str]:
     Raises:
         RuntimeError: If list not found or MDS unreachable
     """
-    import zmq
-    import json
-
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
-    dealer.connect(mds_router_url)
+    from control_client import ControlTimeout, request as control_request
 
     try:
-        request = json.dumps({"op": "get_symbol_list", "name": list_name})
-        dealer.send_string(request)
+        response = control_request(
+            mds_router_url, {"op": "get_symbol_list", "name": list_name}, timeout_ms=5000
+        )
+    except ControlTimeout:
+        raise RuntimeError(f"MDS timeout fetching symbol list '{list_name}'")
 
-        if dealer.poll(timeout=5000):
-            response = json.loads(dealer.recv_string())
-            if not response.get("ok"):
-                raise RuntimeError(
-                    f"MDS error for list '{list_name}': "
-                    f"{response.get('error', 'unknown')}"
-                )
-            return response["data"]["symbols"]
-        else:
-            raise RuntimeError(f"MDS timeout fetching symbol list '{list_name}'")
-    finally:
-        dealer.close(linger=0)
-        ctx.term()
+    if not response.get("ok"):
+        raise RuntimeError(
+            f"MDS error for list '{list_name}': "
+            f"{response.get('error', 'unknown')}"
+        )
+    return response["data"]["symbols"]
 
 
 # ---------------------------------------------------------------------------

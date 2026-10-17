@@ -8,11 +8,13 @@ After self_ping_max_missed consecutive misses, triggers socket recreation.
 Matches Scala's ResilientRouter self-ping pattern.
 """
 
+import json
 import logging
 import threading
 
 import zmq
 
+from control_client import ControlSocket, ControlTimeout
 from service.constants import PING_JSON, PONG_JSON, SELF_PING_INTERVAL_SEC, SELF_PING_MAX_MISSED, SELF_PING_TIMEOUT_MS
 
 log = logging.getLogger(__name__)
@@ -39,14 +41,13 @@ class SelfPingMonitor:
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
         self._ctx: zmq.Context | None = None
-        self._dealer: zmq.Socket | None = None
+        self._dealer: ControlSocket | None = None
 
     def start(self) -> None:
         self._ctx = zmq.Context()
-        self._dealer = self._ctx.socket(zmq.DEALER)
-        self._dealer.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-        self._dealer.setsockopt(zmq.LINGER, 0)
-        self._dealer.connect(f"tcp://127.0.0.1:{self._router_port}")
+        self._dealer = ControlSocket(
+            f"tcp://127.0.0.1:{self._router_port}", timeout_ms=self._timeout_ms, ctx=self._ctx
+        )
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self._service_name}-selfping")
         self._thread.start()
 
@@ -56,7 +57,7 @@ class SelfPingMonitor:
             self._thread.join(timeout=self._interval_sec + 2)
         if self._dealer:
             try:
-                self._dealer.close(linger=0)
+                self._dealer.close()
             except Exception:
                 pass
         if self._ctx:
@@ -92,39 +93,25 @@ class SelfPingMonitor:
                     consecutive_missed = 0
 
     def _ping(self) -> bool:
-        """Send a ping to our own ROUTER, return True if pong received."""
-        # Drain any stale pongs from previous cycles before sending a new ping.
-        # Prevents a stale pong from masking a current failure.
-        self._drain()
+        """Send a ping to our own ROUTER, return True if pong received.
 
+        No drain: the pong carries the id of the ping it answers, so a stale one
+        cannot be mistaken for this cycle's and mask a current failure.
+        """
         try:
-            self._dealer.send_multipart([b"", PING_JSON.encode("utf-8")])
-            frames = self._dealer.recv_multipart()
-            reply = frames[-1].decode("utf-8")
-            return reply == PONG_JSON
-        except zmq.Again:
+            return self._dealer.request(json.loads(PING_JSON)) == json.loads(PONG_JSON)
+        except ControlTimeout:
             return False
         except Exception as e:
             log.debug("[SelfPing] Error: %s", e)
             return False
 
-    def _drain(self) -> None:
-        """Drain any buffered messages from the DEALER (stale pongs)."""
-        while True:
-            try:
-                self._dealer.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break
-            except Exception:
-                break
-
     def _reconnect_dealer(self) -> None:
         """Reconnect the dealer after ROUTER recreation."""
         try:
-            self._dealer.close(linger=0)
+            self._dealer.close()
         except Exception:
             pass
-        self._dealer = self._ctx.socket(zmq.DEALER)
-        self._dealer.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-        self._dealer.setsockopt(zmq.LINGER, 0)
-        self._dealer.connect(f"tcp://127.0.0.1:{self._router_port}")
+        self._dealer = ControlSocket(
+            f"tcp://127.0.0.1:{self._router_port}", timeout_ms=self._timeout_ms, ctx=self._ctx
+        )
