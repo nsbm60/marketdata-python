@@ -15,6 +15,8 @@ import sys
 import time
 import zmq
 
+from control_client import ControlSocket, ControlTimeout
+
 # Add parent dir to path for discovery package
 sys.path.insert(0, ".")
 from discovery.service_locator import ServiceLocator
@@ -65,18 +67,13 @@ def main():
 
     # Layer 3: External ping
     print("\n--- Layer 3: External Ping ---")
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 5000)
-    dealer.setsockopt(zmq.LINGER, 0)
-    dealer.connect(endpoint.router)
+    dealer = ControlSocket(endpoint.router, timeout_ms=5000, ctx=ctx)
 
-    dealer.send_multipart([b"", json.dumps({"op": "__ping__"}).encode()])
     try:
-        frames = dealer.recv_multipart()
-        reply = json.loads(frames[-1].decode("utf-8"))
+        reply = dealer.request({"op": "__ping__"})
         assert reply == {"op": "__pong__"}, f"Expected pong, got {reply}"
         print(f"OK: Ping/pong successful — {reply}")
-    except zmq.Again:
+    except ControlTimeout:
         print("FAIL: No pong received within 5s")
         sys.exit(1)
 
@@ -85,39 +82,30 @@ def main():
 
     # 4a: Success case
     request = {"op": "echo", "msg": "hello"}
-    dealer.send_multipart([b"", json.dumps(request).encode()])
-    frames = dealer.recv_multipart()
-    reply = json.loads(frames[-1].decode("utf-8"))
+    reply = dealer.request(request)
     assert reply["ok"] is True, f"Expected ok=true, got {reply}"
     assert reply["data"]["received"] == request, f"Expected echo of request, got {reply['data']}"
     print(f"OK: Echo handler — received={reply['data']}")
 
     # 4b: Unknown op
-    dealer.send_multipart([b"", json.dumps({"op": "nonexistent"}).encode()])
-    frames = dealer.recv_multipart()
-    reply = json.loads(frames[-1].decode("utf-8"))
+    reply = dealer.request({"op": "nonexistent"})
     assert reply["ok"] is False, f"Expected ok=false, got {reply}"
     assert "unsupported op" in reply["error"], f"Expected 'unsupported op' in error, got {reply['error']}"
     print(f"OK: Unknown op — error={reply['error']}")
 
     # 4c: Missing op
-    dealer.send_multipart([b"", json.dumps({"foo": "bar"}).encode()])
-    frames = dealer.recv_multipart()
-    reply = json.loads(frames[-1].decode("utf-8"))
+    reply = dealer.request({"foo": "bar"})
     assert reply["ok"] is False, f"Expected ok=false, got {reply}"
     assert "missing" in reply["error"].lower() or "empty" in reply["error"].lower(), f"Expected missing op error, got {reply['error']}"
     print(f"OK: Missing op — error={reply['error']}")
 
     # 4d: Handler exception
-    dealer.send_multipart([b"", json.dumps({"op": "fail"}).encode()])
-    frames = dealer.recv_multipart()
-    reply = json.loads(frames[-1].decode("utf-8"))
+    reply = dealer.request({"op": "fail"})
     assert reply["ok"] is False, f"Expected ok=false, got {reply}"
     assert "ValueError" in reply["error"], f"Expected ValueError in error, got {reply['error']}"
     print(f"OK: Handler exception — error={reply['error']}")
 
     dealer.close()
-    ctx.term()
 
     print("\n" + "=" * 60)
     print("ALL LAYERS PASSED")

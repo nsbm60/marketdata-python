@@ -15,8 +15,7 @@ import argparse
 import json
 from datetime import datetime
 
-import zmq
-
+from control_client import ControlSocket, ControlTimeout
 from discovery.service_locator import ServiceLocator
 
 
@@ -35,10 +34,7 @@ def main():
     calc = ServiceLocator.wait_for_service(ServiceLocator.CALC, timeout_sec=10)
     print(f"CalcServer found: {calc.router}")
 
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 10000)
-    dealer.connect(calc.router)
+    dealer = ControlSocket(calc.router, timeout_ms=10000)
 
     request = {
         "op": "get_breakout_candidates",
@@ -52,11 +48,12 @@ def main():
     print(f"\nRequest: {json.dumps(request, indent=2)}")
 
     try:
-        dealer.send_string(json.dumps(request))
+        try:
+            response = dealer.request(request)
+        except ControlTimeout:
+            response = None
 
-        if dealer.poll(timeout=10000):
-            raw = dealer.recv_string()
-            response = json.loads(raw)
+        if response is not None:
 
             print(f"\nRaw response:\n{json.dumps(response, indent=2)}")
 

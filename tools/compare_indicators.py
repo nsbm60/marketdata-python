@@ -23,14 +23,12 @@ Requirements: pyzmq (already used by the other tools here).
 """
 
 import argparse
-import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import zmq
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from control_client import ControlTimeout, request as control_request
 from discovery.service_locator import ServiceLocator
 
 
@@ -225,20 +223,14 @@ def main():
     if args.session:
         request["session"] = args.session
 
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, args.timeout)
-    dealer.connect(calc.router)
-
     print(f"Requesting {args.symbol.upper()} {args.timeframe}, {args.bars} bars, "
           f"ATR({args.atr_period}), RSI({args.rsi_period}), MACD({fast},{slow},{signal})")
-    dealer.send_string(json.dumps(request))
-
-    if not dealer.poll(timeout=args.timeout):
+    try:
+        reply = control_request(calc.router, request, timeout_ms=args.timeout)
+    except ControlTimeout:
         print("No reply from CalcServer. Is it running?")
         return 1
 
-    reply = json.loads(dealer.recv_string())
     if not reply.get("ok", False):
         print(f"Request failed: {reply.get('error')}")
         return 1

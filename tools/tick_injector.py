@@ -12,6 +12,8 @@ Usage:
     python tick_injector.py --file ticks.json             # Batch from file
 """
 import zmq
+
+from control_client import ControlSocket
 import json
 import sys
 import argparse
@@ -23,9 +25,7 @@ MDS_CONTROL_PORT = 6007
 
 def send_control(sock, request: dict) -> dict:
     """Send control request and wait for response."""
-    sock.send_string(json.dumps(request))
-    response = sock.recv_string()
-    return json.loads(response)
+    return sock.request(request)
 
 def inject_equity_tick(sock, symbol: str, price: float, bid: float = None, ask: float = None) -> bool:
     """Inject a single equity tick."""
@@ -113,10 +113,8 @@ def main():
     args = parser.parse_args()
 
     # Connect to MDS control
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.DEALER)
-    sock.setsockopt(zmq.RCVTIMEO, 5000)  # 5s timeout
-    sock.connect(f"tcp://127.0.0.1:{args.port}")
+    sock = ControlSocket(f"tcp://127.0.0.1:{args.port}", timeout_ms=5000,
+                         ctx=zmq.Context.instance())
     print(f"Connected to MDS control on port {args.port}")
 
     try:

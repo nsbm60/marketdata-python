@@ -16,6 +16,8 @@ Requires:
     - pip install alpaca-py
 """
 import zmq
+
+from control_client import ControlSocket
 import json
 import sys
 import argparse
@@ -140,9 +142,7 @@ def fetch_trades(client: StockHistoricalDataClient, symbols: List[str],
 
 def fetch_watchlist_symbols(sock) -> List[str]:
     """Fetch symbols from the active watchlist via MDS."""
-    request = {"op": "get_active_watchlist"}
-    sock.send_string(json.dumps(request))
-    response = json.loads(sock.recv_string())
+    response = sock.request({"op": "get_active_watchlist"})
 
     if response.get("ok"):
         data = response.get("data", {})
@@ -171,8 +171,7 @@ def inject_tick(sock, symbol: str, price: float, bid: float = None, ask: float =
     if volume is not None:
         request["volume"] = volume
 
-    sock.send_string(json.dumps(request))
-    response = json.loads(sock.recv_string())
+    response = sock.request(request)
     return response.get("ok", False)
 
 
@@ -397,10 +396,8 @@ Examples:
             sys.exit(1)
 
     # Connect to MDS control
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.DEALER)
-    sock.setsockopt(zmq.RCVTIMEO, 10000)  # 10s timeout
-    sock.connect(f"tcp://127.0.0.1:{args.port}")
+    sock = ControlSocket(f"tcp://127.0.0.1:{args.port}", timeout_ms=10000,
+                         ctx=zmq.Context.instance())
     print(f"Connected to MDS control on port {args.port}")
 
     try:

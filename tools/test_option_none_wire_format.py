@@ -21,9 +21,10 @@ Exit status:
 
 import json
 import sys
-import uuid
 
 import zmq
+
+from control_client import ControlSocket, ControlTimeout
 
 from discovery.service_locator import ServiceLocator
 
@@ -47,30 +48,16 @@ def main() -> int:
     print(f"CalcServer control router: {router_endpoint}")
 
     # Send list_metrics request
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.DEALER)
-    sock.setsockopt(zmq.IDENTITY, f"test-{uuid.uuid4().hex[:8]}".encode())
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.connect(router_endpoint)
-
+    sock = ControlSocket(router_endpoint, timeout_ms=5000, ctx=zmq.Context.instance())
     try:
-        request = json.dumps({"op": "list_metrics"})
-        sock.send_multipart([b"", request.encode()])
-
-        # Wait up to 5s for reply
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-        if not poller.poll(5000):
-            print("RPC timeout waiting for list_metrics reply", file=sys.stderr)
-            return 3
-
-        frames = sock.recv_multipart()
+        response = sock.request({"op": "list_metrics"})
+    except ControlTimeout:
+        print("RPC timeout waiting for list_metrics reply", file=sys.stderr)
+        return 3
     finally:
         sock.close()
 
-    # DEALER/ROUTER replies typically have an empty delimiter frame followed by payload
-    payload_bytes = frames[-1]
-    payload = payload_bytes.decode()
+    payload = json.dumps(response)
 
     print("\n--- Raw response (first 2000 chars) ---")
     print(payload[:2000])

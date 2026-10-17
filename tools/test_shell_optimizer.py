@@ -10,13 +10,12 @@ Run this test in another:
     python tools/test_shell_optimizer.py
 """
 
-import json
 import sys
 import uuid
 
 sys.path.insert(0, ".")
 
-import zmq
+from control_client import ControlSocket
 from discovery.service_locator import ServiceLocator
 
 # ─────────────────────────────────────────────────────────────
@@ -84,9 +83,7 @@ def make_request(verbose=False, num_dvs=20):
 
 def send_request(dealer, request):
     """Send an optimize request, return parsed response data."""
-    dealer.send_multipart([b"", json.dumps({"op": "optimize", **request}).encode()])
-    frames = dealer.recv_multipart()
-    envelope = json.loads(frames[-1].decode())
+    envelope = dealer.request({"op": "optimize", **request})
     assert envelope["ok"] is True, f"Expected ok=true, got {envelope}"
     return envelope["data"]
 
@@ -111,11 +108,7 @@ def main():
         sys.exit(1)
     print(f"OK: Found optimizer at {endpoint.router}")
 
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 10000)
-    dealer.setsockopt(zmq.LINGER, 0)
-    dealer.connect(endpoint.router)
+    dealer = ControlSocket(endpoint.router, timeout_ms=10000)
 
     # --- Layer 3: Optimal response ---
     print("\n--- Layer 3: Optimal Response ---")
@@ -197,9 +190,7 @@ def main():
 
     # --- Layer 6: Missing op / unknown op (service library behavior) ---
     print("\n--- Layer 6: Service Library Error Handling ---")
-    dealer.send_multipart([b"", json.dumps({"op": "nonexistent"}).encode()])
-    frames = dealer.recv_multipart()
-    err = json.loads(frames[-1].decode())
+    err = dealer.request({"op": "nonexistent"})
     assert err["ok"] is False, "Expected error for unknown op"
     assert "unsupported op" in err["error"], f"Expected unsupported op error, got {err['error']}"
     print(f"OK: Unknown op handled — {err['error']}")

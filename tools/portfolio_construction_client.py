@@ -34,6 +34,8 @@ import time
 
 import zmq
 
+from control_client import ControlTimeout, request as control_request
+
 CALC_PUB_PORT = 6020
 CALC_CONTROL_PORT = 6021
 TOLERANCE = 0.01  # absolute tolerance for floating-point invariant checks
@@ -43,18 +45,12 @@ CROSS_CHECK_TOLERANCE = 0.05  # 5% relative tolerance for cross-check
 
 def rpc(ctx, host, op, payload):
     """Send an RPC to CalcServer's control router and return the parsed response."""
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 5000)
-    dealer.connect(f"tcp://{host}:{CALC_CONTROL_PORT}")
-    msg = json.dumps({"op": op, **payload})
-    dealer.send_multipart([b"", msg.encode()])
     try:
-        parts = dealer.recv_multipart()
-        return json.loads(parts[-1])
-    except zmq.Again:
+        return control_request(
+            f"tcp://{host}:{CALC_CONTROL_PORT}", {"op": op, **payload}, timeout_ms=5000, ctx=ctx
+        )
+    except ControlTimeout:
         return {"ok": False, "error": "RPC timeout"}
-    finally:
-        dealer.close()
 
 
 def validate(r):

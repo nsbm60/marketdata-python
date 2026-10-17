@@ -23,6 +23,8 @@ from typing import Any
 
 import zmq
 
+from control_client import request as control_request
+
 # Hierarchical topic from OSI (same rules as TopicBuilder.formatStrike / optionSuffix)
 def osi_to_quote_topic(osi: str) -> str:
     osi = osi.strip().upper()
@@ -48,20 +50,7 @@ def osi_to_trade_topic(osi: str) -> str:
 
 
 def calc_control(endpoint: str, payload: dict, timeout_ms: int = 10000) -> dict:
-    ctx = zmq.Context.instance()
-    d = ctx.socket(zmq.DEALER)
-    d.setsockopt(zmq.LINGER, 0)
-    d.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    d.setsockopt(zmq.SNDTIMEO, 5000)
-    d.connect(endpoint)
-    try:
-        d.send_string(json.dumps(payload))
-        # Calc may reply single or multipart
-        parts = d.recv_multipart()
-        raw = parts[-1].decode()
-        return json.loads(raw)
-    finally:
-        d.close()
+    return control_request(endpoint, payload, timeout_ms=timeout_ms, ctx=zmq.Context.instance())
 
 
 def sample_mds(osis: list[str], seconds: float = 5.0) -> dict[str, dict[str, Any]]:

@@ -23,14 +23,13 @@ yield_floor_pct in policy must be ignored. The full status taxonomy and
 binding_constraints get their own assertions in Layer 3.
 """
 
-import json
 import sys
 import uuid
 from collections import defaultdict
 
 sys.path.insert(0, ".")
 
-import zmq
+from control_client import ControlSocket
 from discovery.service_locator import ServiceLocator
 
 EXPECTED_SOLVER = "clarabel"  # default backend; override if OPTIMIZER_SOLVER is set
@@ -124,9 +123,7 @@ def make_infeasible_request():
 
 
 def send_request(dealer, request):
-    dealer.send_multipart([b"", json.dumps({"op": "optimize", **request}).encode()])
-    frames = dealer.recv_multipart()
-    envelope = json.loads(frames[-1].decode())
+    envelope = dealer.request({"op": "optimize", **request})
     assert envelope["ok"] is True, f"Expected ok=true, got {envelope}"
     return envelope["data"]
 
@@ -145,11 +142,7 @@ def main():
         sys.exit(1)
     print(f"OK: Found optimizer at {endpoint.router}")
 
-    ctx = zmq.Context()
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.RCVTIMEO, 35000)
-    dealer.setsockopt(zmq.LINGER, 0)
-    dealer.connect(endpoint.router)
+    dealer = ControlSocket(endpoint.router, timeout_ms=35000)
 
     # --- Protocol round-trip ---
     print("\n--- Layer 2: Protocol Round-Trip ---")
