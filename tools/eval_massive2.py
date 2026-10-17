@@ -20,6 +20,17 @@ from massive import RESTClient
 
 # ---------- helpers --------------------------------------------------------
 
+def ns_to_age_hours(ns):
+    """Age of a ns/ms epoch timestamp in hours, relative to now. None on failure."""
+    if ns is None:
+        return None
+    try:
+        seconds = ns / 1e9 if ns > 1e15 else ns / 1e3
+        return (datetime.now(timezone.utc).timestamp() - seconds) / 3600.0
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def ns_to_iso(ns):
     """Convert nanosecond epoch timestamp to ISO-8601 UTC. Returns None on failure."""
     if ns is None:
@@ -94,6 +105,21 @@ def format_row(c) -> str:
     if midpoint is None and bid and ask:
         midpoint = (bid + ask) / 2
 
+    # Last trade, and how old it is. A last print is a historical fact, not a
+    # current price: it can be days stale while the quote beside it is live.
+    t = getattr(c, "last_trade", None)
+    last = getattr(t, "price", None) if t else None
+    last_age = ns_to_age_hours(getattr(t, "sip_timestamp", None) or
+                               getattr(t, "timestamp", None)) if t else None
+
+    # Flag a last print that is not near the current market. Outside the spread
+    # is normal by a tick; multiples away from it means the print is not a
+    # current valuation of this contract.
+    flag = ""
+    if last is not None and bid is not None and ask is not None and bid > 0 and ask > 0:
+        if last > ask * 2 or (last < bid / 2 and last > 0):
+            flag = "  <-- LAST far outside the market"
+
     def fmt(v, width, decimals):
         if v is None:
             return "—".rjust(width)
@@ -105,11 +131,14 @@ def format_row(c) -> str:
         f"{fmt(bid, 8, 2)} "
         f"{fmt(ask, 8, 2)} "
         f"{fmt(midpoint, 8, 2)} "
+        f"{fmt(last, 8, 2)} "
+        f"{fmt(last_age, 7, 1)} "
         f"{fmt(iv, 8, 4)} "
         f"{fmt(delta, 9, 4)} "
         f"{fmt(gamma, 8, 4)} "
         f"{fmt(theta, 9, 4)} "
         f"{fmt(vega, 8, 4)}"
+        f"{flag}"
     )
 
 
@@ -153,6 +182,25 @@ def summarize(contracts):
         print(f"  oldest quote              : {ns_to_iso(min(quote_ts))}")
     else:
         print(f"  no quote timestamps found in any contract")
+
+    # Trade freshness, separately. A quote and a trade in the same record can be
+    # days apart: the quote is refreshed by market makers, the last print is
+    # whenever someone last traded this contract. Conflating them is how a stale
+    # print gets shown as a current price.
+    trade_ts = []
+    for c in contracts:
+        t = getattr(c, "last_trade", None)
+        if t is not None:
+            ts = getattr(t, "sip_timestamp", None) or getattr(t, "timestamp", None)
+            if ts is not None:
+                trade_ts.append(ts)
+    if trade_ts:
+        print(f"  newest last_trade         : {ns_to_iso(max(trade_ts))}")
+        print(f"  oldest last_trade         : {ns_to_iso(min(trade_ts))}")
+        stale = sum(1 for t in trade_ts if (ns_to_age_hours(t) or 0) > 24)
+        print(f"  last_trade older than 24h : {stale}/{len(trade_ts)}")
+    else:
+        print(f"  no trade timestamps found in any contract")
 
     # If snapshot has its own updated_at / day field, show it
     sample = contracts[0]
@@ -211,9 +259,11 @@ def main():
             print()
 
     print(
-        "T   Strike      Bid      Ask      Mid       IV     Delta    Gamma     Theta     Vega"
+        "T   Strike      Bid      Ask      Mid     Last  LastAge"
+        "       IV     Delta    Gamma     Theta     Vega"
     )
-    print("-" * 88)
+    print("     (LastAge is hours since the last print; a market-hours chain should be < 1)")
+    print("-" * 104)
     for c in contracts:
         print(format_row(c))
 
