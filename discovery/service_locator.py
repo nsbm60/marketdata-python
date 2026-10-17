@@ -11,7 +11,7 @@ from typing import Callable
 
 import zmq
 
-from topic_builder import TopicBuilder
+from greeks.topic_builder import TopicBuilder
 
 log = logging.getLogger(__name__)
 

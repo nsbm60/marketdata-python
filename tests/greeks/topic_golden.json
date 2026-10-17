@@ -1,0 +1,128 @@
+[
+  {
+    "underlying": "NVDA",
+    "expiry": "2025-01-03",
+    "side": "C",
+    "strike": "177.50",
+    "quote": "md.option.quote.NVDA.2025-01-03.C.177_50",
+    "trade": "md.option.trade.NVDA.2025-01-03.C.177_50",
+    "greeks": "md.option.greeks.NVDA.2025-01-03.C.177_50"
+  },
+  {
+    "underlying": "NVDA",
+    "expiry": "2025-01-03",
+    "side": "P",
+    "strike": "177.05",
+    "quote": "md.option.quote.NVDA.2025-01-03.P.177_05",
+    "trade": "md.option.trade.NVDA.2025-01-03.P.177_05",
+    "greeks": "md.option.greeks.NVDA.2025-01-03.P.177_05"
+  },
+  {
+    "underlying": "spx",
+    "expiry": "2025-12-19",
+    "side": "C",
+    "strike": "5000.00",
+    "quote": "md.option.quote.SPX.2025-12-19.C.5000_00",
+    "trade": "md.option.trade.SPX.2025-12-19.C.5000_00",
+    "greeks": "md.option.greeks.SPX.2025-12-19.C.5000_00"
+  },
+  {
+    "underlying": "SPXW",
+    "expiry": "2026-06-19",
+    "side": "P",
+    "strike": "4250.50",
+    "quote": "md.option.quote.SPXW.2026-06-19.P.4250_50",
+    "trade": "md.option.trade.SPXW.2026-06-19.P.4250_50",
+    "greeks": "md.option.greeks.SPXW.2026-06-19.P.4250_50"
+  },
+  {
+    "underlying": "AAPL",
+    "expiry": "2027-01-15",
+    "side": "C",
+    "strike": "5.00",
+    "quote": "md.option.quote.AAPL.2027-01-15.C.5_00",
+    "trade": "md.option.trade.AAPL.2027-01-15.C.5_00",
+    "greeks": "md.option.greeks.AAPL.2027-01-15.C.5_00"
+  },
+  {
+    "underlying": "AAPL",
+    "expiry": "2026-01-16",
+    "side": "P",
+    "strike": "2.50",
+    "quote": "md.option.quote.AAPL.2026-01-16.P.2_50",
+    "trade": "md.option.trade.AAPL.2026-01-16.P.2_50",
+    "greeks": "md.option.greeks.AAPL.2026-01-16.P.2_50"
+  },
+  {
+    "underlying": "VIX",
+    "expiry": "2027-01-20",
+    "side": "C",
+    "strike": "17.05",
+    "quote": "md.option.quote.VIX.2027-01-20.C.17_05",
+    "trade": "md.option.trade.VIX.2027-01-20.C.17_05",
+    "greeks": "md.option.greeks.VIX.2027-01-20.C.17_05"
+  },
+  {
+    "underlying": "SPY",
+    "expiry": "2025-03-21",
+    "side": "P",
+    "strike": "600.00",
+    "quote": "md.option.quote.SPY.2025-03-21.P.600_00",
+    "trade": "md.option.trade.SPY.2025-03-21.P.600_00",
+    "greeks": "md.option.greeks.SPY.2025-03-21.P.600_00"
+  },
+  {
+    "underlying": "TSLA",
+    "expiry": "2025-07-18",
+    "side": "C",
+    "strike": "999.99",
+    "quote": "md.option.quote.TSLA.2025-07-18.C.999_99",
+    "trade": "md.option.trade.TSLA.2025-07-18.C.999_99",
+    "greeks": "md.option.greeks.TSLA.2025-07-18.C.999_99"
+  },
+  {
+    "underlying": "NVDA",
+    "expiry": "2025-01-03",
+    "side": "C",
+    "strike": "0.50",
+    "quote": "md.option.quote.NVDA.2025-01-03.C.0_50",
+    "trade": "md.option.trade.NVDA.2025-01-03.C.0_50",
+    "greeks": "md.option.greeks.NVDA.2025-01-03.C.0_50"
+  },
+  {
+    "underlying": "NVDA",
+    "expiry": "2025-01-03",
+    "side": "P",
+    "strike": "177.005",
+    "quote": "md.option.quote.NVDA.2025-01-03.P.177_01",
+    "trade": "md.option.trade.NVDA.2025-01-03.P.177_01",
+    "greeks": "md.option.greeks.NVDA.2025-01-03.P.177_01"
+  },
+  {
+    "underlying": "NVDA",
+    "expiry": "2025-01-03",
+    "side": "P",
+    "strike": "177.004",
+    "quote": "md.option.quote.NVDA.2025-01-03.P.177_00",
+    "trade": "md.option.trade.NVDA.2025-01-03.P.177_00",
+    "greeks": "md.option.greeks.NVDA.2025-01-03.P.177_00"
+  },
+  {
+    "underlying": "F",
+    "expiry": "2026-01-16",
+    "side": "C",
+    "strike": "2.125",
+    "quote": "md.option.quote.F.2026-01-16.C.2_13",
+    "trade": "md.option.trade.F.2026-01-16.C.2_13",
+    "greeks": "md.option.greeks.F.2026-01-16.C.2_13"
+  },
+  {
+    "underlying": "SPX",
+    "expiry": "2026-12-18",
+    "side": "C",
+    "strike": "6000.00",
+    "quote": "md.option.quote.SPX.2026-12-18.C.6000_00",
+    "trade": "md.option.trade.SPX.2026-12-18.C.6000_00",
+    "greeks": "md.option.greeks.SPX.2026-12-18.C.6000_00"
+  }
+]

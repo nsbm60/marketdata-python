@@ -83,7 +83,6 @@ ignore_missing_imports = true
 module = [
   "discovery",
   "discovery.*",
-  "topic_builder",
 ]
 ignore_errors = true
 
