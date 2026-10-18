@@ -122,8 +122,8 @@ try:
 except ValueError:
     sys.exit(f"[Optimizer] Fatal: {ENV_SELECTION_COUNT}='{os.environ[ENV_SELECTION_COUNT]}' is not a valid integer.")
 
-# Ports matching SystemConfig.OptimizerSettings
-PUB_PORT = 6050
+# Control port matching SystemConfig.OptimizerSettings. No pub port: the service
+# connects its PUB out to the bus (resolved in run()).
 ROUTER_PORT = 6051
 
 # ─────────────────────────────────────────────────────────────
@@ -338,7 +338,6 @@ def main():
 
     service = Service(
         name=ServiceLocator.OPTIMIZER,
-        pub_port=PUB_PORT,
         router_port=ROUTER_PORT,
     )
     service.register_handler(OP_OPTIMIZE, handle_optimize)

@@ -8,7 +8,7 @@ heartbeats the same way, wraps responses the same way.
 Usage:
     from service import Service
 
-    service = Service(name="optimizer", pub_port=6050, router_port=6051)
+    service = Service(name="optimizer", router_port=6051)
     service.register_handler("optimize", my_handler)
     service.run()
 """
@@ -36,7 +36,6 @@ class Service:
     def __init__(
         self,
         name: str,
-        pub_port: int,
         router_port: int,
         host: str | None = None,
         discovery_address: str = "255.255.255.255",
@@ -47,7 +46,6 @@ class Service:
         self_ping_max_missed: int = SELF_PING_MAX_MISSED,
     ):
         self._name = name
-        self._pub_port = pub_port
         self._router_port = router_port
         self._host = host or get_local_ipv4()
         self._discovery_address = discovery_address
@@ -89,16 +87,19 @@ class Service:
             raise RuntimeError(f"Service '{self._name}' is already running")
         self._running = True
 
-        log.info("[%s] Starting service (host=%s, pub=%d, router=%d)",
-                 self._name, self._host, self._pub_port, self._router_port)
+        log.info("[%s] Starting service (host=%s, router=%d)",
+                 self._name, self._host, self._router_port)
 
-        # Bind sockets
+        # Resolve the pub/sub bus before creating any socket; the PUB connects out to it.
+        from discovery.service_locator import locate_bus
+        bus = locate_bus()
+
         self._context = zmq.Context()
 
         self._pub_socket = self._context.socket(zmq.PUB)
         self._pub_socket.setsockopt(zmq.LINGER, 0)
-        self._pub_socket.bind(f"tcp://*:{self._pub_port}")
-        log.info("[%s] PUB socket bound to tcp://*:%d", self._name, self._pub_port)
+        self._pub_socket.connect(bus.xsub)
+        log.info("[%s] PUB socket connected to bus XSUB %s", self._name, bus.xsub)
 
         self._router.bind(self._context)
 
@@ -106,7 +107,7 @@ class Service:
         self._advertiser = Advertiser(
             service_name=self._name,
             host=self._host,
-            pub_port=self._pub_port,
+            pub_sub=bus.xpub,
             router_port=self._router_port,
             interval_sec=self._discovery_interval_sec,
             broadcast_address=self._discovery_address,

@@ -79,6 +79,9 @@ import zmq
 from dotenv import load_dotenv
 
 from discovery import ServiceLocator
+from discovery.service_locator import locate_bus
+from service.advertiser import Advertiser
+from service.network import get_local_ipv4
 from ml.shared.config import load_prediction_config, PredictionWindowConfig, fetch_symbol_list
 
 load_dotenv()
@@ -97,8 +100,8 @@ log = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
 
 SERVICE_NAME   = "mlScorer"
-PUB_PORT       = 6040   # Prediction PUB socket (6010/6011 used by IB service)
-ROUTER_PORT    = 6041   # Control router (reserved)
+# No PUB/ROUTER ports: predictions go out on the bus (the PUB connects to the bus
+# XSUB, resolved at startup); the scorer binds no router.
 DISCOVERY_PORT = 6001   # UDP broadcast port (matches SystemConfig.discovery.udpPort)
 BROADCAST_ADDR = "255.255.255.255"
 ADVERTISE_INTERVAL = 5  # seconds
@@ -236,79 +239,6 @@ class BarStore:
         """Return count of bars for a symbol."""
         with self._lock:
             return len(self._bars[symbol])
-
-
-# ---------------------------------------------------------------------------
-# Service Advertiser (Python UDP broadcast)
-# ---------------------------------------------------------------------------
-
-class ServiceAdvertiser:
-    """
-    Broadcasts UDP packets to advertise this service on the discovery bus.
-    Mirrors the Scala ServiceAdvertiser behavior.
-    """
-
-    def __init__(self, service_name: str, pub_port: int, router_port: int,
-                 interval: int = ADVERTISE_INTERVAL):
-        self._service_name = service_name
-        self._pub_port     = pub_port
-        self._router_port  = router_port
-        self._interval     = interval
-        self._running      = False
-        self._thread: Optional[threading.Thread] = None
-        self._host         = self._get_local_ip()
-
-    @staticmethod
-    def _get_local_ip() -> str:
-        """Get the local IPv4 address (same logic as Scala NetworkUtils)."""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
-    def _build_payload(self) -> bytes:
-        payload = {
-            "service": self._service_name,
-            "host":    self._host,
-            "pubSub":  f"tcp://{self._host}:{self._pub_port}",
-            "router":  f"tcp://{self._host}:{self._router_port}",
-            # Also include port for Python ServiceLocator compatibility
-            "port":    self._pub_port,
-        }
-        return json.dumps(payload).encode("utf-8")
-
-    def _run(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        consecutive_failures = 0
-        while self._running:
-            try:
-                sock.sendto(self._build_payload(),
-                            (BROADCAST_ADDR, DISCOVERY_PORT))
-                consecutive_failures = 0
-            except Exception as e:
-                consecutive_failures += 1
-                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
-                    log.warning(f"[ServiceAdvertiser] Broadcast failed "
-                                f"(count={consecutive_failures}): {e}")
-            time.sleep(self._interval)
-        sock.close()
-
-    def start(self):
-        self._running = True
-        self._thread  = threading.Thread(target=self._run, daemon=True,
-                                          name="ServiceAdvertiser")
-        self._thread.start()
-        log.info(f"[ServiceAdvertiser] Broadcasting {self._service_name} "
-                 f"at {self._host} pubSub={self._pub_port} router={self._router_port}")
-
-    def stop(self):
-        self._running = False
-
 
 # ---------------------------------------------------------------------------
 # Historical feature computation
@@ -676,7 +606,8 @@ class SessionScorer:
         self._context:  Optional[zmq.Context] = None
         self._sub:      Optional[zmq.Socket]  = None  # subscribe to market data
         self._pub:      Optional[zmq.Socket]  = None  # publish predictions
-        self._advertiser: Optional[ServiceAdvertiser] = None
+        self._advertiser: Optional[Advertiser] = None
+        self._bus = None  # BusEndpoints, resolved in start()
 
         # ClickHouse client (lazy-initialized)
         self._ch_client = None
@@ -1000,8 +931,8 @@ class SessionScorer:
         # PUB socket -- publish predictions
         if not self.dry_run:
             self._pub = self._context.socket(zmq.PUB)
-            self._pub.bind(f"tcp://*:{PUB_PORT}")
-            log.info(f"Prediction PUB socket bound on port {PUB_PORT}")
+            self._pub.connect(self._bus.xsub)
+            log.info(f"Prediction PUB socket connected to bus XSUB {self._bus.xsub}")
 
     def _publish_prediction(self, symbol: str, prediction: dict):
         topic   = f"{PREDICTION_TOPIC_PREFIX}{symbol}"
@@ -1187,10 +1118,11 @@ class SessionScorer:
         md_endpoint = ServiceLocator.wait_for_service(
             ServiceLocator.MARKET_DATA, timeout_sec=60
         )
-        market_data_url = md_endpoint.pubSub if hasattr(md_endpoint, 'pubSub') \
-                          else f"tcp://{md_endpoint.host}:6006"
-        router_url = md_endpoint.router if hasattr(md_endpoint, 'router') \
-                     else f"tcp://{md_endpoint.host}:6007"
+        market_data_url = md_endpoint.pub_sub
+        router_url = md_endpoint.router
+
+        # Resolve the pub/sub bus; the prediction PUB connects out to it (used in _setup_zmq).
+        self._bus = locate_bus()
 
         # Fetch symbol list from MDS
         log.info("Fetching trading universe from MDS...")
@@ -1229,11 +1161,13 @@ class SessionScorer:
 
         self._setup_zmq(market_data_url)
 
-        # Start service advertiser
-        self._advertiser = ServiceAdvertiser(
+        # Start service advertiser: advertise the bus XPUB as our pubSub; no router
+        # (the scorer binds none).
+        self._advertiser = Advertiser(
             service_name = SERVICE_NAME,
-            pub_port     = PUB_PORT,
-            router_port  = ROUTER_PORT,
+            host         = get_local_ipv4(),
+            pub_sub      = self._bus.xpub,
+            router_port  = None,
         )
         self._advertiser.start()
 

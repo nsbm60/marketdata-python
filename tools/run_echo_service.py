@@ -32,7 +32,6 @@ def fail_handler(payload: dict) -> dict:
 def main():
     service = Service(
         name="echo_test",
-        pub_port=6090,
         router_port=6091,
     )
     service.register_handler("echo", echo_handler)

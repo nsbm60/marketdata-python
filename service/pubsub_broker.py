@@ -175,7 +175,7 @@ def main() -> int:
     advertiser = Advertiser(
         service_name=PUBSUB_SERVICE_NAME,
         host=host,
-        pub_port=XPUB_TCP_PORT,                    # pubSub = XPUB (honest subscribe endpoint)
+        pub_sub=f"tcp://{host}:{XPUB_TCP_PORT}",   # pubSub = XPUB (honest subscribe endpoint)
         router_port=None,                          # no control plane — no router field
         xsub=f"tcp://{host}:{XSUB_TCP_PORT}",      # producers connect in (explicit)
         xpub=f"tcp://{host}:{XPUB_TCP_PORT}",      # subscribers connect out (explicit)

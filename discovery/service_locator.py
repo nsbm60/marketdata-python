@@ -242,3 +242,47 @@ class ServiceLocator:
             )
         except TimeoutError:
             return None
+
+
+@dataclass(frozen=True)
+class BusEndpoints:
+    """The pub/sub bus's two data-plane endpoints (it has no control plane)."""
+    xsub: str   # producers connect in
+    xpub: str   # subscribers connect out
+
+
+def locate_bus(discovery_url: str = None) -> BusEndpoints:
+    """Resolve the pub/sub bus and return its XSUB/XPUB endpoints.
+
+    The bus branch of the future ServiceLocator facade. Sits directly on
+    DiscoverySubscriber (which already decodes xsub/xpub) — not the generalist
+    wait_for_service, whose result is the lowest-common-denominator ServiceEndpoint.
+    Blocks while the bus is absent (not a failure); raises on an announcement with
+    an empty xsub or xpub rather than waiting for a better one.
+    """
+    result: dict[str, ServiceEndpoint] = {}
+    lock = threading.Lock()
+
+    def on_discovered(endpoint: ServiceEndpoint) -> None:
+        with lock:
+            result.setdefault("ep", endpoint)
+
+    sub = DiscoverySubscriber(
+        service_name=ServiceLocator.PUBSUB_BUS,
+        discovery_url=discovery_url,
+        on_discovered=on_discovered,
+    )
+    sub.start()
+    log.info("Waiting for pub/sub bus discovery...")
+    try:
+        while True:
+            with lock:
+                ep = result.get("ep")
+            if ep is not None:
+                if not ep.xsub or not ep.xpub:
+                    raise RuntimeError(f"pubsubbus announcement missing xsub/xpub: {ep}")
+                log.info("Discovered pub/sub bus: xsub=%s xpub=%s", ep.xsub, ep.xpub)
+                return BusEndpoints(xsub=ep.xsub, xpub=ep.xpub)
+            time.sleep(0.25)
+    finally:
+        sub.stop()

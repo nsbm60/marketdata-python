@@ -33,7 +33,7 @@ class Advertiser:
         self,
         service_name: str,
         host: str,
-        pub_port: int,
+        pub_sub: str,
         router_port: int | None = None,
         interval_sec: int = DISCOVERY_INTERVAL_SEC,
         broadcast_address: str = DISCOVERY_BROADCAST_ADDRESS,
@@ -43,7 +43,6 @@ class Advertiser:
     ):
         self._service_name = service_name
         self._host = host
-        self._pub_port = pub_port
         self._router_port = router_port
         self._interval_sec = interval_sec
         self._broadcast_address = broadcast_address
@@ -57,7 +56,7 @@ class Advertiser:
         fields: dict[str, str] = {
             DISC_SERVICE_FIELD: service_name,
             DISC_HOST_FIELD: host,
-            DISC_PUBSUB_FIELD: f"tcp://{host}:{pub_port}",
+            DISC_PUBSUB_FIELD: pub_sub,
         }
         if router_port is not None:
             fields[DISC_ROUTER_FIELD] = f"tcp://{host}:{router_port}"

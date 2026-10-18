@@ -173,8 +173,8 @@ ERR_INFEASIBLE = ("Constraints could not be simultaneously satisfied; see "
 ERR_TIMEOUT = ("Solver exceeded the time budget; the solution may not be optimal "
                "(best feasible solution returned if one was found).")
 
-# Ports matching SystemConfig.OptimizerSettings (same as the shell)
-PUB_PORT = 6050
+# Control port matching SystemConfig.OptimizerSettings (same as the shell).
+# No pub port: the service connects its PUB out to the bus (resolved in run()).
 ROUTER_PORT = 6051
 
 
@@ -606,7 +606,6 @@ def main():
 
     service = Service(
         name=ServiceLocator.OPTIMIZER,
-        pub_port=PUB_PORT,
         router_port=ROUTER_PORT,
     )
     service.register_handler(OP_OPTIMIZE, handle_optimize)
