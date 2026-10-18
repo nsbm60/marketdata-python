@@ -1,0 +1,42 @@
+[Unit]
+Description=Pub/Sub bus broker — stateless XSUB<->XPUB proxy (critical infra)
+# Critical-infra tier: the market-data bus. Stateless, so a restart is instant
+# and lossless — producers and subscribers reconnect on their own.
+# No ordering toward the discovery-router: the broker only ADVERTISES (UDP
+# broadcast, retried on its own interval) and never RESOLVES a discovered
+# service, so the router can be down at boot and any boot order converges.
+# Only the network is a genuine start-ordering prerequisite.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mdapps
+Group=mdapps
+# Shared services tree (see deploy/SERVICES.md). WorkingDirectory puts the app on
+# sys.path so the top-level service/ and discovery/ packages (not pip-installed)
+# resolve; deps resolve via the venv.
+WorkingDirectory=/opt/marketdata-python/app
+# Optional (leading '-'): the broker needs no secrets. Present for per-service
+# overrides like DISCOVERY_ADVERTISE_HOST or PUBSUB_IPC_DIR.
+EnvironmentFile=-/etc/marketdata-python/pubsub-broker.env
+# PYTHONUNBUFFERED=1 so logs land in journald live. systemd Environment= takes
+# no trailing comment — a '# ...' after the value parses as more assignments.
+Environment=PYTHONUNBUFFERED=1
+# RuntimeDirectory creates /run/md-pubsub owned by mdapps for the ipc:// sockets;
+# it is removed on stop, so stale socket files never accumulate.
+RuntimeDirectory=md-pubsub
+RuntimeDirectoryMode=0750
+ExecStart=/opt/marketdata-python/venv/bin/python -m service.pubsub_broker
+# Always-on infra: restart promptly on any exit, forever.
+Restart=always
+RestartSec=2
+# The broker forwards frames indefinitely; no startup deadline.
+TimeoutStartSec=infinity
+
+[Install]
+# Start on boot once enabled. setup-drogon-services.sh installs this unit but does
+# NOT enable it — enable explicitly:  systemctl enable --now pubsub-broker
+WantedBy=multi-user.target
+
+# Watch: journalctl -u pubsub-broker -f
