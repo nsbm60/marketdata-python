@@ -33,6 +33,10 @@ class ServiceEndpoint:
     port: int
     pub_sub: str = ""
     router: str = ""
+    # Pub/sub bus endpoints (additive; empty for every other service). The bus
+    # advertises these explicitly instead of overloading `router` to carry XSUB.
+    xsub: str = ""
+    xpub: str = ""
 
 
 class DiscoverySubscriber:
@@ -102,6 +106,8 @@ class DiscoverySubscriber:
             host    = data.get("host", "")
             pub_sub = data.get("pubSub", "")
             router  = data.get("router", "")
+            xsub    = data.get("xsub", "")
+            xpub    = data.get("xpub", "")
             port    = data.get("port", 0)
 
             if not port and pub_sub:
@@ -124,6 +130,8 @@ class DiscoverySubscriber:
                 port    = port,
                 pub_sub = pub_sub,
                 router  = router,
+                xsub    = xsub,
+                xpub    = xpub,
             )
 
             if self.on_discovered:

@@ -16,12 +16,15 @@ The XPUB side carries a high-water mark so a slow subscriber drops stale frames
 rather than growing the broker's heap — for market data, dropping under load is
 the correct behaviour (ZMQ_XPUB_NODROP is left off, so the drop is silent).
 
-Advertised through the existing UDP discovery path (``service.advertiser``) as
-one logical service. That schema has only ``pubSub`` and ``router`` fields, so:
-  pubSub → XPUB tcp endpoint (subscribers connect out)
-  router → XSUB tcp endpoint (producers connect in)
-The ipc endpoints are a drogon-local convention (fixed paths below), not carried
-in discovery — a remote peer cannot use ipc, and a local peer imports the path.
+Advertised through the existing UDP discovery path (``service.advertiser``) as one
+logical service with EXPLICIT endpoint fields:
+  pubSub → XPUB tcp endpoint (subscribers connect out — the honest pub/sub endpoint)
+  xpub   → XPUB tcp endpoint (same, named for the bus)
+  xsub   → XSUB tcp endpoint (producers connect in)
+The bus has no control plane, so it advertises NO ``router`` — `router` is never
+overloaded to carry XSUB. The ipc endpoints are a drogon-local convention (fixed
+paths below), not carried in discovery — a remote peer cannot use ipc, and a local
+peer imports the path.
 """
 
 from __future__ import annotations
@@ -172,16 +175,18 @@ def main() -> int:
     advertiser = Advertiser(
         service_name=PUBSUB_SERVICE_NAME,
         host=host,
-        pub_port=XPUB_TCP_PORT,     # subscribers connect out  → advertised as pubSub
-        router_port=XSUB_TCP_PORT,  # producers connect in     → advertised as router
+        pub_port=XPUB_TCP_PORT,                    # pubSub = XPUB (honest subscribe endpoint)
+        router_port=None,                          # no control plane — no router field
+        xsub=f"tcp://{host}:{XSUB_TCP_PORT}",      # producers connect in (explicit)
+        xpub=f"tcp://{host}:{XPUB_TCP_PORT}",      # subscribers connect out (explicit)
     )
     advertiser.start()
 
     log.info(
         "pubsub broker up | XSUB(in)=%s | XPUB(out)=%s | hwm=%d | "
-        "advertised '%s' host=%s pubSub=tcp:%d(XPUB) router=tcp:%d(XSUB)",
+        "advertised '%s' host=%s xsub=tcp:%d xpub=tcp:%d (no router)",
         endpoints.xsub, endpoints.xpub, XPUB_SEND_HWM,
-        PUBSUB_SERVICE_NAME, host, XPUB_TCP_PORT, XSUB_TCP_PORT,
+        PUBSUB_SERVICE_NAME, host, XSUB_TCP_PORT, XPUB_TCP_PORT,
     )
     try:
         broker.run()  # blocks in zmq.proxy_steerable until TERMINATE / signal

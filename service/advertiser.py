@@ -19,6 +19,8 @@ from service.constants import (
     DISC_HOST_FIELD,
     DISC_PUBSUB_FIELD,
     DISC_ROUTER_FIELD,
+    DISC_XSUB_FIELD,
+    DISC_XPUB_FIELD,
 )
 
 log = logging.getLogger(__name__)
@@ -32,10 +34,12 @@ class Advertiser:
         service_name: str,
         host: str,
         pub_port: int,
-        router_port: int,
+        router_port: int | None = None,
         interval_sec: int = DISCOVERY_INTERVAL_SEC,
         broadcast_address: str = DISCOVERY_BROADCAST_ADDRESS,
         broadcast_port: int = DISCOVERY_PORT,
+        xsub: str | None = None,
+        xpub: str | None = None,
     ):
         self._service_name = service_name
         self._host = host
@@ -47,12 +51,21 @@ class Advertiser:
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
 
-        self._payload = json.dumps({
+        # router is included only when the service has a control plane. The pub/sub
+        # bus has none — it passes router_port=None and advertises xsub/xpub instead,
+        # so `router` never carries an XSUB endpoint (no field overload).
+        fields: dict[str, str] = {
             DISC_SERVICE_FIELD: service_name,
             DISC_HOST_FIELD: host,
             DISC_PUBSUB_FIELD: f"tcp://{host}:{pub_port}",
-            DISC_ROUTER_FIELD: f"tcp://{host}:{router_port}",
-        }).encode("utf-8")
+        }
+        if router_port is not None:
+            fields[DISC_ROUTER_FIELD] = f"tcp://{host}:{router_port}"
+        if xsub is not None:
+            fields[DISC_XSUB_FIELD] = xsub
+        if xpub is not None:
+            fields[DISC_XPUB_FIELD] = xpub
+        self._payload = json.dumps(fields).encode("utf-8")
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self._service_name}-discovery")

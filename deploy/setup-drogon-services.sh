@@ -59,14 +59,18 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q --upgrade pip
 
-# 4. FIRST code install from this checkout (tests INCLUDED — on-host certification
-#    runs them), then editable install with dev extras so deps + pytest/mypy land in
-#    the venv. Same mirror-with-guards rule as deploy-services.sh.
-rsync -a --delete \
-  --exclude '.git/' --exclude 'venv/' --exclude 'data/' \
-  --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.db' \
-  "${REPO_ROOT}/" "${APP_DIR}/"
+# 4. the app tree is a GIT CHECKOUT (run-from-development-checkout model, like the
+#    Scala services): clone it if absent, so ongoing updates are `git pull` via
+#    deploy-services.sh — never rsync. Cloned from the same origin as the checkout this
+#    script is run from. (If mdapps/root cannot reach that origin, pre-clone the repo
+#    into ${APP_DIR} by hand and re-run — this step then no-ops.)
+if [[ ! -d "${APP_DIR}/.git" ]]; then
+  ORIGIN_URL="$(git -C "${REPO_ROOT}" remote get-url origin)"
+  git clone "${ORIGIN_URL}" "${APP_DIR}"
+fi
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+# editable install with dev extras so deps + pytest/mypy land in the venv (the on-host
+# certification below runs the suite against the pinned 3.14).
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q -e "${APP_DIR}[dev]"
 
 # 5. per-service config files — TEMPLATE ONLY (never real keys), 0600, mdapps-readable.
@@ -98,9 +102,18 @@ done
 
 cat <<NEXT
 >>> Certification PASSED on $(hostname) (python $(${VENV}/bin/python -c 'import sys; print(sys.version.split()[0])')).
->>> Setup complete. Nothing was started. Next:
-      1) fill in any ${CONFIG_DIR}/<service>.env that was templated (the broker needs none)
-      2) (ongoing updates) ./deploy/deploy-services.sh from a dev checkout
-      3) enable a service on boot + start it now, e.g.:
-           systemctl enable --now pubsub-broker     (watch: journalctl -u pubsub-broker -f)
+>>> Setup complete. Nothing was started.
+
+Next steps — each command is on its own line, copy-paste as a single line:
+
+  1) If any service env was templated above, fill it in (the broker needs none).
+
+  2) Enable the broker on boot and start it now:
+     systemctl enable --now pubsub-broker
+
+  3) Watch it:
+     journalctl -u pubsub-broker -f
+
+  Ongoing updates run ON drogon from the checkout:
+     sudo ${APP_DIR}/deploy/deploy-services.sh --restart pubsub-broker
 NEXT

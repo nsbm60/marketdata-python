@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
-# Deploy the Python services tree to drogon. Run from a dev checkout.
+# Update the drogon Python services IN PLACE. Run ON drogon, as root:
+#   sudo /opt/marketdata-python/app/deploy/deploy-services.sh --restart pubsub-broker
 #
-# Ships the repo to /opt/marketdata-python/app via rsync --delete (an exact mirror),
-# reinstalls the package into the shared venv (outside that tree), and reloads unit
-# definitions. All services share this one tree + venv (see deploy/SERVICES.md).
+# The app tree is a git checkout (run-from-development-checkout model, like the Scala
+# services) — update = `git pull` + reinstall into the shared venv + restart. No rsync,
+# no "from a dev checkout". All services share this one tree + venv (see SERVICES.md).
 #
-# Restarting onto the new code is opt-in and per-service, because a ship should not
-# silently bounce a running service:
-#   ./deploy/deploy-services.sh                          # ship + reload only
-#   ./deploy/deploy-services.sh --restart pubsub-broker  # ...and restart these
-#   ./deploy/deploy-services.sh --restart-all            # ...and restart all managed
+# Restarting onto the new code is opt-in and per-service — a ship should not silently
+# bounce a running service:
+#   sudo ./deploy-services.sh                          # pull + reinstall + refresh units
+#   sudo ./deploy-services.sh --restart pubsub-broker  # ...and restart these
+#   sudo ./deploy-services.sh --restart-all            # ...and restart all managed
 # The broker is stateless (restart is instant + lossless); restart stateful services
 # deliberately.
 set -euo pipefail
 
-HOST="${MARKETDATA_HOST:-drogon}"
 APP_DIR=/opt/marketdata-python/app
 VENV=/opt/marketdata-python/venv
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SERVICE_USER=mdapps
 
-# Keep in sync with setup-drogon-services.sh (used to validate --restart names and
-# to expand --restart-all).
+# Keep in sync with setup-drogon-services.sh (validates --restart names, expands --restart-all).
 SERVICES=(pubsub-broker)
 
 RESTART=()
@@ -32,43 +31,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Validate restart targets are services we manage (a typo must not silently no-op).
 for svc in "${RESTART[@]}"; do
   if ! printf '%s\n' "${SERVICES[@]}" | grep -qx "${svc}"; then
     echo "not a managed service: ${svc} (known: ${SERVICES[*]})" >&2; exit 2
   fi
 done
 
-echo "Deploying ${REPO_ROOT} -> ${HOST}:${APP_DIR}"
-echo "Restart after ship: ${RESTART[*]:-(none)}"
+[[ $EUID -eq 0 ]] || { echo "run as root (sudo) — reinstalls units and restarts services"; exit 1; }
+[[ -d "${APP_DIR}/.git" ]] || { echo "${APP_DIR} is not a git checkout — run setup-drogon-services.sh first"; exit 1; }
 
-# --delete keeps APP_DIR an exact mirror. Everything mutable lives OUTSIDE APP_DIR and
-# is untouchable: the venv, /etc/marketdata-python/*.env, .git. tests/ IS shipped (the
-# on-host checks run against the pinned 3.14).
-rsync -az --delete \
-  --exclude '.git/' \
-  --exclude 'venv/' \
-  --exclude 'data/' \
-  --exclude '__pycache__/' \
-  --exclude '*.pyc' \
-  --exclude '*.db' \
-  "${REPO_ROOT}/" "${HOST}:${APP_DIR}/"
+# Pull the checkout as its owner (fast-forward only: fail loudly if it has diverged
+# rather than create a merge commit on a deployed box).
+sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" pull --ff-only
 
-RESTART_LIST="${RESTART[*]:-}"
-ssh "${HOST}" bash -s <<REMOTE
-set -euo pipefail
-"${VENV}/bin/pip" install -q -e "${APP_DIR}"
-sudo systemctl daemon-reload
-for svc in ${RESTART_LIST}; do
-  echo "restarting \${svc}"
-  sudo systemctl restart "\${svc}"
+# Reinstall (editable) so a dependency change is picked up.
+sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q -e "${APP_DIR}"
+
+# Refresh every managed unit from the checkout (a pull may have changed a .service
+# file; the installed copy under /etc is not touched by git), then reload definitions.
+for svc in "${SERVICES[@]}"; do
+  install -m 0644 "${APP_DIR}/deploy/${svc}.service" /etc/systemd/system/
 done
-echo "deployed on \$(hostname); python \$(${VENV}/bin/python -c 'import sys; print(sys.version.split()[0])')"
-REMOTE
+systemctl daemon-reload
 
+for svc in "${RESTART[@]}"; do
+  echo "restarting ${svc}"
+  systemctl restart "${svc}"
+done
+
+echo "pulled + reinstalled on $(hostname); python $(${VENV}/bin/python -c 'import sys; print(sys.version.split()[0])')"
 if [[ ${#RESTART[@]} -eq 0 ]]; then
-  echo "Done. Code shipped + units reloaded; no service restarted."
-  echo "Restart onto new code when ready, e.g.: sudo systemctl restart pubsub-broker"
+  echo "No service restarted. Restart onto new code when ready:"
+  echo "  sudo systemctl restart pubsub-broker"
 else
-  echo "Done. Shipped and restarted: ${RESTART[*]}"
+  echo "Restarted: ${RESTART[*]}"
 fi

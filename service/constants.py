@@ -27,6 +27,11 @@ DISC_SERVICE_FIELD = "service"
 DISC_HOST_FIELD = "host"
 DISC_PUBSUB_FIELD = "pubSub"
 DISC_ROUTER_FIELD = "router"
+# Pub/sub bus endpoints (additive). The bus is a two-port XSUB/XPUB proxy with no
+# control plane, so it advertises these EXPLICITLY instead of overloading `router`
+# to carry XSUB. Absent for every other service.
+DISC_XSUB_FIELD = "xsub"   # producers connect in
+DISC_XPUB_FIELD = "xpub"   # subscribers connect out
 
 # Ping/pong JSON (pre-serialized for speed)
 PING_JSON = '{"op":"__ping__"}'
