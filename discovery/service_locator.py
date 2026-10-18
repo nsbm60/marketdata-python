@@ -156,6 +156,7 @@ class ServiceLocator:
     ALPACA_TRADING = "alpaca"
     ML_SCORER      = "mlscorer"
     OPTIMIZER      = "optimizer"
+    PUBSUB_BUS     = "pubsubbus"   # XSUB/XPUB bus broker (service/pubsub_broker.py)
 
     @staticmethod
     def wait_for_service(
