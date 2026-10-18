@@ -59,15 +59,16 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VENV}"
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q --upgrade pip
 
-# 4. the app tree is a GIT CHECKOUT (run-from-development-checkout model, like the
-#    Scala services): clone it if absent, so ongoing updates are `git pull` via
-#    deploy-services.sh — never rsync. Cloned from the same origin as the checkout this
-#    script is run from. (If mdapps/root cannot reach that origin, pre-clone the repo
-#    into ${APP_DIR} by hand and re-run — this step then no-ops.)
-if [[ ! -d "${APP_DIR}/.git" ]]; then
-  ORIGIN_URL="$(git -C "${REPO_ROOT}" remote get-url origin)"
-  git clone "${ORIGIN_URL}" "${APP_DIR}"
-fi
+# 4. the app tree is a FROZEN PLAIN COPY of the checkout — NOT a git repo. A service
+#    must never run from modifiable source, so /opt holds only files (no .git). This
+#    bootstrap lays down the FIRST copy from the checkout this script is run from;
+#    ongoing updates use deploy-services.sh (git pull the checkout, then copy -> /opt).
+#    No clone into /opt, no rsync. The empty APP_DIR was created in step 2.
+tar -C "${REPO_ROOT}" \
+    --exclude='./.git' --exclude='./venv' --exclude='./data' \
+    --exclude='__pycache__' --exclude='.mypy_cache' --exclude='.pytest_cache' \
+    --exclude='./.claude' --exclude='./target' --exclude='*.pyc' \
+    -cf - . | tar -C "${APP_DIR}" -xf -
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
 # editable install with dev extras so deps + pytest/mypy land in the venv (the on-host
 # certification below runs the suite against the pinned 3.14).

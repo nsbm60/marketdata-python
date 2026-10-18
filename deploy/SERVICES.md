@@ -20,7 +20,7 @@ convention is for services only and does not touch it.
 
 | Path | What |
 |------|------|
-| `/opt/marketdata-python/app`  | a **git checkout** of the repo; updated by `git pull` (run-from-development-checkout model, like the Scala services) |
+| `/opt/marketdata-python/app`  | a **frozen plain copy** of the checkout (no `.git`); the service runs from here, never from the repo — updated only by a deliberate `deploy-services.sh` |
 | `/opt/marketdata-python/venv` | the shared venv, built on the pinned `/usr/bin/python3.14`, OUTSIDE the app tree |
 | `/etc/marketdata-python/<service>.env` | per-service config/credentials, `0600`, `mdapps` (optional — the broker needs none) |
 | `/etc/systemd/system/<service>.service` | one unit per service, installed from `app/deploy/<service>.service` |
@@ -32,14 +32,15 @@ as `User=mdapps` (shared with the Scala batch and the archive).
 ## The two scripts (one pair for ALL services)
 
 - **`setup-drogon-services.sh`** — one-time bootstrap, run as root on drogon from a
-  checkout. Creates the user/dirs/venv, clones the repo into `app/` if absent (so it's
-  a git checkout), `pip install -e .[dev]`, installs every managed unit, `daemon-reload`,
+  checkout. Creates the user/dirs/venv, lays down the first plain copy of the checkout into
+  `app/` (no `.git`), `pip install -e .[dev]`, installs every managed unit, `daemon-reload`,
   then **certifies each service**. It does **not** enable or start anything (don't start
   before you look). Idempotent.
-- **`deploy-services.sh`** — ongoing update, run **ON drogon as root**: `git pull` the
-  `app/` checkout (fast-forward only), `pip install -e`, refresh the unit files from the
-  checkout, `daemon-reload`, and optionally restart named services. No rsync, no "from a
-  dev checkout".
+- **`deploy-services.sh`** — ongoing update, run **ON drogon as root, from the home
+  checkout**: you `git pull` the home checkout yourself, then this copies that checkout
+  into `app/` (a plain local copy — no rsync, no `.git` in `/opt`), `pip install -e`,
+  refreshes the unit files, `daemon-reload`, and optionally restarts named services. The
+  service never runs from the repo; `/opt` changes only on a deliberate deploy.
 
 Both carry a `SERVICES=(…)` array. It is the single list of what we manage.
 
@@ -85,12 +86,15 @@ sudo systemctl enable --now pubsub-broker
 # watch it:
 journalctl -u pubsub-broker -f
 
-# ongoing update: pull + reinstall, restart nothing:
-sudo /opt/marketdata-python/app/deploy/deploy-services.sh
+# ongoing update — run from the HOME checkout after pulling it:
+cd ~/marketdata-python && git pull
+
+# copy -> /opt + reinstall, restart nothing:
+sudo ./deploy/deploy-services.sh
 
 # ...and restart the broker (stateless, lossless):
-sudo /opt/marketdata-python/app/deploy/deploy-services.sh --restart pubsub-broker
+sudo ./deploy/deploy-services.sh --restart pubsub-broker
 
 # ...and restart every managed service:
-sudo /opt/marketdata-python/app/deploy/deploy-services.sh --restart-all
+sudo ./deploy/deploy-services.sh --restart-all
 ```
