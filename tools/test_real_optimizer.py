@@ -30,7 +30,7 @@ from collections import defaultdict
 sys.path.insert(0, ".")
 
 from control_client import ControlSocket
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 EXPECTED_SOLVER = "clarabel"  # default backend; override if OPTIMIZER_SOLVER is set
 TOL = 1e-4  # arithmetic-sanity tolerance
@@ -135,7 +135,7 @@ def main():
 
     print("\nDiscovering optimizer service...")
     try:
-        endpoint = ServiceLocator.wait_for_service(ServiceLocator.OPTIMIZER, timeout_sec=15)
+        endpoint = ServiceLocator.control(ControlService.OPTIMIZER, timeout_sec=15)
     except TimeoutError:
         print("FAIL: Optimizer service not discovered within 15s")
         print("Is optimizer.py running?")

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import clickhouse_connect
 
-from discovery import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 # Import SQL constants from score_session
 from ml.scoring.score_session import (
@@ -171,8 +171,8 @@ def main():
     # Connect to ClickHouse via discovery
     print("Discovering ClickHouse...")
     try:
-        ch_endpoint = ServiceLocator.wait_for_service(
-            ServiceLocator.CLICKHOUSE, timeout_sec=30
+        ch_endpoint = ServiceLocator.endpoint(
+            EndpointService.CLICKHOUSE, timeout_sec=30
         )
     except TimeoutError:
         print("FAILED: Could not discover ClickHouse within 30s")

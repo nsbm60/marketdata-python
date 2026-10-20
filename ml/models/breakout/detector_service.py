@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import zmq
 
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 from ml.shared.config import fetch_symbol_list
 from ml.shared.mds_client import (
     get_bars, get_prior_session, parse_pivot_backfill, subscribe_with_backfill,
@@ -107,12 +107,11 @@ class BreakoutDetector:
 
         # Discover MDS
         log.info("Discovering Market Data Service...")
-        md_endpoint = ServiceLocator.wait_for_service(
-            ServiceLocator.MARKET_DATA,
+        market_data_url = ServiceLocator.bus(timeout_sec=60).xpub
+        self._mds_router_url = ServiceLocator.control(
+            ControlService.MARKET_DATA,
             timeout_sec=60,
-        )
-        market_data_url = md_endpoint.pub_sub
-        self._mds_router_url = md_endpoint.router
+        ).router
         log.info(f"MDS found: PUB={market_data_url}, ROUTER={self._mds_router_url}")
 
         # Fetch trading universe

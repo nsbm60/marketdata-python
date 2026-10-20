@@ -21,12 +21,12 @@ import sys
 
 try:
     from control_client import ControlSocket
-    from discovery.service_locator import ServiceLocator
+    from discovery import ControlService, ServiceLocator
 except ModuleNotFoundError:
     import pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
     from control_client import ControlSocket
-    from discovery.service_locator import ServiceLocator
+    from discovery import ControlService, ServiceLocator
 
 # Canonical service name; ServiceLocator (via TopicBuilder.for_service) lowercases it to match
 # the wire topic `service.marketdata`.
@@ -41,7 +41,7 @@ def _underlying(symbol: str) -> str:
 
 def query_option_subscriptions(timeout_sec: int = 15) -> dict:
     """Discover MDS, send the option_subscriptions op over a DEALER, return the parsed reply."""
-    endpoint = ServiceLocator.wait_for_service(SERVICE, timeout_sec=timeout_sec)
+    endpoint = ServiceLocator.control(ControlService.MARKET_DATA, timeout_sec=timeout_sec)
     with ControlSocket(endpoint.router, timeout_ms=5000) as dealer:
         return dealer.request({"op": "option_subscriptions"})
 

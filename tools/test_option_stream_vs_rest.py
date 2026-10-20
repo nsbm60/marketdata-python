@@ -20,7 +20,7 @@ from datetime import datetime
 import requests
 import zmq
 
-from discovery.service_locator import ServiceLocator
+from discovery import ServiceLocator
 
 ALPACA_DATA_URL = "https://data.alpaca.markets/v1beta1"
 MIN_REST_INTERVAL_MS = 100  # throttle: max 1 REST call per 100ms per contract
@@ -113,15 +113,15 @@ def main():
         "APCA-API-SECRET-KEY": api_secret,
     }
 
-    # Find MDS pub/sub endpoint
-    md = ServiceLocator.wait_for_service(ServiceLocator.MARKET_DATA, timeout_sec=10)
-    print(f"MDS pub/sub: {md.pub_sub}")
+    # Find the pub/sub bus endpoint (data plane)
+    bus_xpub = ServiceLocator.bus(timeout_sec=10).xpub
+    print(f"MDS pub/sub: {bus_xpub}")
     print(f"Contracts: {contracts}")
     print(f"Duration: {args.duration}s")
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
-    sock.connect(md.pub_sub)
+    sock.connect(bus_xpub)
     sock.setsockopt(zmq.RCVTIMEO, 1000)
 
     for osi in contracts:

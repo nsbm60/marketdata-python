@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService
 from service import Service
 
 logging.basicConfig(
@@ -337,7 +337,7 @@ def main():
              FORCE_STATUS, SELECTION_COUNT)
 
     service = Service(
-        name=ServiceLocator.OPTIMIZER,
+        name=ControlService.OPTIMIZER,
         router_port=ROUTER_PORT,
     )
     service.register_handler(OP_OPTIMIZE, handle_optimize)

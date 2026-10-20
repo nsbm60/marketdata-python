@@ -13,6 +13,7 @@ import logging
 import sys
 
 sys.path.insert(0, ".")
+from discovery import ControlService
 from service import Service
 
 logging.basicConfig(
@@ -31,7 +32,7 @@ def fail_handler(payload: dict) -> dict:
 
 def main():
     service = Service(
-        name="echo_test",
+        name=ControlService.ECHO_TEST,
         router_port=6091,
     )
     service.register_handler("echo", echo_handler)

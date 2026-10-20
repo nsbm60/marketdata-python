@@ -24,12 +24,12 @@ import json
 import sys
 
 from control_client import ControlSocket, ControlTimeout
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 SERVICES = {
-    "mds": ServiceLocator.MARKET_DATA,
-    "calc": ServiceLocator.CALC,
-    "ib": ServiceLocator.IB,
+    "mds": ControlService.MARKET_DATA,
+    "calc": ControlService.CALC,
+    "ib": ControlService.IB,
 }
 
 
@@ -66,7 +66,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        endpoint = ServiceLocator.wait_for_service(SERVICES[args.service], timeout_sec=10)
+        endpoint = ServiceLocator.control(SERVICES[args.service], timeout_sec=10)
     except Exception as e:
         print(f"Discovery failed for {args.service}: {e}", file=sys.stderr)
         return 3

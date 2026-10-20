@@ -16,7 +16,7 @@ import json
 from datetime import datetime
 
 from control_client import ControlSocket, ControlTimeout
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 
 def main():
@@ -31,7 +31,7 @@ def main():
 
     end_date = args.end_date or args.start_date
 
-    calc = ServiceLocator.wait_for_service(ServiceLocator.CALC, timeout_sec=10)
+    calc = ServiceLocator.control(ControlService.CALC, timeout_sec=10)
     print(f"CalcServer found: {calc.router}")
 
     dealer = ControlSocket(calc.router, timeout_ms=10000)

@@ -29,7 +29,7 @@ from datetime import date, datetime
 from dataclasses import dataclass
 from typing import Optional
 
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 from ml.models.breakout.config import ModelConfig
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
@@ -534,7 +534,7 @@ def main():
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(",")]
     else:
-        md = ServiceLocator.wait_for_service(ServiceLocator.MARKET_DATA, timeout_sec=30)
+        md = ServiceLocator.control(ControlService.MARKET_DATA, timeout_sec=30)
         log.info("MDS found: %s", md.router)
         symbols = fetch_symbol_list(md.router, "trading_universe")
         log.info("Using TradingUniverse: %d symbols", len(symbols))

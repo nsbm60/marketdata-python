@@ -38,13 +38,13 @@ from typing import Optional
 import zmq
 
 from service.advertiser import Advertiser
-from discovery.service_locator import ServiceLocator
+from discovery import PUBSUB_BUS
 
 log = logging.getLogger(__name__)
 
 # ── conventions (two of these are flagged design forks; see module docstring) ──
 # FLAGGED: discovery service name/key for the bus.
-PUBSUB_SERVICE_NAME = ServiceLocator.PUBSUB_BUS
+PUBSUB_SERVICE_NAME = PUBSUB_BUS
 # FLAGGED: messages buffered per subscriber on XPUB before stale frames drop.
 XPUB_SEND_HWM = 100_000
 
@@ -175,7 +175,6 @@ def main() -> int:
     advertiser = Advertiser(
         service_name=PUBSUB_SERVICE_NAME,
         host=host,
-        pub_sub=f"tcp://{host}:{XPUB_TCP_PORT}",   # pubSub = XPUB (honest subscribe endpoint)
         router_port=None,                          # no control plane — no router field
         xsub=f"tcp://{host}:{XSUB_TCP_PORT}",      # producers connect in (explicit)
         xpub=f"tcp://{host}:{XPUB_TCP_PORT}",      # subscribers connect out (explicit)

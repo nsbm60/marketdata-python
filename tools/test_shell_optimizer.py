@@ -16,7 +16,7 @@ import uuid
 sys.path.insert(0, ".")
 
 from control_client import ControlSocket
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 # ─────────────────────────────────────────────────────────────
 # Synthetic request data
@@ -101,7 +101,7 @@ def main():
     # Discover the optimizer
     print("\nDiscovering optimizer service...")
     try:
-        endpoint = ServiceLocator.wait_for_service(ServiceLocator.OPTIMIZER, timeout_sec=15)
+        endpoint = ServiceLocator.control(ControlService.OPTIMIZER, timeout_sec=15)
     except TimeoutError:
         print("FAIL: Optimizer service not discovered within 15s")
         print("Is shell_optimizer.py running?")

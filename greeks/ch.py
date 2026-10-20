@@ -21,10 +21,10 @@ from greeks.harness.store import residual_to_ch_dict, validation_to_ch_dict
 
 def get_ch_client() -> Client:
     """Resolve ClickHouse via service discovery (same as ml.shared)."""
-    from discovery import ServiceLocator
+    from discovery import EndpointService, ServiceLocator
 
-    ep = ServiceLocator.wait_for_service(
-        ServiceLocator.CLICKHOUSE,
+    ep = ServiceLocator.endpoint(
+        EndpointService.CLICKHOUSE,
         timeout_sec=60,
     )
     return clickhouse_connect.get_client(

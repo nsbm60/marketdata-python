@@ -6,16 +6,28 @@ Provides ZMQ-based service discovery compatible with the Scala MarketData backen
 
 from .service_locator import (
     ServiceLocator,
-    ServiceEndpoint,
     DiscoverySubscriber,
     DEFAULT_DISCOVERY_PORT,
     SERVICE_TOPIC_PREFIX,
 )
+from .services import (
+    ControlService,
+    EndpointService,
+    PUBSUB_BUS,
+    ControlEndpoint,
+    HostPort,
+    BusEndpoints,
+)
 
 __all__ = [
     "ServiceLocator",
-    "ServiceEndpoint",
     "DiscoverySubscriber",
     "DEFAULT_DISCOVERY_PORT",
     "SERVICE_TOPIC_PREFIX",
+    "ControlService",
+    "EndpointService",
+    "PUBSUB_BUS",
+    "ControlEndpoint",
+    "HostPort",
+    "BusEndpoints",
 ]

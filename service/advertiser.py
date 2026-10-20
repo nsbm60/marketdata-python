@@ -17,7 +17,6 @@ from service.constants import (
     DISCOVERY_INTERVAL_SEC,
     DISC_SERVICE_FIELD,
     DISC_HOST_FIELD,
-    DISC_PUBSUB_FIELD,
     DISC_ROUTER_FIELD,
     DISC_XSUB_FIELD,
     DISC_XPUB_FIELD,
@@ -33,7 +32,6 @@ class Advertiser:
         self,
         service_name: str,
         host: str,
-        pub_sub: str,
         router_port: int | None = None,
         interval_sec: int = DISCOVERY_INTERVAL_SEC,
         broadcast_address: str = DISCOVERY_BROADCAST_ADDRESS,
@@ -50,13 +48,12 @@ class Advertiser:
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
 
-        # router is included only when the service has a control plane. The pub/sub
-        # bus has none — it passes router_port=None and advertises xsub/xpub instead,
-        # so `router` never carries an XSUB endpoint (no field overload).
+        # The bus is the only data plane, so no service advertises a pubSub endpoint. router is
+        # included only when the service has a control plane; the pub/sub bus has none — it passes
+        # router_port=None and advertises xsub/xpub instead (no field overload).
         fields: dict[str, str] = {
             DISC_SERVICE_FIELD: service_name,
             DISC_HOST_FIELD: host,
-            DISC_PUBSUB_FIELD: pub_sub,
         }
         if router_port is not None:
             fields[DISC_ROUTER_FIELD] = f"tcp://{host}:{router_port}"

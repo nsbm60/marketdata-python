@@ -20,6 +20,7 @@ import threading
 
 import zmq
 
+from discovery import ControlService, ServiceLocator
 from service.advertiser import Advertiser
 from service.constants import HEARTBEAT_INTERVAL_SEC, SELF_PING_INTERVAL_SEC, SELF_PING_MAX_MISSED
 from service.heartbeat import HeartbeatPublisher
@@ -35,7 +36,7 @@ class Service:
 
     def __init__(
         self,
-        name: str,
+        name: ControlService,
         router_port: int,
         host: str | None = None,
         discovery_address: str = "255.255.255.255",
@@ -45,7 +46,10 @@ class Service:
         self_ping_interval_sec: int = SELF_PING_INTERVAL_SEC,
         self_ping_max_missed: int = SELF_PING_MAX_MISSED,
     ):
-        self._name = name
+        if not isinstance(name, ControlService):
+            raise TypeError(f"Service(name=...) takes a ControlService, got {name!r}")
+        # The wire name drives the router topic, the advertisement, heartbeats and logging.
+        self._name = name.value
         self._router_port = router_port
         self._host = host or get_local_ipv4()
         self._discovery_address = discovery_address
@@ -61,7 +65,7 @@ class Service:
         self._pub_socket: zmq.Socket | None = None
         self._pub_lock = threading.Lock()
 
-        self._router = Router(name, router_port)
+        self._router = Router(self._name, router_port)
         self._advertiser: Advertiser | None = None
         self._heartbeat: HeartbeatPublisher | None = None
         self._self_ping: SelfPingMonitor | None = None
@@ -91,8 +95,7 @@ class Service:
                  self._name, self._host, self._router_port)
 
         # Resolve the pub/sub bus before creating any socket; the PUB connects out to it.
-        from discovery.service_locator import locate_bus
-        bus = locate_bus()
+        bus = ServiceLocator.bus()
 
         self._context = zmq.Context()
 
@@ -107,7 +110,6 @@ class Service:
         self._advertiser = Advertiser(
             service_name=self._name,
             host=self._host,
-            pub_sub=bus.xpub,
             router_port=self._router_port,
             interval_sec=self._discovery_interval_sec,
             broadcast_address=self._discovery_address,

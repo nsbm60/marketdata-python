@@ -17,7 +17,7 @@ import clickhouse_connect
 # Repo root on path for discovery / shared helpers
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from discovery.service_locator import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "trading")
 TABLE = "option_snapshot"
@@ -101,8 +101,8 @@ def connect_clickhouse():
     if host:
         print(f"ClickHouse (explicit) {host}:{port}")
     else:
-        endpoint = ServiceLocator.wait_for_service(
-            service_name=ServiceLocator.CLICKHOUSE,
+        endpoint = ServiceLocator.endpoint(
+            EndpointService.CLICKHOUSE,
             timeout_sec=30,
         )
         host, port = endpoint.host, endpoint.port

@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 
 # Add project root to path for discovery module
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from discovery.service_locator import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 load_dotenv()
 
@@ -84,8 +84,8 @@ log.info("=" * 60)
 log.info("Step 1: Discovering ClickHouse")
 log.info("=" * 60)
 
-endpoint = ServiceLocator.wait_for_service(
-    service_name=ServiceLocator.CLICKHOUSE,
+endpoint = ServiceLocator.endpoint(
+    EndpointService.CLICKHOUSE,
     timeout_sec=30,
 )
 log.info(f"ClickHouse discovered: {endpoint.host}:{endpoint.port}")

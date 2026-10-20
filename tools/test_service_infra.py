@@ -19,7 +19,7 @@ from control_client import ControlSocket, ControlTimeout
 
 # Add parent dir to path for discovery package
 sys.path.insert(0, ".")
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 SERVICE_NAME = "echo_test"
 
@@ -33,14 +33,15 @@ def main():
     print("\n--- Layer 1: Discovery ---")
     print(f"Waiting for '{SERVICE_NAME}' service...")
     try:
-        endpoint = ServiceLocator.wait_for_service(SERVICE_NAME, timeout_sec=15)
+        endpoint = ServiceLocator.control(ControlService.ECHO_TEST, timeout_sec=15)
+        bus_xpub = ServiceLocator.bus(timeout_sec=15).xpub
     except TimeoutError:
         print(f"FAIL: Service '{SERVICE_NAME}' not discovered within 15s")
         print("Is run_echo_service.py running?")
         sys.exit(1)
 
-    print(f"OK: Discovered {endpoint.service} at {endpoint.host}:{endpoint.port}")
-    print(f"    pubSub={endpoint.pub_sub}")
+    print(f"OK: Discovered {SERVICE_NAME} at {endpoint.host}")
+    print(f"    pubSub={bus_xpub}")
     print(f"    router={endpoint.router}")
 
     ctx = zmq.Context()
@@ -48,7 +49,7 @@ def main():
     # Layer 2.5: Heartbeat
     print("\n--- Layer 2.5: Heartbeat ---")
     sub = ctx.socket(zmq.SUB)
-    sub.connect(endpoint.pub_sub)
+    sub.connect(bus_xpub)
     sub.setsockopt_string(zmq.SUBSCRIBE, f"{SERVICE_NAME}.heartbeat")
     sub.setsockopt(zmq.RCVTIMEO, 15000)  # 15s timeout
 

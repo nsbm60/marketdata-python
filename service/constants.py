@@ -25,7 +25,6 @@ DISCOVERY_PORT = 6001
 DISCOVERY_INTERVAL_SEC = 5
 DISC_SERVICE_FIELD = "service"
 DISC_HOST_FIELD = "host"
-DISC_PUBSUB_FIELD = "pubSub"
 DISC_ROUTER_FIELD = "router"
 # Pub/sub bus endpoints (additive). The bus is a two-port XSUB/XPUB proxy with no
 # control plane, so it advertises these EXPLICITLY instead of overloading `router`

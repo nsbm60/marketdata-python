@@ -14,7 +14,7 @@ from dash import Dash, dcc, html, Input, Output, State, ctx
 
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 from tools.chart_day import (
     query_bars, query_candidates, query_emas, query_pivots, build_figure,
     TIMEFRAME_MINUTES,
@@ -27,7 +27,7 @@ ch = get_ch_client()
 def get_symbols():
     """Fetch trading universe symbols from MDS, fallback to breakout_candidate."""
     try:
-        md = ServiceLocator.wait_for_service(ServiceLocator.MARKET_DATA, timeout_sec=5)
+        md = ServiceLocator.control(ControlService.MARKET_DATA, timeout_sec=5)
         return fetch_symbol_list(md.router, "trading_universe")
     except Exception:
         result = ch.query(

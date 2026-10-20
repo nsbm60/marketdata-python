@@ -44,7 +44,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-from discovery import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 load_dotenv()
 
@@ -499,8 +499,8 @@ def main():
 
     # --- ClickHouse client (discovered via ZMQ) ---
     log.info("Discovering ClickHouse...")
-    ch_endpoint = ServiceLocator.wait_for_service(
-        ServiceLocator.CLICKHOUSE,
+    ch_endpoint = ServiceLocator.endpoint(
+        EndpointService.CLICKHOUSE,
         timeout_sec=60,
     )
 

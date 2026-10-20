@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from ml.shared.paths import features_path, model_path, ensure_dirs
 from ml.shared.clickhouse import get_ch_client
 from ml.shared.config import fetch_symbol_list
-from discovery import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -274,9 +274,12 @@ def main():
     else:
         # Fetch from MDS
         log.info(f"Fetching symbol list '{args.list}' from MDS...")
-        md_endpoint = ServiceLocator.find_service(
-            ServiceLocator.MARKET_DATA, wait_sec=10
-        )
+        try:
+            md_endpoint = ServiceLocator.control(
+                ControlService.MARKET_DATA, timeout_sec=10
+            )
+        except TimeoutError:
+            md_endpoint = None
         if md_endpoint:
             router_url = md_endpoint.router if hasattr(md_endpoint, 'router') \
                          else f"tcp://{md_endpoint.host}:6007"

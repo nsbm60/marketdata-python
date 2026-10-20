@@ -14,11 +14,8 @@ passed. Health check backfills any missing bars from Alpaca. If started after
 the latest prediction window (w60 = 10:30am ET), skips today and waits for
 tomorrow.
 
-Advertises itself via UDP broadcast so the Scala layer can discover it.
-
-Service name:  mlScorer
-PUB port:      6040  (predictions)
-Router port:   6041  (control -- reserved for future use)
+Consumer only: it subscribes to bars on the pub/sub bus and publishes predictions
+to the bus. It does not advertise and nothing looks it up.
 
 Published prediction topic: ml.session.prediction.{SYMBOL}
 
@@ -78,10 +75,7 @@ import xgboost as xgb
 import zmq
 from dotenv import load_dotenv
 
-from discovery import ServiceLocator
-from discovery.service_locator import locate_bus
-from service.advertiser import Advertiser
-from service.network import get_local_ipv4
+from discovery import ControlService, EndpointService, ServiceLocator
 from ml.shared.config import load_prediction_config, PredictionWindowConfig, fetch_symbol_list
 
 load_dotenv()
@@ -99,7 +93,6 @@ log = logging.getLogger(__name__)
 
 NY = ZoneInfo("America/New_York")
 
-SERVICE_NAME   = "mlScorer"
 # No PUB/ROUTER ports: predictions go out on the bus (the PUB connects to the bus
 # XSUB, resolved at startup); the scorer binds no router.
 DISCOVERY_PORT = 6001   # UDP broadcast port (matches SystemConfig.discovery.udpPort)
@@ -606,7 +599,6 @@ class SessionScorer:
         self._context:  Optional[zmq.Context] = None
         self._sub:      Optional[zmq.Socket]  = None  # subscribe to market data
         self._pub:      Optional[zmq.Socket]  = None  # publish predictions
-        self._advertiser: Optional[Advertiser] = None
         self._bus = None  # BusEndpoints, resolved in start()
 
         # ClickHouse client (lazy-initialized)
@@ -615,8 +607,8 @@ class SessionScorer:
     def _get_ch_client(self):
         if self._ch_client is None:
             log.info("Discovering ClickHouse...")
-            ch_endpoint = ServiceLocator.wait_for_service(
-                ServiceLocator.CLICKHOUSE, timeout_sec=60
+            ch_endpoint = ServiceLocator.endpoint(
+                EndpointService.CLICKHOUSE, timeout_sec=60
             )
             self._ch_client = clickhouse_connect.get_client(
                 host     = ch_endpoint.host,
@@ -1113,16 +1105,14 @@ class SessionScorer:
         """Start the scoring server."""
         self._running = True
 
-        # Discover market data service first (needed for symbol list and bar subscription)
+        # Discover market data control (needed for the symbol list); bar data arrives on the bus.
         log.info("Discovering market data service...")
-        md_endpoint = ServiceLocator.wait_for_service(
-            ServiceLocator.MARKET_DATA, timeout_sec=60
-        )
-        market_data_url = md_endpoint.pub_sub
-        router_url = md_endpoint.router
+        router_url = ServiceLocator.control(ControlService.MARKET_DATA, timeout_sec=60).router
 
-        # Resolve the pub/sub bus; the prediction PUB connects out to it (used in _setup_zmq).
-        self._bus = locate_bus()
+        # Resolve the pub/sub bus; bars are subscribed on its XPUB and the prediction PUB connects
+        # out to it (used in _setup_zmq).
+        self._bus = ServiceLocator.bus()
+        market_data_url = self._bus.xpub
 
         # Fetch symbol list from MDS
         log.info("Fetching trading universe from MDS...")
@@ -1161,15 +1151,8 @@ class SessionScorer:
 
         self._setup_zmq(market_data_url)
 
-        # Start service advertiser: advertise the bus XPUB as our pubSub; no router
-        # (the scorer binds none).
-        self._advertiser = Advertiser(
-            service_name = SERVICE_NAME,
-            host         = get_local_ipv4(),
-            pub_sub      = self._bus.xpub,
-            router_port  = None,
-        )
-        self._advertiser.start()
+        # The scorer is a consumer only: it does not advertise. It subscribes to bars on the bus and
+        # publishes predictions to the bus; nothing looks it up.
 
         # Log per-symbol config
         for sym in self.symbols:
@@ -1493,8 +1476,6 @@ class SessionScorer:
     def stop(self):
         """Graceful shutdown."""
         self._running = False
-        if self._advertiser:
-            self._advertiser.stop()
         if self._sub:
             self._sub.close(linger=0)
         if self._pub:

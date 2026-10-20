@@ -246,8 +246,8 @@ def ch_connect():
     else:
         # Mirror migrate_stock_bars.py: add repo root to path, discover via bus.
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from discovery.service_locator import ServiceLocator
-        ep = ServiceLocator.wait_for_service(ServiceLocator.CLICKHOUSE, timeout_sec=30)
+        from discovery import EndpointService, ServiceLocator
+        ep = ServiceLocator.endpoint(EndpointService.CLICKHOUSE, timeout_sec=30)
         host, port = ep.host, ep.port
         print(f"  ClickHouse discovered at {host}:{port} "
               f"(set CLICKHOUSE_HOST/PORT to override, DISCOVERY_HOST for the bus)")

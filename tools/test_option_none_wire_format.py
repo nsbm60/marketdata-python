@@ -26,14 +26,14 @@ import zmq
 
 from control_client import ControlSocket, ControlTimeout
 
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 
 def main() -> int:
     # Discover CalcServer's control router endpoint
     try:
-        endpoint = ServiceLocator.wait_for_service(
-            ServiceLocator.CALC,
+        endpoint = ServiceLocator.control(
+            ControlService.CALC,
             timeout_sec=10,
         )
     except Exception as e:

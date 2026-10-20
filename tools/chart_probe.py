@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from control_client import ControlTimeout, request as control_request
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=20000)
     args = ap.parse_args()
 
-    calc = ServiceLocator.wait_for_service(service_name=ServiceLocator.CALC, timeout_sec=30)
+    calc = ServiceLocator.control(ControlService.CALC, timeout_sec=30)
 
     request = {
         "op": "get_chart_data",

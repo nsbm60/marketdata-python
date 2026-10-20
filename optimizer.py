@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cvxpy as cp
 import numpy as np
 
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService
 from service import Service
 
 from wire_format import (
@@ -605,7 +605,7 @@ def main():
              SOLVER_NAME, SOLVE_TIME_LIMIT_SEC)
 
     service = Service(
-        name=ServiceLocator.OPTIMIZER,
+        name=ControlService.OPTIMIZER,
         router_port=ROUTER_PORT,
     )
     service.register_handler(OP_OPTIMIZE, handle_optimize)

@@ -1,17 +1,33 @@
 """
 service_locator.py - Service discovery via ZMQ subscription.
+
+ServiceLocator is the one entry point: it knows every service and the shape it advertises, and
+returns a typed result per shape (ControlEndpoint / HostPort / BusEndpoints). A non-member argument
+raises TypeError — the runtime equivalent of the Scala compile error.
+
+The transport (DiscoverySubscriber) does not parse: it hands the raw payload string to its callback,
+matching the Scala DiscoverySubscriber. Field extraction and the "malformed" decision live in the
+facade's per-shape parsers.
 """
 
 import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional, TypeVar
 
 import zmq
 
 from greeks.topic_builder import TopicBuilder
+
+from .services import (
+    BusEndpoints,
+    ControlEndpoint,
+    ControlService,
+    EndpointService,
+    HostPort,
+    PUBSUB_BUS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -26,30 +42,22 @@ def _default_discovery_url() -> str:
     return f"tcp://{host}:{port}"
 
 
-@dataclass(frozen=True)
-class ServiceEndpoint:
-    service: str
-    host: str
-    port: int
-    pub_sub: str = ""
-    router: str = ""
-    # Pub/sub bus endpoints (additive; empty for every other service). The bus
-    # advertises these explicitly instead of overloading `router` to carry XSUB.
-    xsub: str = ""
-    xpub: str = ""
-
-
 class DiscoverySubscriber:
+    """Subscribes to one service's discovery topic and hands each raw payload to a callback.
+
+    It does not parse: the callback receives the JSON string verbatim, as in the Scala
+    DiscoverySubscriber. Parsing and validation are the facade's job.
+    """
 
     def __init__(
         self,
         service_name: str,
         discovery_url: str = None,
-        on_discovered: Callable[[ServiceEndpoint], None] = None,
+        on_message: Callable[[str], None] = None,
     ):
         self.service_name = service_name
         self.discovery_url = discovery_url or _default_discovery_url()
-        self.on_discovered = on_discovered
+        self.on_message = on_message
         # Lowercases the name (via TopicBuilder) to match the wire topic `service.<name lower>`,
         # so a caller passing canonical "marketData" still matches "service.marketdata".
         self._topic = TopicBuilder.for_service(service_name)
@@ -85,12 +93,10 @@ class DiscoverySubscriber:
         while self._running:
             try:
                 frames = self._socket.recv_multipart()
-
                 if len(frames) >= 2:
-                    topic   = frames[0].decode("utf-8")
                     payload = frames[1].decode("utf-8")
-                    self._handle_message(payload, topic)
-
+                    if self.on_message:
+                        self.on_message(payload)
             except zmq.Again:
                 continue
             except Exception as e:
@@ -99,46 +105,6 @@ class DiscoverySubscriber:
                     time.sleep(1)
 
         self._cleanup()
-
-    def _handle_message(self, msg: str, topic: str) -> None:
-        try:
-            data    = json.loads(msg)
-            host    = data.get("host", "")
-            pub_sub = data.get("pubSub", "")
-            router  = data.get("router", "")
-            xsub    = data.get("xsub", "")
-            xpub    = data.get("xpub", "")
-            port    = data.get("port", 0)
-
-            if not port and pub_sub:
-                try:
-                    port = int(pub_sub.split(":")[-1])
-                except (ValueError, IndexError):
-                    pass
-
-            if not host or not port:
-                log.warning(f"Malformed discovery message: {msg}")
-                return
-
-            # Use service name from topic, not from payload
-            # Topic format is "service.{name}" -- extract the name
-            service = topic.removeprefix(SERVICE_TOPIC_PREFIX)
-
-            endpoint = ServiceEndpoint(
-                service = service,
-                host    = host,
-                port    = port,
-                pub_sub = pub_sub,
-                router  = router,
-                xsub    = xsub,
-                xpub    = xpub,
-            )
-
-            if self.on_discovered:
-                self.on_discovered(endpoint)
-
-        except json.JSONDecodeError as e:
-            log.warning(f"JSON decode error: {e}")
 
     def _cleanup(self) -> None:
         if self._socket:
@@ -155,134 +121,125 @@ class DiscoverySubscriber:
             self._context = None
 
 
-class ServiceLocator:
+T = TypeVar("T")
 
-    CLICKHOUSE     = "clickhouse"
-    MARKET_DATA    = "marketdata"
-    IB             = "ib"
-    CALC           = "calc"
-    ALPACA_TRADING = "alpaca"
-    ML_SCORER      = "mlscorer"
-    OPTIMIZER      = "optimizer"
-    PUBSUB_BUS     = "pubsubbus"   # XSUB/XPUB bus broker (service/pubsub_broker.py)
+
+class ServiceLocator:
+    """Resolve a service to its typed endpoint. The one entry point for discovery."""
 
     @staticmethod
-    def wait_for_service(
-        service_name: str,
-        timeout_sec: float = None,
-        discovery_url: str = None,
+    def control(s: ControlService, timeout_sec: Optional[float] = None) -> ControlEndpoint:
+        if not isinstance(s, ControlService):
+            raise TypeError(f"control() takes a ControlService, got {s!r}")
+        return ServiceLocator._await(s.value, _parse_control, timeout_sec)
+
+    @staticmethod
+    def endpoint(s: EndpointService, timeout_sec: Optional[float] = None) -> HostPort:
+        if not isinstance(s, EndpointService):
+            raise TypeError(f"endpoint() takes an EndpointService, got {s!r}")
+        return ServiceLocator._await(s.value, _parse_endpoint, timeout_sec)
+
+    @staticmethod
+    def bus(timeout_sec: Optional[float] = None) -> BusEndpoints:
+        return ServiceLocator._await(PUBSUB_BUS, _parse_bus, timeout_sec)
+
+    @staticmethod
+    def _await(
+        wire: str,
+        parse: Callable[[dict], T],
+        timeout_sec: Optional[float],
         log_interval_sec: float = 5.0,
         warn_after_sec: float = 30.0,
-    ) -> ServiceEndpoint:
-        result: ServiceEndpoint = None
+    ) -> T:
+        # The name check and parse run on the subscriber thread; the result (or the failure) is
+        # handed back under the lock. A record for another service on the same topic prefix is
+        # ignored. A malformed record for the requested service raises — a bug in the advertiser.
+        state: dict = {}
         lock = threading.Lock()
 
-        def on_discovered(endpoint: ServiceEndpoint):
-            nonlocal result
+        def on_message(msg: str) -> None:
             with lock:
-                if result is None:
-                    result = endpoint
+                if "result" in state or "error" in state:
+                    return
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError as e:
+                    state["error"] = ValueError(f"'{wire}' announcement is not JSON: {e} — {msg}")
+                    return
+                # Name check first: ignore an announcement for another service on the same prefix.
+                if str(data.get("service", "")).lower() != wire.lower():
+                    return
+                try:
+                    state["result"] = parse(data)
+                except ValueError as e:
+                    state["error"] = ValueError(f"'{wire}' announcement malformed: {e} — {msg}")
 
-        sub = DiscoverySubscriber(
-            service_name=service_name,
-            discovery_url=discovery_url,
-            on_discovered=on_discovered,
-        )
+        sub = DiscoverySubscriber(service_name=wire, on_message=on_message)
         sub.start()
+        log.info(f"Waiting for '{wire}' discovery..."
+                 + (f" (timeout={timeout_sec}s)" if timeout_sec else ""))
 
-        log.info(f"Waiting for {service_name} discovery...")
         start_time = time.time()
-        last_log   = start_time
-        warned     = False
+        last_log = start_time
+        warned = False
 
         try:
             while True:
                 with lock:
-                    if result is not None:
-                        log.info(f"Discovered {service_name}: "
-                                 f"{result.host}:{result.port} "
-                                 f"pubSub={result.pub_sub}")
-                        return result
+                    if "error" in state:
+                        raise state["error"]
+                    if "result" in state:
+                        return state["result"]
 
                 elapsed = time.time() - start_time
-
                 if timeout_sec and elapsed > timeout_sec:
-                    raise TimeoutError(
-                        f"Service '{service_name}' not discovered "
-                        f"within {timeout_sec}s"
-                    )
+                    raise TimeoutError(f"Service '{wire}' not discovered within {timeout_sec}s")
 
                 now = time.time()
                 if now - last_log > log_interval_sec:
                     if not warned and elapsed > warn_after_sec:
-                        log.warning(
-                            f"{service_name} not found after {elapsed:.0f}s - "
-                            f"is the broadcaster running?"
-                        )
+                        log.warning(f"'{wire}' not found after {elapsed:.0f}s — is the broadcaster running?")
                         warned = True
                     else:
-                        log.debug(f"Still waiting for {service_name}...")
+                        log.debug(f"Still waiting for '{wire}'...")
                     last_log = now
 
                 time.sleep(0.25)
         finally:
             sub.stop()
 
-    @staticmethod
-    def find_service(
-        service_name: str,
-        wait_sec: float = 2.0,
-        discovery_url: str = None,
-    ) -> ServiceEndpoint | None:
-        try:
-            return ServiceLocator.wait_for_service(
-                service_name=service_name,
-                timeout_sec=wait_sec,
-                discovery_url=discovery_url,
-            )
-        except TimeoutError:
-            return None
+
+# ── Per-shape parsers ──────────────────────────────────────────────────────────────────────────
+# Raise ValueError when a record for the requested service is malformed. Extra fields are ignored,
+# so a control service still running pre-change code (which also sends a `pubSub`) parses fine.
+
+def _parse_control(data: dict) -> ControlEndpoint:
+    host = data.get("host", "")
+    router = data.get("router", "")
+    if not host or not router:
+        raise ValueError("missing or empty host/router")
+    return ControlEndpoint(host=host, router=router)
 
 
-@dataclass(frozen=True)
-class BusEndpoints:
-    """The pub/sub bus's two data-plane endpoints (it has no control plane)."""
-    xsub: str   # producers connect in
-    xpub: str   # subscribers connect out
-
-
-def locate_bus(discovery_url: str = None) -> BusEndpoints:
-    """Resolve the pub/sub bus and return its XSUB/XPUB endpoints.
-
-    The bus branch of the future ServiceLocator facade. Sits directly on
-    DiscoverySubscriber (which already decodes xsub/xpub) — not the generalist
-    wait_for_service, whose result is the lowest-common-denominator ServiceEndpoint.
-    Blocks while the bus is absent (not a failure); raises on an announcement with
-    an empty xsub or xpub rather than waiting for a better one.
-    """
-    result: dict[str, ServiceEndpoint] = {}
-    lock = threading.Lock()
-
-    def on_discovered(endpoint: ServiceEndpoint) -> None:
-        with lock:
-            result.setdefault("ep", endpoint)
-
-    sub = DiscoverySubscriber(
-        service_name=ServiceLocator.PUBSUB_BUS,
-        discovery_url=discovery_url,
-        on_discovered=on_discovered,
-    )
-    sub.start()
-    log.info("Waiting for pub/sub bus discovery...")
+def _parse_endpoint(data: dict) -> HostPort:
+    host = data.get("host", "")
+    port = data.get("port", 0)
+    if not host:
+        raise ValueError("missing host")
     try:
-        while True:
-            with lock:
-                ep = result.get("ep")
-            if ep is not None:
-                if not ep.xsub or not ep.xpub:
-                    raise RuntimeError(f"pubsubbus announcement missing xsub/xpub: {ep}")
-                log.info("Discovered pub/sub bus: xsub=%s xpub=%s", ep.xsub, ep.xpub)
-                return BusEndpoints(xsub=ep.xsub, xpub=ep.xpub)
-            time.sleep(0.25)
-    finally:
-        sub.stop()
+        port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError(f"port is not an int ({port!r})")
+    if port <= 0:
+        raise ValueError(f"port <= 0 ({port})")
+    return HostPort(host=host, port=port)
+
+
+def _parse_bus(data: dict) -> BusEndpoints:
+    if "router" in data:
+        raise ValueError("carries a 'router' — the bus has no control plane")
+    xsub = data.get("xsub", "")
+    xpub = data.get("xpub", "")
+    if not xsub or not xpub:
+        raise ValueError("missing or empty xsub/xpub")
+    return BusEndpoints(xsub=xsub, xpub=xpub)

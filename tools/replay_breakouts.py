@@ -26,7 +26,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from typing import Optional
 
-from discovery.service_locator import ServiceLocator
+from discovery import ControlService, ServiceLocator
 from ml.models.breakout.engine import BreakoutEngine
 from ml.models.breakout.persistence import BreakoutPersistor
 from ml.models.breakout.signal_generator import SignalConfig
@@ -378,7 +378,7 @@ def main():
     end = date.fromisoformat(args.end_date)
 
     # MDS required for trading sessions (and optionally symbol list)
-    md = ServiceLocator.wait_for_service(ServiceLocator.MARKET_DATA, timeout_sec=30)
+    md = ServiceLocator.control(ControlService.MARKET_DATA, timeout_sec=30)
     log.info("MDS found: %s", md.router)
 
     sessions = get_trading_sessions(md.router, start, end)

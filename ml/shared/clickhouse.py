@@ -10,7 +10,7 @@ import time
 
 import clickhouse_connect
 
-from discovery import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 log = logging.getLogger("ml.shared.clickhouse")
 
@@ -38,8 +38,8 @@ def get_ch_client():
     backoff = 1.0
     while True:
         try:
-            ch_endpoint = ServiceLocator.wait_for_service(
-                ServiceLocator.CLICKHOUSE,
+            ch_endpoint = ServiceLocator.endpoint(
+                EndpointService.CLICKHOUSE,
                 timeout_sec=_RESOLVE_ATTEMPT_TIMEOUT_SEC,
             )
             break

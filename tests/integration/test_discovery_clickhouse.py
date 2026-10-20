@@ -25,13 +25,13 @@ import sys
 import pytest
 
 try:
-    from discovery.service_locator import ServiceEndpoint, ServiceLocator
+    from discovery import EndpointService, HostPort, ServiceLocator
     from ml.shared.clickhouse import get_ch_client
 except ModuleNotFoundError:
     import pathlib
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-    from discovery.service_locator import ServiceEndpoint, ServiceLocator
+    from discovery import EndpointService, HostPort, ServiceLocator
     from ml.shared.clickhouse import get_ch_client
 
 # Short: on the discovery bus ClickHouse is advertised ~1/sec, so resolution is
@@ -57,7 +57,7 @@ def _env_source(key: str, default: str) -> str:
     return f"{os.environ.get(key, default)} ({'from env' if key in os.environ else 'connector default'})"
 
 
-def _report(ep: ServiceEndpoint) -> None:
+def _report(ep: HostPort) -> None:
     print("\n=== ClickHouse resolution (via the real discovery-router) ===")
     print(f"  DISCOVERY_HOST/PORT : {os.environ.get('DISCOVERY_HOST', 'localhost')}:"
           f"{os.environ.get('DISCOVERY_PORT', '6005')}")
@@ -69,8 +69,8 @@ def _report(ep: ServiceEndpoint) -> None:
     print("=============================================================\n")
 
 
-def _resolve(timeout_sec: float) -> ServiceEndpoint:
-    return ServiceLocator.wait_for_service(ServiceLocator.CLICKHOUSE, timeout_sec=timeout_sec)
+def _resolve(timeout_sec: float) -> HostPort:
+    return ServiceLocator.endpoint(EndpointService.CLICKHOUSE, timeout_sec=timeout_sec)
 
 
 def test_discovery_clickhouse_select_1() -> None:

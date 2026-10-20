@@ -31,7 +31,7 @@ import clickhouse_connect
 import pandas as pd
 from dotenv import load_dotenv
 
-from discovery import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 load_dotenv()
 
@@ -59,8 +59,8 @@ CSV_COLUMNS = [
 def get_ch_client():
     """Get ClickHouse client via service discovery."""
     log.info("Discovering ClickHouse...")
-    ch_endpoint = ServiceLocator.wait_for_service(
-        ServiceLocator.CLICKHOUSE,
+    ch_endpoint = ServiceLocator.endpoint(
+        EndpointService.CLICKHOUSE,
         timeout_sec=60,
     )
     return clickhouse_connect.get_client(

@@ -20,7 +20,7 @@ from pathlib import Path
 import clickhouse_connect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from discovery.service_locator import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "trading")
 SNAPSHOT = "option_snapshot"
@@ -36,7 +36,7 @@ def connect_clickhouse():
     if host:
         print(f"ClickHouse (explicit) {host}:{port}\n")
     else:
-        ep = ServiceLocator.wait_for_service(ServiceLocator.CLICKHOUSE, timeout_sec=30)
+        ep = ServiceLocator.endpoint(EndpointService.CLICKHOUSE, timeout_sec=30)
         host, port = ep.host, ep.port
         print(f"ClickHouse discovered at {host}:{port}\n")
     return clickhouse_connect.get_client(

@@ -32,7 +32,7 @@ import clickhouse_connect
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from discovery.service_locator import ServiceLocator
+from discovery import EndpointService, ServiceLocator
 
 load_dotenv()
 
@@ -60,8 +60,8 @@ print(f"Charting {symbol} {timeframe} {session_date} session={session_filter}")
 # Connect to ClickHouse
 # ---------------------------------------------------------------------------
 print("Discovering ClickHouse...")
-endpoint = ServiceLocator.wait_for_service(
-    service_name=ServiceLocator.CLICKHOUSE,
+endpoint = ServiceLocator.endpoint(
+    EndpointService.CLICKHOUSE,
     timeout_sec=30,
 )
 
