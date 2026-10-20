@@ -66,8 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--sofr-ch",
         action="store_true",
         help=(
-            "Load SOFR from trading.sofr_daily source=fred only "
-            "(FINAL). Fails if FRED rows missing — never uses fixture rows."
+            "Load SOFR from trading.sofr_daily source=nyfed only "
+            "(FINAL). Fails if rows are missing — never uses fixture rows."
         ),
     )
     p.add_argument(
@@ -226,20 +226,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.sofr_ch:
         from greeks.ch import load_sofr_series_from_ch
 
-        # source=fred only — no fixture mix-in, no silent alternate source.
+        # source=nyfed only — no fixture mix-in, no silent alternate source.
         try:
             sofr = load_sofr_series_from_ch(
                 ch_client,  # type: ignore[arg-type]
                 table=cfg.tables.sofr_daily,
                 start=cfg.window.start,
                 end=cfg.window.end,
-                source="fred",
+                source="nyfed",
             )
         except ValueError as e:
             raise SystemExit(f"sofr-ch failed: {e}") from e
         rates = list(sofr.values())
         print(
-            f"sofr-ch: source=fred dates={len(sofr)} "
+            f"sofr-ch: source=nyfed dates={len(sofr)} "
             f"rate_min={min(rates):.6f} rate_max={max(rates):.6f}"
         )
     elif args.sofr_csv is not None:

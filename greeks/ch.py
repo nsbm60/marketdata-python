@@ -15,7 +15,6 @@ import clickhouse_connect
 from clickhouse_connect.driver.client import Client
 
 from greeks.domain import Dividend
-from greeks.forwards.sofr import SofrObservation, load_sofr_csv, rows_for_clickhouse
 from greeks.harness.rows import ResidualRow, ValidationRow, VendorSnapshot
 from greeks.harness.store import residual_to_ch_dict, validation_to_ch_dict
 
@@ -55,16 +54,17 @@ def load_sofr_series_from_ch(
     table: str = "trading.sofr_daily",
     start: Optional[date] = None,
     end: Optional[date] = None,
-    source: str = "fred",
+    source: str = "nyfed",
 ) -> dict[date, float]:
     """Read SOFR rates from ClickHouse into ``date -> decimal rate``.
 
     **No silent fallback.** Uses ``FINAL`` (ReplacingMergeTree) and requires an
-    explicit ``source`` (default ``fred``). Fixture rows are never mixed in.
+    explicit ``source`` (default ``nyfed``: the Scala BatchService sofr job, the table's only
+    writer). Fixture and old ``fred`` rows are never mixed in.
     Raises ``ValueError`` if the query returns no rows.
     """
     if not source or not str(source).strip():
-        raise ValueError("source is required (e.g. 'fred'); refusing unscoped load")
+        raise ValueError("source is required (e.g. 'nyfed'); refusing unscoped load")
     src = str(source).strip()
     # FINAL so ReplacingMergeTree keeps latest version per date; source filter
     # so fixture/fred never collapse into an ambiguous dict overwrite.
@@ -99,7 +99,7 @@ def load_sofr_series_from_ch(
             f"no SOFR rows in {table} for source={src!r}"
             + (f" start={start}" if start is not None else "")
             + (f" end={end}" if end is not None else "")
-            + " — load FRED first; will not fall back to fixture"
+            + " — is the BatchService sofr job running? Will not fall back to fixture"
         )
     return out
 
@@ -132,45 +132,6 @@ def load_upcoming_dividends(
             raise ValueError(f"{table}: {sym} ex_date={ex} has amount {amount!r}")
         out.setdefault(sym, []).append(Dividend(underlying=sym, amount=amount, ex_date=ex))
     return {k: tuple(v) for k, v in out.items()}
-
-
-def insert_sofr_observations(
-    client: Client,
-    observations: Sequence[SofrObservation],
-    *,
-    table: str = "trading.sofr_daily",
-) -> int:
-    """Insert SOFR rows (ReplacingMergeTree on fetched_at). Returns row count."""
-    rows = rows_for_clickhouse(list(observations))
-    if not rows:
-        return 0
-    db, name = _split_table(table)
-    client.insert(
-        name,
-        [[r["date"], r["rate"], r["source"], r["fetched_at"]] for r in rows],
-        column_names=["date", "rate", "source", "fetched_at"],
-        database=db,
-    )
-    return len(rows)
-
-
-def load_sofr_fixture_to_ch(
-    client: Client,
-    *,
-    csv_path: Optional[str] = None,
-    table: str = "trading.sofr_daily",
-    source: str = "fixture",
-) -> int:
-    """Push package SOFR CSV (or path) into ClickHouse."""
-    series = load_sofr_csv(csv_path)
-    now = datetime.now(timezone.utc)
-    obs = [
-        SofrObservation(obs_date=d, rate=r, source=source)
-        for d, r in sorted(series.items())
-    ]
-    # stamp fetched_at once via rows_for_clickhouse
-    _ = now
-    return insert_sofr_observations(client, obs, table=table)
 
 
 def fetch_vendor_snapshots(

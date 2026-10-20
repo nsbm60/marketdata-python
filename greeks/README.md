@@ -105,8 +105,8 @@ Operational notes (live):
   nearest-ATM when capping.
 - Invert uses the package SOFR CSV by default (`--sofr-csv`). Prefer
   `--sofr-ch` once `trading.sofr_daily` is loaded.
-- SOFR load: `python -m greeks.forwards --load-fixture` (or `--fred` with
-  `FRED_API_KEY`).
+- SOFR: `trading.sofr_daily` is written only by the Scala BatchService `sofr` job (NY Fed
+  API, `source='nyfed'`, full history from 2018-04-02). The manual loader is gone.
 - Vendor join: `--vendor-ch` pulls `trading.option_snapshot`; `--write-ch`
   inserts validation + residuals into ClickHouse.
 - Example (after pull/staging exists)::
