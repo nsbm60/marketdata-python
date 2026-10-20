@@ -2,7 +2,7 @@
 
 Startup order (P18):
   1. Load config.
-  2. Resolve the bus and connect ClickHouse through the facade.
+  2. Resolve the bus and MDS, connect ClickHouse, fetch the calendar from MDS (waits for MDS).
   3. If in session, load SOFR and dividends.
   4. Start the compute thread and its ResilientSub (it waits for the PUB before publishing).
   5. Service.run(): connects the PUB, binds the router, then advertises. Blocks.
@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from discovery import ControlService, ServiceLocator
 from greeks.config import load_config
 from greeks.topic_builder import TopicBuilder
-from greeks_server.calendar import session_at
+from greeks_server.calendar import ET, SessionCalendar, mds_fetch
 from greeks_server.handler import OP, make_handler
 from greeks_server.inputs import InputsHolder, clickhouse_loader
 from greeks_server.loop import ComputeLoop
@@ -45,17 +45,19 @@ def main() -> int:
     )
 
     bus = ServiceLocator.bus()
+    mds = ServiceLocator.control(ControlService.MARKET_DATA)  # waits with retry
     from ml.shared.clickhouse import get_ch_client  # canonical connector
 
     ch = get_ch_client()  # connect now: a bad env file fails at deploy, not at 09:30
     inputs = InputsHolder(clickhouse_loader(lambda: ch))
     now = datetime.now(timezone.utc)
-    session = session_at(now)
+    calendar = SessionCalendar(mds_fetch(mds.router), now.astimezone(ET).date())
+    session = calendar.session_at(now)
     if session is not None:
         inputs.load_session(session.date)
 
     service = Service(name=ControlService.GREEKS, router_port=s.router_port)
-    service.register_handler(OP, make_handler(cfg, inputs))
+    service.register_handler(OP, make_handler(cfg, inputs, calendar.session_at))
 
     fatal: list[BaseException] = []
 
@@ -84,6 +86,7 @@ def main() -> int:
         publisher_ready=service.publisher_ready,
         inputs=inputs,
         on_fatal=on_fatal,
+        session_fn=calendar.session_at,
     )
     def stop_loop() -> None:
         loop.stop()

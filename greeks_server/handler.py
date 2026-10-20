@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 from greeks.config import GreeksConfig
-from greeks_server.calendar import ET, session_at
+from greeks_server.calendar import ET, Session
 from greeks_server.compute import Contract, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
@@ -82,6 +82,7 @@ def parse_request(payload: Mapping[str, Any]) -> list[tuple[Contract, SelectedPr
 def make_handler(
     cfg: GreeksConfig,
     inputs: InputsHolder,
+    session_fn: Callable[[datetime], Optional[Session]],
     *,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
@@ -90,7 +91,7 @@ def make_handler(
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         items = parse_request(payload)  # validate everything before any work
         t = now()
-        session_inputs = inputs.for_request(t.astimezone(ET).date(), in_session=session_at(t) is not None)
+        session_inputs = inputs.for_request(t.astimezone(ET).date(), in_session=session_fn(t) is not None)
         return {
             "results": [
                 compute_or_fail(c, opx, spx, session_inputs, t, m).to_wire() for c, opx, spx in items

@@ -1,65 +1,108 @@
-"""Session calendar: a port of Scala USMarketCalendar.sessionFor (holidays, 09:30–16:00 ET)."""
+"""SessionCalendar: sessions come from MDS get_trading_sessions, cached; no local holiday rules."""
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Sequence
 
-from greeks_server.calendar import holidays, is_trading_day, session_at, session_for
+import pytest
 
-ET = ZoneInfo("America/New_York")
-
-# NYSE full-day closures (published schedule), which the Scala calendar reproduces.
-NYSE_2026 = {
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3), date(2026, 5, 25),
-    date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7), date(2026, 11, 26), date(2026, 12, 25),
-}
-NYSE_2027 = {
-    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26), date(2027, 5, 31),
-    date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6), date(2027, 11, 25), date(2027, 12, 24),
-}
+from greeks_server.calendar import ET, Session, SessionCalendar
 
 
-def test_holidays_2026() -> None:
-    assert holidays(2026) == NYSE_2026
+def _sess(d: date) -> Session:
+    return Session(
+        d,
+        datetime.combine(d, time(9, 30), tzinfo=ET).astimezone(timezone.utc),
+        datetime.combine(d, time(16, 0), tzinfo=ET).astimezone(timezone.utc),
+    )
 
 
-def test_holidays_2027() -> None:
-    assert holidays(2027) == NYSE_2027
-    # Jan 1 2028 is a Saturday. NYSE does not observe it on Fri Dec 31 2027 (as 2021-12-31).
-    assert is_trading_day(date(2027, 12, 31))
+class FakeMds:
+    """Weekdays only, as MDS would answer (holidays are MDS's business, not ours)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[date, date]] = []
+        self.down = False
+
+    def __call__(self, start: date, end: date) -> Sequence[Session]:
+        self.calls.append((start, end))
+        if self.down:
+            raise RuntimeError("MDS timeout for get_trading_sessions")
+        out, d = [], start
+        while d <= end:
+            if d.weekday() < 5:
+                out.append(_sess(d))
+            d += timedelta(days=1)
+        return out
 
 
-def test_weekends_and_holidays_have_no_session() -> None:
-    assert session_for(date(2026, 10, 24)) is None  # Saturday
-    assert session_for(date(2026, 10, 25)) is None  # Sunday
-    assert session_for(date(2026, 11, 26)) is None  # Thanksgiving
-    assert is_trading_day(date(2026, 11, 27))       # day after: open (no early close modelled)
+def _et(d: date, h: int, m: int) -> datetime:
+    return datetime.combine(d, time(h, m), tzinfo=ET).astimezone(timezone.utc)
 
 
-def _et(y: int, mo: int, d: int, h: int, mi: int, s: int = 0) -> datetime:
-    return datetime(y, mo, d, h, mi, s, tzinfo=ET).astimezone(timezone.utc)
+TUE = date(2026, 10, 20)
 
 
-def test_session_bounds_edt() -> None:
-    assert session_at(_et(2026, 10, 20, 9, 29, 59)) is None
-    s = session_at(_et(2026, 10, 20, 9, 30))
-    assert s is not None and s.date == date(2026, 10, 20)
-    assert s.open_utc == datetime(2026, 10, 20, 13, 30, tzinfo=timezone.utc)
-    assert session_at(_et(2026, 10, 20, 15, 59, 59)) is not None
-    assert session_at(_et(2026, 10, 20, 16, 0)) is None
+def test_startup_fetches_a_week() -> None:
+    mds = FakeMds()
+    SessionCalendar(mds, TUE)
+    assert mds.calls == [(TUE, TUE + timedelta(days=7))]
 
 
-def test_session_bounds_est() -> None:
-    s = session_at(_et(2026, 12, 1, 12, 0))
-    assert s is not None
-    assert s.open_utc == datetime(2026, 12, 1, 14, 30, tzinfo=timezone.utc)
-    assert s.close_utc == datetime(2026, 12, 1, 21, 0, tzinfo=timezone.utc)
-    assert s.open_ms == int(s.open_utc.timestamp() * 1000)
+def test_startup_without_mds_raises() -> None:
+    mds = FakeMds()
+    mds.down = True
+    with pytest.raises(RuntimeError):
+        SessionCalendar(mds, TUE)
 
 
-def test_every_day_of_2026_matches_weekday_minus_holidays() -> None:
-    d = date(2026, 1, 1)
-    while d.year == 2026:
-        assert is_trading_day(d) == (d.weekday() < 5 and d not in NYSE_2026)
-        d += timedelta(days=1)
+def test_session_bounds() -> None:
+    cal = SessionCalendar(FakeMds(), TUE)
+    assert cal.session_at(_et(TUE, 9, 29)) is None
+    s = cal.session_at(_et(TUE, 9, 30))
+    assert s is not None and s.date == TUE and s.open_ms == int(s.open_utc.timestamp() * 1000)
+    assert cal.session_at(_et(TUE, 15, 59)) is not None
+    assert cal.session_at(_et(TUE, 16, 0)) is None
+    assert cal.session_at(_et(date(2026, 10, 24), 12, 0)) is None  # Saturday: MDS sent none
+
+
+def test_reads_cache_then_refreshes_with_two_days_left() -> None:
+    mds = FakeMds()
+    cal = SessionCalendar(mds, TUE)
+    cal.session_at(_et(TUE + timedelta(days=5), 12, 0))   # 2 days left: cached, no fetch
+    assert len(mds.calls) == 1
+    later = TUE + timedelta(days=6)                        # 1 day left: refresh from that day
+    assert cal.session_at(_et(later, 12, 0)) is not None
+    assert mds.calls[-1] == (later, later + timedelta(days=7))
+
+
+def test_mds_outage_mid_session_does_not_affect_gating() -> None:
+    mds = FakeMds()
+    t = [0.0]
+    cal = SessionCalendar(mds, TUE, monotonic=lambda: t[0])
+    mds.down = True
+    day6 = TUE + timedelta(days=6)                         # refresh due, MDS down, cache covers it
+    assert cal.session_at(_et(day6, 12, 0)) is not None
+    n = len(mds.calls)
+    cal.session_at(_et(day6, 12, 1))                       # retried at most once a minute
+    assert len(mds.calls) == n
+    t[0] += 61
+    cal.session_at(_et(day6, 12, 2))
+    assert len(mds.calls) == n + 1
+
+
+def test_uncovered_date_without_mds_raises() -> None:
+    mds = FakeMds()
+    cal = SessionCalendar(mds, TUE)
+    mds.down = True
+    with pytest.raises(RuntimeError, match="no calendar"):
+        cal.session_at(_et(TUE + timedelta(days=9), 12, 0))
+
+
+def test_bad_session_rejected() -> None:
+    def bad(start: date, end: date) -> Sequence[Session]:
+        s = _sess(start)
+        return [Session(s.date, s.close_utc, s.open_utc)]
+    with pytest.raises(ValueError):
+        SessionCalendar(bad, TUE)

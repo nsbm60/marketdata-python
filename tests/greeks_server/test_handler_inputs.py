@@ -27,7 +27,7 @@ def _handler(loads: list[date]) -> Any:
     def loader(d: date) -> SessionInputs:
         loads.append(d)
         return SessionInputs(session_date=d, sofr=sofr_flat(), dividends={})
-    return make_handler(load_config(), InputsHolder(loader), now=lambda: NOW)
+    return make_handler(load_config(), InputsHolder(loader), lambda t: object(), now=lambda: NOW)  # type: ignore[arg-type,return-value]
 
 
 def test_results_in_input_order() -> None:

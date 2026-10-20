@@ -6,7 +6,7 @@ Each iteration: receive (bounded by min_pass_interval), check the calendar, then
   - in session: apply the tick, mark everything dirty every clock_tick_s, and run a pass when the
     dirty set is non-empty and min_pass_interval has elapsed since the last one.
 
-The calendar check is the only session signal, so a pre-open start, a mid-session start and a
+The calendar check (MDS sessions, cached — greeks_server/calendar.py) is the only session signal, so a pre-open start, a mid-session start and a
 restart all take the same path. Off-session ticks are dropped. A failure to load session inputs
 is fatal: on_fatal stops the service and the process exits for systemd to restart.
 """
@@ -22,7 +22,7 @@ from typing import Any, Callable, Optional, Protocol
 from greeks.config import GreeksConfig
 from greeks.topic_builder import TopicBuilder
 from greeks_server.book import Book
-from greeks_server.calendar import Session, session_at
+from greeks_server.calendar import Session
 from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.price import select_price
@@ -61,10 +61,10 @@ class ComputeLoop(threading.Thread):
         publisher_ready: threading.Event,
         inputs: InputsHolder,
         on_fatal: Callable[[BaseException], None],
+        session_fn: Callable[[datetime], Optional[Session]],
         *,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         monotonic: Callable[[], float] = time.monotonic,
-        session_fn: Callable[[datetime], Optional[Session]] = session_at,
     ) -> None:
         super().__init__(name="greeks-compute", daemon=True)
         self._cfg = cfg

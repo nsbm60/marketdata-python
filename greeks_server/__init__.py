@@ -6,7 +6,7 @@ answers compute_greeks for contracts that aren't streamed. Pricing comes from th
 uses threads (the service library), which ``greeks/`` forbids.
 
 Modules
-  calendar  session hours (port of the Scala USMarketCalendar)
+  calendar  session hours from MDS get_trading_sessions, cached
   wire      decode MDS tick payloads
   price     price selection (§4)
   inputs    SOFR + dividends per session
