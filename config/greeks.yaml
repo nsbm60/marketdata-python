@@ -43,3 +43,10 @@ tables:
   option_contract: "trading.option_contract"
   earnings_calendar: "trading.earnings_calendar"
   sofr_daily: "trading.sofr_daily"
+
+# Live greeks server (greeks_server/, greeks-server-spec.md §9). All fields required.
+server:
+  router_port: 6110            # block above the bus (6100/6101); 6000-6092 are taken
+  clock_tick_s: 5              # the time input: mark every contract dirty this often
+  min_pass_interval_ms: 250    # coalescing: at most one pricing pass per interval
+  topic_prefix: "shadow."      # Phase 1 shadow; "" at cutover (spec §10)

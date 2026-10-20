@@ -29,6 +29,8 @@ class FailureReason(str, Enum):
     SOLVER_FAILED = "solver_failed"
     NONSTANDARD_CONTRACT = "nonstandard_contract"
     MISSING_SPOT = "missing_spot"
+    # Live server: no two-sided quote and no last trade from the current session.
+    NO_SESSION_PRICE = "no_session_price"
     MISSING_FORWARD_INPUTS = "missing_forward_inputs"
     EXCLUDED_DATE = "excluded_date"
     # Diagnostic: --price mid requires a two-sided vendor quote at join; not a solver fault.

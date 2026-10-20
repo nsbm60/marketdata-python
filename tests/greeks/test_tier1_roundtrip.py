@@ -1,4 +1,10 @@
-"""Tier-1 frozen fixtures: 1e-10 relative IV recovery + bit-for-bit expected iv."""
+"""Tier-1 frozen fixtures: 1e-10 relative IV recovery + frozen expected iv to 1e-12 relative.
+
+The frozen-IV check was bit for bit. The v1 grid was generated on macOS arm64, and the last ulp
+of Jäckel's IV differs on Linux (x86_64 and aarch64: e.g. 2.0 vs 1.9999999999999996), so the
+check failed on drogon's certify step. 1e-12 relative is 10^4 ulps and still far inside the
+1e-10 recovery gate; any methodology change moves IV by orders of magnitude more.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ from greeks.solver.invert import invert, relative_iv_error
 
 FIXTURE_DIR = Path(__file__).resolve().parents[2] / "greeks" / "fixtures" / "v1"
 MAX_REL = 1e-10
+FROZEN_REL = 1e-12
 
 
 def _load_rows() -> list[dict[str, object]]:
@@ -62,7 +69,8 @@ def test_tier1_relative_and_bit_for_bit() -> None:
         rel = relative_iv_error(result.iv, true_vol)
         worst = max(worst, rel)
         assert rel <= MAX_REL, f"rel={rel} row={row}"
-        # Bit-for-bit vs frozen expected_iv under current methodology
-        assert result.iv == float(row["expected_iv"])  # type: ignore[arg-type]
+        # Frozen expected_iv under current methodology (portable tolerance, see docstring)
+        expected = float(row["expected_iv"])  # type: ignore[arg-type]
+        assert abs(result.iv - expected) <= FROZEN_REL * abs(expected), row
 
     assert worst <= MAX_REL

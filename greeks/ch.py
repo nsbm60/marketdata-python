@@ -14,6 +14,7 @@ from typing import Any, Mapping, Optional, Sequence
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
 
+from greeks.domain import Dividend
 from greeks.forwards.sofr import SofrObservation, load_sofr_csv, rows_for_clickhouse
 from greeks.harness.rows import ResidualRow, ValidationRow, VendorSnapshot
 from greeks.harness.store import residual_to_ch_dict, validation_to_ch_dict
@@ -101,6 +102,36 @@ def load_sofr_series_from_ch(
             + " — load FRED first; will not fall back to fixture"
         )
     return out
+
+
+def load_upcoming_dividends(
+    client: Client,
+    *,
+    after: date,
+    table: str = "trading.dividend",
+) -> dict[str, tuple[Dividend, ...]]:
+    """Cash dividends with ex-date strictly after ``after``, by underlying symbol.
+
+    ``trading.dividend`` is maintained by the Scala DividendJob, which replaces a
+    symbol's not-yet-ex rows on every run, so upcoming rows are not duplicated.
+    A symbol with no upcoming dividend is simply absent from the result.
+    """
+    sql = (
+        f"SELECT symbol, ex_date, amount FROM {table} "
+        "WHERE ex_date > {after:Date} ORDER BY symbol, ex_date"
+    )
+    result = client.query(sql, parameters={"after": after})
+    out: dict[str, list[Dividend]] = {}
+    for row in result.result_rows:
+        sym = str(row[0]).upper()
+        ex = row[1]
+        if isinstance(ex, datetime):
+            ex = ex.date()
+        amount = float(row[2])
+        if not (amount >= 0.0):
+            raise ValueError(f"{table}: {sym} ex_date={ex} has amount {amount!r}")
+        out.setdefault(sym, []).append(Dividend(underlying=sym, amount=amount, ex_date=ex))
+    return {k: tuple(v) for k, v in out.items()}
 
 
 def insert_sofr_observations(
