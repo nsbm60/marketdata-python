@@ -168,3 +168,18 @@ def test_stop_makes_recv_return_immediately(pub) -> None:
     assert time.monotonic() - t0 < 0.5
     assert sub.running is False
     sub.close()
+
+
+def test_bad_endpoint_neither_hangs_nor_spins() -> None:
+    t0 = time.monotonic()
+    sub = ResilientSub("t", "bogus-endpoint", ["md."], HB, heartbeat_interval_s=0.1, max_missed=2,
+                       reconnect_delay_s=0.01, recv_timeout_s=0.05)
+    assert time.monotonic() - t0 < 1.0             # constructor returns
+    calls = 0
+    t1 = time.monotonic()
+    while time.monotonic() - t1 < 0.5:
+        assert sub.recv() == ("", "")
+        calls += 1
+    assert calls < 20                              # waits per call, no busy loop
+    assert sub.reconnects >= 1                     # and keeps retrying the connect
+    sub.close()

@@ -89,7 +89,14 @@ class ResilientSub:
 
     def recv(self) -> tuple[str, str]:
         """Next DATA message as (topic, payload), or ("", "") on heartbeat/timeout."""
-        if not self._running or self._socket is None:
+        if not self._running:
+            return "", ""
+        if self._socket is None:
+            # A connect failed. Wait like a receive timeout, then let the heartbeat check
+            # retry the connect (Scala gets here through its recv error path).
+            self._stop.wait(self._recv_timeout_s)
+            if self._running:
+                self._check_heartbeat()
             return "", ""
         try:
             if self._socket.poll(int(self._recv_timeout_s * 1000), zmq.POLLIN) == 0:
@@ -162,15 +169,16 @@ class ResilientSub:
     def _connect(self) -> None:
         try:
             self._ctx = zmq.Context()
-            sock = self._ctx.socket(zmq.SUB)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(self._endpoint)
+            # Held on self at once so a failure below still closes it (else ctx.term() blocks).
+            self._socket = self._ctx.socket(zmq.SUB)
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.connect(self._endpoint)
             for prefix in [*self._data_prefixes, self._heartbeat_topic]:
-                sock.setsockopt_string(zmq.SUBSCRIBE, prefix)
-            self._socket = sock
+                self._socket.setsockopt_string(zmq.SUBSCRIBE, prefix)
         except Exception as e:
             log.error("[%s] Connection failed: %s", self._name, e)
             self._close_socket()
+            return  # as in Scala: the heartbeat clock is not reset, so the retry comes on time
         # Give the publisher time to send a first heartbeat, and re-arm the live callback:
         # a reconnect has the same blind window as a first connect.
         self._last_heartbeat = self._clock()

@@ -67,6 +67,7 @@ class Service:
         # Set once run() has connected the PUB socket. publish() raises before then, so a
         # thread started before run() waits on this before its first publish.
         self.publisher_ready = threading.Event()
+        self._shutdown_hooks: list = []
 
         self._router = Router(self._name, router_port)
         self._advertiser: Advertiser | None = None
@@ -77,12 +78,16 @@ class Service:
         """Register a handler for an operation name."""
         self._router.register_handler(op, handler)
 
+    def add_shutdown_hook(self, fn: callable) -> None:
+        """Run fn at shutdown, before any socket is closed (e.g. stop a publishing thread)."""
+        self._shutdown_hooks.append(fn)
+
     def publish(self, topic: str, payload: dict) -> None:
         """Publish a message on the service's PUB socket."""
-        if self._pub_socket is None:
-            raise RuntimeError("Service not started — call run() first")
         data = json.dumps(payload)
         with self._pub_lock:
+            if self._pub_socket is None:
+                raise RuntimeError("Service not started (or already stopped) — no PUB socket")
             self._pub_socket.send_multipart([
                 topic.encode("utf-8"),
                 data.encode("utf-8"),
@@ -167,6 +172,11 @@ class Service:
         self._shutdown_event.set()
 
     def _cleanup(self) -> None:
+        for fn in self._shutdown_hooks:
+            try:
+                fn()
+            except Exception as e:
+                log.warning("[%s] shutdown hook failed: %s", self._name, e)
         if self._self_ping:
             self._self_ping.stop()
         if self._heartbeat:
@@ -174,11 +184,13 @@ class Service:
         if self._advertiser:
             self._advertiser.stop()
         self._router.close()
-        if self._pub_socket:
-            try:
-                self._pub_socket.close(linger=0)
-            except Exception:
-                pass
+        with self._pub_lock:
+            if self._pub_socket:
+                try:
+                    self._pub_socket.close(linger=0)
+                except Exception:
+                    pass
+                self._pub_socket = None
         if self._context:
             try:
                 self._context.term()

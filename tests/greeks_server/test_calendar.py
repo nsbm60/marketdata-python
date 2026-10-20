@@ -25,8 +25,9 @@ def test_holidays_2026() -> None:
 
 
 def test_holidays_2027() -> None:
-    # Jan 1 2028 is a Saturday: the Scala rule adds Fri Dec 31 2027 (NYSE itself stays open).
-    assert holidays(2027) == NYSE_2027 | {date(2027, 12, 31)}
+    assert holidays(2027) == NYSE_2027
+    # Jan 1 2028 is a Saturday. NYSE does not observe it on Fri Dec 31 2027 (as 2021-12-31).
+    assert is_trading_day(date(2027, 12, 31))
 
 
 def test_weekends_and_holidays_have_no_session() -> None:

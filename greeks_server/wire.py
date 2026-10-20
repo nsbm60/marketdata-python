@@ -44,20 +44,31 @@ class Tick:
     trade: Optional[Trade] = None
 
 
+# Epoch millis are 13 digits from 2001 to 2286. Anything else (seconds, nanos) is not millis.
+_MS_MIN = 1_000_000_000_000
+_MS_MAX = 9_999_999_999_999
+# A tick stamped further ahead of the wall clock than this is rejected: kept, it would outrank
+# every real tick (newer-only) and pin the price for the rest of the session.
+MAX_FUTURE_MS = 60_000
+
+
+def _ms(v: int) -> Optional[int]:
+    return v if _MS_MIN <= v <= _MS_MAX else None
+
+
 def parse_market_ts(raw: Any) -> Optional[int]:
     """Epoch millis from a tick timestamp: digits = epoch millis, else ISO-8601. None if neither."""
     if isinstance(raw, bool):
         return None
     if isinstance(raw, int):
-        return raw if raw > 0 else None
+        return _ms(raw)
     if not isinstance(raw, str):
         return None
     s = raw.strip()
     if not s:
         return None
     if s.isdigit():
-        v = int(s)
-        return v if v > 0 else None
+        return _ms(int(s))
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
@@ -74,8 +85,12 @@ def _side(v: Any) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
-def decode_tick(payload: str) -> Optional[Tick]:
-    """Decode a quote or trade payload. None if it isn't a well-formed one."""
+def decode_tick(payload: str, now_ms: int) -> Optional[Tick]:
+    """Decode a quote or trade payload. None if it isn't a well-formed one.
+
+    ``now_ms`` (wall clock) only bounds the timestamp: a tick more than MAX_FUTURE_MS ahead of
+    it is rejected. The tick's own time is never replaced by the wall clock.
+    """
     try:
         d = json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -86,7 +101,7 @@ def decode_tick(payload: str) -> Optional[Tick]:
     if not isinstance(sym, str) or not sym.strip():
         return None
     ts = parse_market_ts(d.get("timestamp"))
-    if ts is None:
+    if ts is None or ts > now_ms + MAX_FUTURE_MS:
         return None
     kind = d.get("type")
     if kind == "quote":

@@ -10,7 +10,7 @@ from greeks.domain import Dividend, FailureReason, RowStatus, SolverInput
 from greeks.forwards.carry import carry
 from greeks.solver.black76 import price as black_price
 from greeks.solver.invert import invert
-from greeks_server.compute import Contract, compute
+from greeks_server.compute import Contract, compute, compute_or_fail
 from greeks_server.price import PriceKind, SelectedPrice
 
 from gs_helpers import M, NOW, NOW_MS, SESSION, inputs
@@ -93,3 +93,12 @@ def test_expired_contract() -> None:
     msg = compute(old, SelectedPrice(1.2, PriceKind.MID, NOW_MS), SPOT, inputs(), NOW, M)
     assert msg.reason is FailureReason.T_BELOW_FLOOR
     assert SESSION > old.expiry
+
+
+def test_unexpected_error_is_one_contracts_solver_failed() -> None:
+    bad_div = {"NVDA": (Dividend("NVDA", -1.0, date(2026, 11, 5)),)}  # carry() raises
+    px = SelectedPrice(9.0, PriceKind.MID, NOW_MS)
+    with pytest.raises(ValueError):
+        compute(C, px, SPOT, inputs(bad_div), NOW, M)
+    msg = compute_or_fail(C, px, SPOT, inputs(bad_div), NOW, M)
+    assert msg.reason is FailureReason.SOLVER_FAILED and msg.price == 9.0

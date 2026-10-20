@@ -95,7 +95,12 @@ def clickhouse_loader(get_client: Callable[[], object]) -> Loader:
 
 
 class InputsHolder:
-    """The current SessionInputs, swapped whole. get_for() loads when the date changes."""
+    """The session's SessionInputs, swapped whole.
+
+    Only a session load fills it: startup inside a session, or the compute loop at the open.
+    An off-session compute_greeks loads fresh and does not cache, so an early-morning request
+    can't leave the open running on inputs loaded before the 08:45 SOFR job.
+    """
 
     def __init__(self, loader: Loader) -> None:
         self._loader = loader
@@ -104,13 +109,22 @@ class InputsHolder:
     def current(self) -> Optional[SessionInputs]:
         return self._current
 
-    def load(self, session_date: date) -> SessionInputs:
+    def load_session(self, session_date: date) -> SessionInputs:
+        """Load for a session that is open now, and keep it."""
         inputs = self._loader(session_date)
         self._current = inputs
         return inputs
 
-    def get_for(self, session_date: date) -> SessionInputs:
+    def session_inputs(self, session_date: date) -> SessionInputs:
+        """The open's inputs: reuse a load already made inside this session (startup), else load."""
         cur = self._current
         if cur is not None and cur.session_date == session_date:
             return cur
-        return self.load(session_date)
+        return self.load_session(session_date)
+
+    def for_request(self, session_date: date, in_session: bool) -> SessionInputs:
+        """compute_greeks: the session's inputs while it is open, a fresh uncached load otherwise."""
+        cur = self._current
+        if in_session and cur is not None and cur.session_date == session_date:
+            return cur
+        return self._loader(session_date)

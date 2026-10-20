@@ -5,8 +5,9 @@ iteration covers a pre-open start, a mid-session start and a restart. It mirrors
 calendar exactly, including what that calendar leaves out:
 
   - Trading days: Mon–Fri minus New Year's, MLK, Presidents, Good Friday, Memorial, Juneteenth,
-    Independence, Labor, Thanksgiving, Christmas (Sat → Fri, Sun → Mon observed), plus the Scala
-    rule that a Saturday Jan 1 of NEXT year makes Dec 31 of this year a holiday.
+    Independence, Labor, Thanksgiving, Christmas (Sat → Fri, Sun → Mon observed). A Saturday
+    Jan 1 is not observed on the Friday before (NYSE: 2021-12-31 traded); the Scala calendar had
+    that wrong and was fixed with this port.
   - Session 09:30–16:00 America/New_York. No early closes.
 
 A change to the Scala calendar must be made here too; tests/greeks_server/test_calendar.py pins
@@ -16,6 +17,7 @@ the 2026 and 2027 holiday lists.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -82,6 +84,7 @@ def _easter_sunday(year: int) -> date:
     return date(year, month, day)
 
 
+@lru_cache(maxsize=8)
 def holidays(year: int) -> frozenset[date]:
     """The Scala calendar's holiday set for one year."""
     days = {
@@ -96,9 +99,6 @@ def holidays(year: int) -> frozenset[date]:
         _observed(date(year, 12, 25)),
         _easter_sunday(year) - timedelta(days=2),
     }
-    next_ny = _observed(date(year + 1, 1, 1))
-    if next_ny.year == year:
-        days.add(next_ny)
     return frozenset(days)
 
 

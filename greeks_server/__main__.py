@@ -47,11 +47,12 @@ def main() -> int:
     bus = ServiceLocator.bus()
     from ml.shared.clickhouse import get_ch_client  # canonical connector
 
-    inputs = InputsHolder(clickhouse_loader(get_ch_client))
+    ch = get_ch_client()  # connect now: a bad env file fails at deploy, not at 09:30
+    inputs = InputsHolder(clickhouse_loader(lambda: ch))
     now = datetime.now(timezone.utc)
     session = session_at(now)
     if session is not None:
-        inputs.load(session.date)
+        inputs.load_session(session.date)
 
     service = Service(name=ControlService.GREEKS, router_port=s.router_port)
     service.register_handler(OP, make_handler(cfg, inputs))
@@ -84,12 +85,17 @@ def main() -> int:
         inputs=inputs,
         on_fatal=on_fatal,
     )
+    def stop_loop() -> None:
+        loop.stop()
+        loop.join(timeout=5.0)
+
+    # Runs inside Service cleanup BEFORE the PUB socket closes, so no pass publishes into it.
+    service.add_shutdown_hook(stop_loop)
     loop.start()
     try:
         service.run()
     finally:
-        loop.stop()
-        loop.join(timeout=5.0)
+        stop_loop()
     if fatal:
         log.error("exiting: %s", fatal[0])
         return 1

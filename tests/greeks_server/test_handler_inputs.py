@@ -39,7 +39,9 @@ def test_results_in_input_order() -> None:
     assert res[0]["status"] == "success" and res[1]["reason"] == "below_intrinsic"
     assert res[0]["spot_kind"] == "last"
     h({"op": "compute_greeks", "contracts": [_item()]})
-    assert loads == [SESSION]  # loaded once for the date
+    # NOW is in session but nothing loaded the session: each request loads fresh, uncached,
+    # so the open can't inherit a pre-08:45 load.
+    assert loads == [SESSION, SESSION]
 
 
 def test_empty_list_is_fine() -> None:
@@ -52,6 +54,7 @@ def test_empty_list_is_fine() -> None:
         ({"contracts": "x"}, "'contracts' must be a list"),
         ({"contracts": [_item(osi="NVDA1261120C00180000")]}, "not a standard OSI"),
         ({"contracts": [_item(price=0)]}, "price must be a positive number"),
+        ({"contracts": [_item(spot=float("inf"))]}, "spot must be a positive number"),
         ({"contracts": [_item(price_kind="bid")]}, "price_kind must be 'mid' or 'last'"),
         ({"contracts": [_item(spot_ts=1.5)]}, "spot_ts must be epoch millis"),
         ({"contracts": [{k: v for k, v in _item().items() if k != "spot_kind"}]}, "missing field(s): spot_kind"),
@@ -77,3 +80,19 @@ def test_rate_memo_per_expiry() -> None:
     r1 = inp.rate_for(date(2026, 11, 20))
     assert inp.rate_for(date(2026, 11, 20)) is r1
     assert r1 == pytest.approx(0.04 * 365 / 360, rel=1e-3)  # ACT/360 simple -> ACT/365 continuous
+
+
+def test_holder_session_vs_request() -> None:
+    loads: list[date] = []
+
+    def loader(d: date) -> SessionInputs:
+        loads.append(d)
+        return SessionInputs(session_date=d, sofr=sofr_flat(), dividends={})
+
+    h = InputsHolder(loader)
+    h.for_request(SESSION, in_session=False)
+    assert h.current() is None                     # off-session request does not cache
+    s1 = h.session_inputs(SESSION)                 # the open loads
+    assert h.for_request(SESSION, in_session=True) is s1
+    assert h.session_inputs(SESSION) is s1
+    assert loads == [SESSION, SESSION]

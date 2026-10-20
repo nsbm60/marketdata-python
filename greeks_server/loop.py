@@ -23,7 +23,7 @@ from greeks.config import GreeksConfig
 from greeks.topic_builder import TopicBuilder
 from greeks_server.book import Book
 from greeks_server.calendar import Session, session_at
-from greeks_server.compute import Contract, Methodology, compute
+from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.price import select_price
 from greeks_server.wire import decode_tick
@@ -123,7 +123,7 @@ class ComputeLoop(threading.Thread):
         if self.session is None:
             return
         if topic:
-            self._apply(topic, payload)
+            self._apply(topic, payload, now)
         mono = self._mono()
         if mono - self._last_tick >= self._tick_s:
             self.book.mark_all_dirty()
@@ -136,7 +136,7 @@ class ComputeLoop(threading.Thread):
     def _gate(self, now: datetime) -> None:
         s = self._session_fn(now)
         if s is not None and (self.session is None or self.session.date != s.date):
-            inputs = self._inputs.get_for(s.date)  # raises -> fatal
+            inputs = self._inputs.session_inputs(s.date)  # raises -> fatal
             self.book = Book()
             self.session = s
             self._session_inputs = inputs
@@ -148,8 +148,8 @@ class ComputeLoop(threading.Thread):
             self._session_inputs = None
             self.book = Book()
 
-    def _apply(self, topic: str, payload: str) -> None:
-        tick = decode_tick(payload)
+    def _apply(self, topic: str, payload: str, now: datetime) -> None:
+        tick = decode_tick(payload, int(now.timestamp() * 1000))
         if tick is None:
             self._stats.bad_ticks += 1
             return
@@ -173,7 +173,7 @@ class ComputeLoop(threading.Thread):
         for c in contracts:
             spot_px = select_price(b.equity_quotes.get(c.underlying), b.equity_trades.get(c.underlying), open_ms)
             opt_px = select_price(b.option_quotes.get(c.osi), b.option_trades.get(c.osi), open_ms)
-            msg = compute(c, opt_px, spot_px, inputs, now, self._m)
+            msg = compute_or_fail(c, opt_px, spot_px, inputs, now, self._m)
             self._publish(greeks_topic(self._prefix, c), msg.to_wire())
             ok += msg.reason is None
         self._stats.record(len(contracts), ok, time.perf_counter() - t0)

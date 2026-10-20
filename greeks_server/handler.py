@@ -9,18 +9,19 @@ rule; the server prices what it is given. Validation is at the edge: a malformed
 rejected whole with a specific error (the Router turns the exception into {ok: false, error}).
 Nothing is defaulted.
 
-Uses the session's SOFR and dividends; outside a session it loads them for today's date (ET).
-Stateless otherwise.
+Uses the session's SOFR and dividends; outside a session it loads them fresh for today's date
+(ET) and does not cache them. Stateless otherwise.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from greeks.config import GreeksConfig
-from greeks_server.calendar import ET
-from greeks_server.compute import Contract, compute
+from greeks_server.calendar import ET, session_at
+from greeks_server.compute import Contract, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
 from greeks_server.price import PriceKind, SelectedPrice
@@ -31,7 +32,7 @@ _FIELDS = ("osi", "price", "price_kind", "price_ts", "spot", "spot_kind", "spot_
 
 def _number(i: int, item: Mapping[str, Any], key: str) -> float:
     v = item[key]
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not v > 0:
         raise ValueError(f"contracts[{i}].{key} must be a positive number, got {v!r}")
     return float(v)
 
@@ -89,10 +90,10 @@ def make_handler(
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         items = parse_request(payload)  # validate everything before any work
         t = now()
-        session_inputs = inputs.get_for(t.astimezone(ET).date())
+        session_inputs = inputs.for_request(t.astimezone(ET).date(), in_session=session_at(t) is not None)
         return {
             "results": [
-                compute(c, opx, spx, session_inputs, t, m).to_wire() for c, opx, spx in items
+                compute_or_fail(c, opx, spx, session_inputs, t, m).to_wire() for c, opx, spx in items
             ]
         }
 

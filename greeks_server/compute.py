@@ -6,6 +6,8 @@ greeks from greeks.solver.invert (through the iv_for seam).
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -14,10 +16,11 @@ from greeks.domain import FailureReason, OptionRight, RowStatus, SolverInput, So
 from greeks.forwards.carry import carry
 from greeks.occ import OccContract, parse_occ
 from greeks.solver.invert import invert
-from greeks.solver.time import years_to_expiry
 from greeks_server.inputs import SessionInputs
 from greeks_server.message import OptionGreeksMessage
 from greeks_server.price import SelectedPrice
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -117,8 +120,7 @@ def compute(
     if contract.expiry < inputs.session_date:
         # Expired before this session: there is no rate for a negative term. The solver's floor
         # (t_below_floor) is the reason it would give; the floor itself stays the solver's.
-        t = years_to_expiry(now_utc, contract.expiry, expiry_time_et=m.expiry_time_et)
-        return _failure(contract, FailureReason.T_BELOW_FLOOR, now_ms, m, option_px, spot_px, t=t)
+        return _failure(contract, FailureReason.T_BELOW_FLOOR, now_ms, m, option_px, spot_px)
 
     r = inputs.rate_for(contract.expiry)
     c = carry(
@@ -154,3 +156,22 @@ def compute(
         discount=c.discount,
         t_years=c.time_to_expiry,
     )
+
+
+def compute_or_fail(
+    contract: Contract,
+    option_px: Optional[SelectedPrice],
+    spot_px: Optional[SelectedPrice],
+    inputs: SessionInputs,
+    now_utc: datetime,
+    m: Methodology,
+) -> OptionGreeksMessage:
+    """compute(), but one contract can't take the server down: an unexpected error (bad dividend
+    row, a non-finite greek from the library) is published as solver_failed for that contract."""
+    try:
+        return compute(contract, option_px, spot_px, inputs, now_utc, m)
+    except Exception as e:  # noqa: BLE001 — per-contract isolation, logged
+        log.warning("%s: compute raised %s: %s — publishing solver_failed", contract.osi, type(e).__name__, e)
+        return _failure(
+            contract, FailureReason.SOLVER_FAILED, int(now_utc.timestamp() * 1000), m, option_px, spot_px
+        )
