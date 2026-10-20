@@ -48,7 +48,7 @@ class Session:
 Fetch = Callable[[date, date], Sequence[Session]]
 
 
-class SessionCalendar:
+class SessionCache:
     """Cached MDS sessions. Thread-safe (compute thread and router thread both ask)."""
 
     def __init__(self, fetch: Fetch, today: date, *, monotonic: Callable[[], float] = time.monotonic) -> None:

@@ -1,4 +1,4 @@
-"""SessionCalendar: sessions come from MDS get_trading_sessions, cached; no local holiday rules."""
+"""SessionCache: sessions come from MDS get_trading_sessions, cached; no local holiday rules."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Sequence
 
 import pytest
 
-from greeks_server.calendar import ET, Session, SessionCalendar
+from greeks_server.calendar import ET, Session, SessionCache
 
 
 def _sess(d: date) -> Session:
@@ -46,7 +46,7 @@ TUE = date(2026, 10, 20)
 
 def test_startup_fetches_a_week() -> None:
     mds = FakeMds()
-    SessionCalendar(mds, TUE)
+    SessionCache(mds, TUE)
     assert mds.calls == [(TUE, TUE + timedelta(days=7))]
 
 
@@ -54,11 +54,11 @@ def test_startup_without_mds_raises() -> None:
     mds = FakeMds()
     mds.down = True
     with pytest.raises(RuntimeError):
-        SessionCalendar(mds, TUE)
+        SessionCache(mds, TUE)
 
 
 def test_session_bounds() -> None:
-    cal = SessionCalendar(FakeMds(), TUE)
+    cal = SessionCache(FakeMds(), TUE)
     assert cal.session_at(_et(TUE, 9, 29)) is None
     s = cal.session_at(_et(TUE, 9, 30))
     assert s is not None and s.date == TUE and s.open_ms == int(s.open_utc.timestamp() * 1000)
@@ -69,7 +69,7 @@ def test_session_bounds() -> None:
 
 def test_reads_cache_then_refreshes_with_two_days_left() -> None:
     mds = FakeMds()
-    cal = SessionCalendar(mds, TUE)
+    cal = SessionCache(mds, TUE)
     cal.session_at(_et(TUE + timedelta(days=5), 12, 0))   # 2 days left: cached, no fetch
     assert len(mds.calls) == 1
     later = TUE + timedelta(days=6)                        # 1 day left: refresh from that day
@@ -80,7 +80,7 @@ def test_reads_cache_then_refreshes_with_two_days_left() -> None:
 def test_mds_outage_mid_session_does_not_affect_gating() -> None:
     mds = FakeMds()
     t = [0.0]
-    cal = SessionCalendar(mds, TUE, monotonic=lambda: t[0])
+    cal = SessionCache(mds, TUE, monotonic=lambda: t[0])
     mds.down = True
     day6 = TUE + timedelta(days=6)                         # refresh due, MDS down, cache covers it
     assert cal.session_at(_et(day6, 12, 0)) is not None
@@ -94,7 +94,7 @@ def test_mds_outage_mid_session_does_not_affect_gating() -> None:
 
 def test_uncovered_date_without_mds_raises() -> None:
     mds = FakeMds()
-    cal = SessionCalendar(mds, TUE)
+    cal = SessionCache(mds, TUE)
     mds.down = True
     with pytest.raises(RuntimeError, match="no calendar"):
         cal.session_at(_et(TUE + timedelta(days=9), 12, 0))
@@ -105,4 +105,4 @@ def test_bad_session_rejected() -> None:
         s = _sess(start)
         return [Session(s.date, s.close_utc, s.open_utc)]
     with pytest.raises(ValueError):
-        SessionCalendar(bad, TUE)
+        SessionCache(bad, TUE)

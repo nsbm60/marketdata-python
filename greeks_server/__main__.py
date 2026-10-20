@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from discovery import ControlService, ServiceLocator
 from greeks.config import load_config
 from greeks.topic_builder import TopicBuilder
-from greeks_server.calendar import ET, SessionCalendar, mds_fetch
+from greeks_server.calendar import ET, SessionCache, mds_fetch
 from greeks_server.handler import OP, make_handler
 from greeks_server.inputs import InputsHolder, clickhouse_loader
 from greeks_server.loop import ComputeLoop
@@ -51,7 +51,7 @@ def main() -> int:
     ch = get_ch_client()  # connect now: a bad env file fails at deploy, not at 09:30
     inputs = InputsHolder(clickhouse_loader(lambda: ch))
     now = datetime.now(timezone.utc)
-    calendar = SessionCalendar(mds_fetch(mds.router), now.astimezone(ET).date())
+    calendar = SessionCache(mds_fetch(mds.router), now.astimezone(ET).date())
     session = calendar.session_at(now)
     if session is not None:
         inputs.load_session(session.date)
