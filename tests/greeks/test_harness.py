@@ -293,7 +293,7 @@ def test_results_store_and_join_batch(tmp_path: Path) -> None:
     db = tmp_path / "results.db"
     with ResultsStore(db) as store:
         store.upsert_validation(rows)
-        counts = store.count_validation(methodology_version="v1")
+        counts = store.count_validation(methodology_version=cfg.methodology_version)
         assert counts.get("success", 0) + counts.get("failure", 0) == 1
 
         snap = VendorSnapshot(
@@ -312,5 +312,5 @@ def test_results_store_and_join_batch(tmp_path: Path) -> None:
         )
         residuals = join_batch(rows, {tr.symbol: [snap]}, max_staleness_s=300)
         store.upsert_residuals(residuals)
-        jc = store.count_residuals_by_class(methodology_version="v1")
+        jc = store.count_residuals_by_class(methodology_version=cfg.methodology_version)
         assert sum(jc.values()) == 1

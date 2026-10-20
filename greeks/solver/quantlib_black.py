@@ -104,6 +104,8 @@ def greeks(
       **not** the same quantity as py_vollib black rho
     - rho_futures: F held fixed, ``-T * price / 100`` — matches py_vollib black rho
     - delta: forward delta; if ``spot`` given, convert via F/S to spot terms
+    - gamma: ``BlackCalculator.gamma(spot)`` when ``spot`` given (QuantLib's own
+      spot gamma, dF/dS = F/S), else ``gamma(forward)`` (forward terms)
     """
     if time_to_expiry <= 0:
         if right is OptionRight.CALL:
@@ -138,7 +140,7 @@ def greeks(
     return QuantLibBlackGreeks(
         price=px,
         delta=d,
-        gamma=float(bc.gamma(forward)),
+        gamma=float(bc.gamma(spot if spot is not None and spot > 0 else forward)),
         vega=float(bc.vega(time_to_expiry)) / 100.0,
         theta=float(bc.thetaPerDay(forward, time_to_expiry)),
         rho_cash=float(bc.rho(time_to_expiry)) / 100.0,

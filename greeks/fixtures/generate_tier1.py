@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Generate frozen Tier-1 round-trip fixtures for methodology_version v1.
+"""Generate frozen Tier-1 round-trip fixtures for methodology_version v2.
 
-Run once and commit outputs under greeks/fixtures/v1/. Never edit v1 in place
-after commit — bump methodology_version and write a new directory instead.
+Run once and commit outputs under greeks/fixtures/v2/. Never edit a committed
+version in place — bump methodology_version and write a new directory instead.
+
+v1 (greeks/fixtures/v1/, frozen) priced every row with spot = F, so F/S = 1 and
+the spot-terms conversions were invisible. v2 changes gamma to spot terms
+(gamma_S = gamma_F * (F/S)**2), so its grid carries a spot below the forward:
+S = 100, F = S * exp(r T) (no dividends). Strikes are set on forward moneyness
+K = F * m, as in v1, so the invertibility screen is unchanged.
+
+    python -m greeks.fixtures.generate_tier1
 """
 
 from __future__ import annotations
@@ -15,11 +23,11 @@ from greeks.domain import OptionRight, SolverInput
 from greeks.solver.black76 import forward_intrinsic, price as black_price
 from greeks.solver.invert import DEFAULT_TICK_SIZE, invert, relative_iv_error
 
-OUT_DIR = Path(__file__).resolve().parent / "v1"
-METHODOLOGY_VERSION = "v1"
+OUT_DIR = Path(__file__).resolve().parent / "v2"
+METHODOLOGY_VERSION = "v2"
 MAX_REL_ERR = 1e-10
-# Carry-free unit forward for pure round-trip (F=S=100, D=exp(-rT) with r=0.05)
-F = 100.0
+# Spot 100, carry-only forward F = S*exp(rT), D = exp(-rT) with r = 0.05.
+S = 100.0
 R = 0.05
 ONE_DAY = 1.0 / 365.0
 
@@ -64,8 +72,9 @@ def main() -> None:
     failures: list[str] = []
     skipped = 0
     for m in _moneyness_grid():
-        K = F * m
         for t in _t_grid_years():
+            F = S * math.exp(R * t)
+            K = F * m
             D = math.exp(-R * t)
             for vol in _vol_grid():
                 for right in (OptionRight.CALL, OptionRight.PUT):
@@ -81,7 +90,7 @@ def main() -> None:
                             forward=F,
                             discount=D,
                             time_to_expiry=t,
-                            spot=F,
+                            spot=S,
                         ),
                         methodology_version=METHODOLOGY_VERSION,
                         t_floor_minutes=0.0,  # grid includes 15m; floor applied in prod config
@@ -104,7 +113,7 @@ def main() -> None:
                             "moneyness": m,
                             "strike": K,
                             "forward": F,
-                            "spot": F,
+                            "spot": S,
                             "discount": D,
                             "r": R,
                             "t": t,
@@ -136,11 +145,12 @@ def main() -> None:
         "methodology_version": METHODOLOGY_VERSION,
         "max_relative_iv_error": MAX_REL_ERR,
         "n_rows": len(rows),
-        "forward": F,
+        "spot": S,
         "r": R,
         "notes": (
-            "Prices generated with Black-76 via py_vollib; expected_iv from scalar invert. "
-            "Delta in spot terms (S=F). Theta per calendar day. "
+            "Prices generated with Black-76 via py_vollib; expected_* from scalar invert. "
+            "S=100, F=S*exp(rT), K=F*moneyness. Delta and gamma in spot terms "
+            "(x F/S and x (F/S)^2). Theta per calendar day. "
             "Do not edit this fixture set; bump methodology_version for changes."
         ),
     }

@@ -14,7 +14,7 @@ from greeks.domain import Dividend
 def test_load_default_config() -> None:
     get_config.cache_clear()
     cfg = load_config()
-    assert cfg.methodology_version == "v1"
+    assert cfg.methodology_version == "v2"
     assert cfg.window.start == date(2026, 5, 27)
     assert cfg.window.end == date(2026, 7, 9)
     assert date(2026, 6, 8) in cfg.window.excluded_dates

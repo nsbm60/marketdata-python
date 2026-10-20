@@ -1,7 +1,7 @@
 # Sole application config for the greeks validation package.
 # Read only via greeks.config.load_config(). Do not parse this file elsewhere.
 
-methodology_version: "v1"
+methodology_version: "v2"  # v2: gamma in spot terms (x (F/S)^2). v1 fixtures stay frozen.
 
 window:
   start: "2026-05-27"

@@ -1,0 +1,8 @@
+{
+  "max_relative_iv_error": 1e-10,
+  "methodology_version": "v2",
+  "n_rows": 2718,
+  "notes": "Prices generated with Black-76 via py_vollib; expected_* from scalar invert. S=100, F=S*exp(rT), K=F*moneyness. Delta and gamma in spot terms (x F/S and x (F/S)^2). Theta per calendar day. Do not edit this fixture set; bump methodology_version for changes.",
+  "r": 0.05,
+  "spot": 100.0
+}

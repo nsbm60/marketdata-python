@@ -16,14 +16,16 @@ from greeks.domain import OptionRight  # noqa: E402
 from greeks.solver import black76 as ours  # noqa: E402
 from greeks.solver import quantlib_black as ql_black  # noqa: E402
 
-FIXTURE_DIR = Path(__file__).resolve().parents[2] / "greeks" / "fixtures" / "v1"
+FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "greeks" / "fixtures"
+# v1: S = F. v2: S < F, so the spot-terms delta/gamma conversions are exercised.
+FIXTURE_VERSIONS = ("v1", "v2")
 IV_TOL = 1e-8
 GREEK_TOL = 1e-6
 PRICE_TOL = 1e-10
 
 
-def _load_rows() -> list[dict[str, object]]:
-    path = FIXTURE_DIR / "grid.jsonl"
+def _load_rows(version: str) -> list[dict[str, object]]:
+    path = FIXTURES_ROOT / version / "grid.jsonl"
     if not path.is_file():
         pytest.skip(f"fixtures not generated: {path}")
     rows: list[dict[str, object]] = []
@@ -66,9 +68,10 @@ def test_single_point_price_and_greeks_match() -> None:
     assert abs(g_ours.rho - g_ql.rho_cash) > GREEK_TOL  # systematic difference
 
 
-def test_tier2_grid_price_iv_greeks() -> None:
+@pytest.mark.parametrize("version", FIXTURE_VERSIONS)
+def test_tier2_grid_price_iv_greeks(version: str) -> None:
     """Full Tier-1 fixture grid through QuantLib."""
-    rows = _load_rows()
+    rows = _load_rows(version)
     assert len(rows) > 100
 
     worst_iv_rel = 0.0

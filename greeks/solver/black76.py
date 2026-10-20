@@ -55,7 +55,7 @@ def upper_no_arb_bound(forward: float, strike: float, discount: float, right: Op
 
 @dataclass(frozen=True)
 class BlackGreeks:
-    """Analytic greeks at a given vol. Delta is spot terms when spot is set."""
+    """Analytic greeks at a given vol. Delta and gamma are spot terms when spot is set."""
 
     price: float
     delta: float
@@ -99,6 +99,9 @@ def greeks(
     - Delta: if ``spot`` is provided and > 0, convert forward delta via F/S
       (spot terms). Otherwise report library forward (discounted) delta and set
       ``delta_is_spot=False``.
+    - Gamma: py_vollib's is d2V/dF2. With ``spot`` set, convert with the same
+      factor squared, gamma_S = gamma_F * (F/S)**2 (methodology v2). Without
+      ``spot`` it stays in forward terms, like delta.
     - Theta: per calendar day (py_vollib divides by 365).
     - Vega: per 1 vol point (py_vollib multiplies by 0.01).
     """
@@ -119,18 +122,22 @@ def greeks(
     flag = _flag(right)
     px = float(_black_price(flag, forward, strike, time_to_expiry, r, sigma))
     d_fwd = float(_delta(flag, forward, strike, time_to_expiry, r, sigma))
+    g_fwd = float(_gamma(flag, forward, strike, time_to_expiry, r, sigma))
     if spot is not None and spot > 0:
-        d = d_fwd * (forward / spot)
+        f_over_s = forward / spot
+        d = d_fwd * f_over_s
+        g = g_fwd * f_over_s * f_over_s
         delta_is_spot = True
     else:
         d = d_fwd
+        g = g_fwd
         delta_is_spot = False
 
     limited = time_to_expiry * 365.0 < 1.0
     return BlackGreeks(
         price=px,
         delta=d,
-        gamma=float(_gamma(flag, forward, strike, time_to_expiry, r, sigma)),
+        gamma=g,
         vega=float(_vega(flag, forward, strike, time_to_expiry, r, sigma)),
         theta=float(_theta(flag, forward, strike, time_to_expiry, r, sigma)),
         rho=float(_rho(flag, forward, strike, time_to_expiry, r, sigma)),
