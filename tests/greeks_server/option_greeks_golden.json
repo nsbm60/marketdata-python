@@ -1,0 +1,66 @@
+{
+  "_doc": "Cross-language fixture for OptionGreeksMessage (greeks-server-spec.md §7). Python: tests/greeks_server/test_message.py. Scala (cutover): the CalcServer decoder test reads a byte-identical copy. Absent optional fields are omitted, never null.",
+  "messages": [
+    {
+      "osi": "NVDA261120C00180000",
+      "status": "success",
+      "computed_at": 1792501800123,
+      "methodology_version": "v2",
+      "theta_limited": false,
+      "iv": 0.4123,
+      "delta": 0.5234,
+      "gamma": 0.0123,
+      "theta": -0.1789,
+      "vega": 0.2541,
+      "rho": -0.0102,
+      "price": 9.85,
+      "price_kind": "mid",
+      "price_ts": 1792501799870,
+      "spot": 181.42,
+      "spot_kind": "mid",
+      "spot_ts": 1792501800001,
+      "forward": 182.03,
+      "discount": 0.99586,
+      "t_years": 0.08493
+    },
+    {
+      "osi": "MU261120P00150000",
+      "status": "failure",
+      "computed_at": 1792501800123,
+      "methodology_version": "v2",
+      "theta_limited": false,
+      "reason": "no_session_price",
+      "spot": 196.1,
+      "spot_kind": "last",
+      "spot_ts": 1792501795000
+    },
+    {
+      "osi": "AMD261023C00250000",
+      "status": "failure",
+      "computed_at": 1792501800123,
+      "methodology_version": "v2",
+      "theta_limited": false,
+      "reason": "below_intrinsic",
+      "price": 0.02,
+      "price_kind": "last",
+      "price_ts": 1792501780000,
+      "spot": 251.8,
+      "spot_kind": "mid",
+      "spot_ts": 1792501800001,
+      "forward": 251.84,
+      "discount": 0.99987,
+      "t_years": 0.00837
+    },
+    {
+      "osi": "AAPL261120C00250000",
+      "status": "failure",
+      "computed_at": 1792501800123,
+      "methodology_version": "v2",
+      "theta_limited": false,
+      "reason": "missing_spot",
+      "price": 3.1,
+      "price_kind": "mid",
+      "price_ts": 1792501799000
+    }
+  ]
+}

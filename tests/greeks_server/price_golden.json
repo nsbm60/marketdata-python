@@ -1,0 +1,15 @@
+{
+  "_doc": "Golden cases for the greeks-server price rule (greeks-server-spec.md §4). The Scala side (CalcServer, at cutover) asserts the same cases. session_open_ms = 1000. null = absent.",
+  "session_open_ms": 1000,
+  "cases": [
+    {"name": "two-sided session quote -> mid",            "quote": {"bid": 1.0, "ask": 1.2, "ts": 2000}, "trade": {"price": 1.5, "ts": 3000}, "expect": {"kind": "mid",  "value": 1.1, "ts": 2000}},
+    {"name": "quote at the open counts",                  "quote": {"bid": 1.0, "ask": 1.2, "ts": 1000}, "trade": null,                        "expect": {"kind": "mid",  "value": 1.1, "ts": 1000}},
+    {"name": "stale quote, session trade -> last",        "quote": {"bid": 1.0, "ask": 1.2, "ts": 999},  "trade": {"price": 1.5, "ts": 3000}, "expect": {"kind": "last", "value": 1.5, "ts": 3000}},
+    {"name": "one-sided quote (no bid), session trade",   "quote": {"bid": null, "ask": 1.2, "ts": 2000}, "trade": {"price": 1.5, "ts": 3000}, "expect": {"kind": "last", "value": 1.5, "ts": 3000}},
+    {"name": "zero bid is not two-sided",                 "quote": {"bid": 0.0, "ask": 0.05, "ts": 2000}, "trade": null,                       "expect": null},
+    {"name": "crossed quote is not valid",                "quote": {"bid": 1.3, "ask": 1.2, "ts": 2000}, "trade": {"price": 1.25, "ts": 2500}, "expect": {"kind": "last", "value": 1.25, "ts": 2500}},
+    {"name": "locked quote is valid",                     "quote": {"bid": 1.2, "ask": 1.2, "ts": 2000}, "trade": null,                        "expect": {"kind": "mid",  "value": 1.2, "ts": 2000}},
+    {"name": "prior-session trade only -> nothing",       "quote": null,                                 "trade": {"price": 1.5, "ts": 500},  "expect": null},
+    {"name": "nothing at all",                            "quote": null,                                 "trade": null,                        "expect": null}
+  ]
+}

@@ -39,7 +39,7 @@ tier2 = [
 include = ["greeks*", "option_archive*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/greeks", "tests/option_archive"]
+testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server"]
 pythonpath = ["."]
 
 [tool.mypy]
@@ -48,7 +48,7 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "."
-packages = ["greeks", "option_archive"]
+packages = ["greeks", "option_archive", "greeks_server"]
 exclude = [
   "venv/",
   "tools/venv/",
@@ -77,6 +77,23 @@ ignore_missing_imports = true
 module = ["ml.shared.clickhouse"]
 follow_imports = "skip"
 ignore_missing_imports = true
+
+# Pre-existing untyped service library (greeks_server imports Service). Its new, typed
+# module service.resilient_sub is NOT in this list and is checked strictly.
+[[tool.mypy.overrides]]
+module = [
+  "control_client",
+  "service",
+  "service.server",
+  "service.router",
+  "service.heartbeat",
+  "service.self_ping",
+  "service.advertiser",
+  "service.network",
+  "service.constants",
+  "service.pubsub_broker",
+]
+ignore_errors = true
 
 # Pre-existing untyped discovery layer; greeks only uses wait_for_service.
 [[tool.mypy.overrides]]

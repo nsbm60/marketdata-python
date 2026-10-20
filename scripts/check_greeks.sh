@@ -31,4 +31,15 @@ echo "== pytest tests/greeks =="
 "$PYTHON" -m pytest tests/greeks -q
 echo "ok"
 
+# The live server (greeks_server/) uses threads, so it lives outside greeks/ and the grep
+# above; it is held to the same mypy --strict gate. service/resilient_sub.py is its bus
+# subscriber.
+echo "== mypy --strict (greeks_server, service/resilient_sub.py) =="
+"$PYTHON" -m mypy --strict greeks_server service/resilient_sub.py
+echo "ok"
+
+echo "== pytest tests/greeks_server tests/service/test_resilient_sub.py =="
+"$PYTHON" -m pytest tests/greeks_server tests/service/test_resilient_sub.py -q
+echo "ok"
+
 echo "All greeks checks passed."
