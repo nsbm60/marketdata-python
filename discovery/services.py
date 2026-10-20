@@ -21,6 +21,7 @@ class ControlService(Enum):
     IB = "ib"
     ALPACA_TRADING = "alpaca"
     OPTIMIZER = "optimizer"
+    GREEKS = "greeks"
     # Python-only: the service-infra test harness (tools/run_echo_service.py). No Scala counterpart.
     ECHO_TEST = "echo_test"
 

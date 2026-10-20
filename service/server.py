@@ -64,6 +64,9 @@ class Service:
         self._context: zmq.Context | None = None
         self._pub_socket: zmq.Socket | None = None
         self._pub_lock = threading.Lock()
+        # Set once run() has connected the PUB socket. publish() raises before then, so a
+        # thread started before run() waits on this before its first publish.
+        self.publisher_ready = threading.Event()
 
         self._router = Router(self._name, router_port)
         self._advertiser: Advertiser | None = None
@@ -103,6 +106,7 @@ class Service:
         self._pub_socket.setsockopt(zmq.LINGER, 0)
         self._pub_socket.connect(bus.xsub)
         log.info("[%s] PUB socket connected to bus XSUB %s", self._name, bus.xsub)
+        self.publisher_ready.set()
 
         self._router.bind(self._context)
 
