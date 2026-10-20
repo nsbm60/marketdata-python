@@ -30,7 +30,7 @@ SERVICE_USER=mdapps
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Keep in sync with setup-drogon-services.sh (validates --restart names, expands --restart-all).
-SERVICES=(pubsub-broker)
+SERVICES=(pubsub-broker greeks-server)
 
 RESTART=()
 while [[ $# -gt 0 ]]; do

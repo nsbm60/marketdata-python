@@ -98,3 +98,27 @@ sudo ./deploy/deploy-services.sh --restart pubsub-broker
 # ...and restart every managed service:
 sudo ./deploy/deploy-services.sh --restart-all
 ```
+
+## greeks-server
+
+`python -m greeks_server` (spec: Scala `docs/specs/greeks-server-spec.md`). Needs
+`CLICKHOUSE_PASSWORD` in `/etc/marketdata-python/greeks-server.env`. Certified by
+`scripts/check_greeks.sh`. Phase 1 publishes on `shadow.md.option.greeks.*`
+(`server.topic_prefix` in `config/greeks.yaml`).
+
+```bash
+# first time on drogon, from the pulled home checkout (creates the env template, installs the unit, certifies):
+sudo ./deploy/setup-drogon-services.sh
+
+# put the ClickHouse password in the env file:
+sudoedit /etc/marketdata-python/greeks-server.env
+
+# enable on boot and start now:
+sudo systemctl enable --now greeks-server
+
+# watch it:
+journalctl -u greeks-server -f
+
+# later updates:
+sudo ./deploy/deploy-services.sh --restart greeks-server
+```

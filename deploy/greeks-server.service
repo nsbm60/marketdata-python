@@ -1,0 +1,29 @@
+[Unit]
+Description=Greeks server — live IV/greeks for streamed options (greeks-server-spec.md)
+# Resolves the bus and ClickHouse through discovery with retry, so any boot order
+# converges; only the network is a start-ordering prerequisite (deploy/SERVICES.md).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mdapps
+Group=mdapps
+# Shared services tree (deploy/SERVICES.md). WorkingDirectory puts the app on sys.path
+# so greeks_server/, service/ and discovery/ resolve; deps come from the venv.
+WorkingDirectory=/opt/marketdata-python/app
+# CLICKHOUSE_PASSWORD (required: the canonical connector fails loud without it).
+EnvironmentFile=/etc/marketdata-python/greeks-server.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/marketdata-python/venv/bin/python -m greeks_server
+# The process exits when it can't load session inputs (SOFR/dividends) and comes back
+# through the normal startup path. 10 s keeps that from spinning.
+Restart=always
+RestartSec=10
+
+[Install]
+# setup-drogon-services.sh installs this unit but does NOT enable it:
+#   systemctl enable --now greeks-server
+WantedBy=multi-user.target
+
+# Watch: journalctl -u greeks-server -f

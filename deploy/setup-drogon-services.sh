@@ -25,14 +25,14 @@ CONFIG_DIR=/etc/marketdata-python
 
 # The managed services. Adding one = drop deploy/<name>.service (+ optional
 # deploy/<name>.env.example) and add its <name> here. No new script.
-SERVICES=(pubsub-broker)
+SERVICES=(pubsub-broker greeks-server)
 
 # Per-service certification: the check that must pass on-host before we call the box
 # good. A service with no entry here is installed but not certified (logged).
 certify_service() {
   case "$1" in
     pubsub-broker) ( cd "${APP_DIR}" && sudo -u "${SERVICE_USER}" "${VENV}/bin/python" -m pytest tests/service -q ) ;;
-    # greeks-server) sudo -u "${SERVICE_USER}" env PYTHON="${VENV}/bin/python" bash "${APP_DIR}/scripts/check_greeks.sh" ;;
+    greeks-server) ( cd "${APP_DIR}" && sudo -u "${SERVICE_USER}" env PYTHON="${VENV}/bin/python" bash scripts/check_greeks.sh ) ;;
     # optimizer)     ... ;;
     *) echo ">>> no certification defined for '$1' — installed but not certified"; return 0 ;;
   esac
@@ -107,13 +107,18 @@ cat <<NEXT
 
 Next steps — each command is on its own line, copy-paste as a single line:
 
-  1) If any service env was templated above, fill it in (the broker needs none).
+  1) If any service env was templated above, fill it in (the broker needs none;
+     greeks-server needs CLICKHOUSE_PASSWORD):
+     sudoedit /etc/marketdata-python/greeks-server.env
 
   2) Enable the broker on boot and start it now:
      systemctl enable --now pubsub-broker
 
   3) Watch it:
      journalctl -u pubsub-broker -f
+
+  4) Enable the greeks server on boot and start it now (after step 1):
+     systemctl enable --now greeks-server
 
   Ongoing updates run ON drogon from the checkout:
      sudo ${APP_DIR}/deploy/deploy-services.sh --restart pubsub-broker
