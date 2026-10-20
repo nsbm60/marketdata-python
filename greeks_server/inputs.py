@@ -21,6 +21,9 @@ log = logging.getLogger(__name__)
 
 SOFR_LOOKBACK_DAYS = 30
 SOFR_MAX_AGE_DAYS = 10
+# Written by the Scala BatchService sofr job from the NY Fed API (the publisher of SOFR).
+# The validation-phase rows are source='fred' (and 'fixture'); the server reads only these.
+SOFR_SOURCE = "nyfed"
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,7 @@ def clickhouse_loader(get_client: Callable[[], object]) -> Loader:
                 client,  # type: ignore[arg-type]
                 start=session_date - timedelta(days=SOFR_LOOKBACK_DAYS),
                 end=session_date,
-                source="fred",
+                source=SOFR_SOURCE,
             )
             validate_sofr(sofr, session_date)
             divs = load_upcoming_dividends(client, after=session_date)  # type: ignore[arg-type]
