@@ -7,6 +7,14 @@ server publishes on shadow.md.option.greeks.*, and reports:
   1. Differences, by moneyness (K/S) and DTE bucket, for contracts where both sides have a
      success: median and p90 of |dIV| (bps), |d delta|, |d gamma| / vendor gamma, |d theta|.
      The latest value on each side is compared; pairs more than --max-skew-s apart are skipped.
+     Plus two clock-convention checks per bucket:
+       - signed IV gap, median (IV_local - IV_vendor) in bps: a clock difference has one sign;
+       - implied clock offset in hours: the vendor T that reconciles the two IVs at the same
+         price, T_v = t_local * (IV_local / IV_vendor)^2 (sigma^2 T held fixed), offset =
+         (T_v - t_local) * 8760. Median and p10..p90. K/S 0.90-1.10 only (tick noise outside).
+       Reading it: a roughly constant offset across DTE buckets is a clock convention (about +8 h:
+       vendor measures to midnight, not 16:00; about +24 h: whole days; drifting with time of
+       day: vendor T doesn't move intraday). A scattered offset is a price-source difference.
   2. The cost of having no seed: how many contracts with live vendor greeks have no local success
      1, 5 and 15 minutes after a server restart. A restart is the first greeks.heartbeat after a
      gap of more than 25 s (or the first one the tool sees).
@@ -64,6 +72,7 @@ class Greeks:
     gamma: float
     theta: float
     at: float  # receipt time, monotonic
+    t_years: Optional[float] = None  # local only: the T the server used
 
 
 def _f(d: dict[str, Any], k: str) -> Optional[float]:
@@ -87,7 +96,8 @@ def parse_local(payload: str, at: float) -> Optional[tuple[str, Greeks, Optional
         return None
     return (
         d["osi"],
-        Greeks(float(d["iv"]), float(d["delta"]), float(d["gamma"]), float(d["theta"]), at),
+        Greeks(float(d["iv"]), float(d["delta"]), float(d["gamma"]), float(d["theta"]), at,
+               t_years=_f(d, "t_years")),
         _f(d, "spot"),
     )
 
@@ -157,13 +167,22 @@ class Shadow:
             l = self.local.get(osi)
             if l is None or abs(l.at - v.at) > self.max_skew_s:
                 continue
-            c = parse_occ(osi)
+            try:
+                c = parse_occ(osi)
+            except ValueError:
+                continue
             s = self.spot.get(c.root)
             if s is None:
                 continue
-            key = (_bucket(c.strike / s, MONEYNESS), _bucket((c.expiry - today).days, DTE))
-            cell = cells.setdefault(key, {"iv_bps": [], "delta": [], "gamma_rel": [], "theta": []})
+            ks = c.strike / s
+            key = (_bucket(ks, MONEYNESS), _bucket((c.expiry - today).days, DTE))
+            cell = cells.setdefault(key, {"iv_bps": [], "delta": [], "gamma_rel": [], "theta": [],
+                                          "iv_signed_bps": [], "offset_h": []})
             cell["iv_bps"].append(abs(l.iv - v.iv) * 1e4)
+            cell["iv_signed_bps"].append((l.iv - v.iv) * 1e4)
+            if 0.90 <= ks <= 1.10 and l.iv > 0 and v.iv > 0 and l.t_years is not None and l.t_years > 0:
+                t_vendor = l.t_years * (l.iv / v.iv) ** 2
+                cell["offset_h"].append((t_vendor - l.t_years) * 8760.0)
             cell["delta"].append(abs(l.delta - v.delta))
             if v.gamma != 0:
                 cell["gamma_rel"].append(abs(l.gamma - v.gamma) / abs(v.gamma))
@@ -175,6 +194,9 @@ class Shadow:
                 if xs:
                     row[f"{k}_med"] = statistics.median(xs)
                     row[f"{k}_p90"] = _q(xs, 0.9)
+            if cell["offset_h"]:
+                row["offset_h_p10"] = _q(cell["offset_h"], 0.1)
+                row["n_offset"] = len(cell["offset_h"])
             rows.append(row)
         return {"kind": "diff", "vendor": len(self.vendor), "local": len(self.local), "rows": rows}
 
@@ -182,12 +204,20 @@ class Shadow:
 def _print_report(r: dict[str, Any]) -> None:
     print(f"\n{datetime.now(timezone.utc).isoformat()}  vendor={r['vendor']} local={r['local']}")
     print(f"{'K/S':>10} {'DTE':>7} {'n':>5} {'|dIV|bps med/p90':>18} {'|dDelta| med/p90':>18} "
-          f"{'|dGam|/G med/p90':>18} {'|dTheta| med/p90':>18}")
+          f"{'|dGam|/G med/p90':>18} {'|dTheta| med/p90':>18} {'dIV bps med':>12} "
+          f"{'offset h med [p10..p90] (n)':>30}")
+    nan = float("nan")
     for row in r["rows"]:
         def pair(k: str) -> str:
-            return f"{row.get(k + '_med', float('nan')):.4g}/{row.get(k + '_p90', float('nan')):.4g}"
+            return f"{row.get(k + '_med', nan):.4g}/{row.get(k + '_p90', nan):.4g}"
+        if "n_offset" in row:
+            off = (f"{row['offset_h_med']:+.1f} [{row['offset_h_p10']:+.1f}..{row['offset_h_p90']:+.1f}]"
+                   f" ({row['n_offset']})")
+        else:
+            off = "-"
         print(f"{row['moneyness']:>10} {row['dte']:>7} {row['n']:>5} {pair('iv_bps'):>18} "
-              f"{pair('delta'):>18} {pair('gamma_rel'):>18} {pair('theta'):>18}")
+              f"{pair('delta'):>18} {pair('gamma_rel'):>18} {pair('theta'):>18} "
+              f"{row.get('iv_signed_bps_med', nan):>+12.4g} {off:>30}")
 
 
 def main() -> None:
