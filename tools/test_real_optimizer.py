@@ -8,7 +8,10 @@ pc-solver-spec-draft.md, extended for the run-loop amendments
 
   - execution cost is charged on |target − current| (holding is free);
   - interim holding horizon h = min(days_to_expiry, horizon_days), with
-    fractional days_to_expiry: theta × h, gamma scaled by √h in the group sum;
+    fractional days_to_expiry: theta × h, gamma variance over each pair's
+    overlapping horizon min(h_i, h_j);
+  - rounding: floor what consumes buying power, stock repairs a broken delta
+    band, and a breach that remains is `infeasible`;
   - min_improvement and action hold|trade, never hold an invalid book.
 
 Start the real optimizer in one terminal:
@@ -20,11 +23,10 @@ Run this test in another:
 Scope: protocol round-trip, arithmetic sanity for the full formulation
 (penalties, hard constraints, post-solve cardinality), the status taxonomy,
 and the run-loop behaviour above. The gamma penalty is independently
-recomputed from the response to verify the per-underlying √h group-sum
-attribution.
+recomputed from the response with the closed form
+Σ_U Σ_i Σ_j γ_i q_i γ_j q_j · min(h_i, h_j).
 """
 
-import math
 import sys
 import uuid
 from collections import defaultdict
@@ -85,6 +87,10 @@ def make_request(verbose=False):
          "direction": "long", "current_quantity": 100, "delta_per_unit": 1.0,
          "theta_per_unit": 0, "gamma_per_unit": 0, "margin_per_unit": 21.65,
          "premium_per_unit": 216.49, "exec_cost_per_unit": 0.005},
+        {"id": "NVDA-equity-short", "underlying": "NVDA", "type": "equity",
+         "direction": "short", "current_quantity": 0, "delta_per_unit": -1.0,
+         "theta_per_unit": 0, "gamma_per_unit": 0, "margin_per_unit": 32.47,
+         "premium_per_unit": -216.49, "exec_cost_per_unit": 0.005},
     ]
     return {
         "schema_version": 1,
@@ -158,6 +164,62 @@ def make_switch_request(exec_cost, min_improvement=0.0, held_qty=2):
     }
 
 
+PUT_DELTA = 30.37
+
+
+def make_rounding_request(tradeable):
+    """Two short options on ZZZ whose continuous optimum sits on the delta-band edge.
+    Put +30.37 delta, call −20 delta, band 0 ± 5, both held 10 and closeable.
+
+    With stock (tradeable): the solver keeps both legs and shorts 98.7 shares to sit at the
+    band edge (net +5; stock has no theta, so it uses as little as it can). Flooring to 98
+    shares gives net +5.7, outside the band; the repair shorts the 1 more share that brings
+    it back inside (99 short, net +4.7), not all the way to the target.
+
+    Without stock (non-tradeable): it keeps 10 calls and 6.75 puts (net +5); flooring to 6
+    puts gives net −17.78, and the breach is reported as infeasible."""
+    def leg(name, delta):
+        return {"id": f"O:ZZZ260515{name}-short", "underlying": "ZZZ", "type": "option",
+                "direction": "short", "current_quantity": 10, "closeable_only": True,
+                "delta_per_unit": delta, "theta_per_unit": 10.0, "gamma_per_unit": 0.0,
+                "margin_per_unit": 1000.0, "premium_per_unit": 150.0, "exec_cost_per_unit": 0.0,
+                "iv": 0.3, "days_to_expiry": 3.235, "strike": 100.0, "expiry": "2026-05-15"}
+    dvs = [leg("P00100000", PUT_DELTA), leg("C00100000", -20.0)]
+    if tradeable:
+        dvs += [
+            {"id": "ZZZ-equity-long", "underlying": "ZZZ", "type": "equity", "direction": "long",
+             "current_quantity": 0, "delta_per_unit": 1.0, "theta_per_unit": 0, "gamma_per_unit": 0,
+             "margin_per_unit": 50.0, "premium_per_unit": 100.0, "exec_cost_per_unit": 0.005},
+            {"id": "ZZZ-equity-short", "underlying": "ZZZ", "type": "equity", "direction": "short",
+             "current_quantity": 0, "delta_per_unit": -1.0, "theta_per_unit": 0, "gamma_per_unit": 0,
+             "margin_per_unit": 75.0, "premium_per_unit": -100.0, "exec_cost_per_unit": 0.005},
+        ]
+    return {
+        "schema_version": 1,
+        "request_id": f"test-rnd-{uuid.uuid4().hex[:8]}",
+        "policy_version": "v3",
+        "timestamp": "2026-05-12T14:22:37Z",
+        "horizon_days": HORIZON_DAYS,
+        "verbose": True,
+        "decision_variables": dvs,
+        "per_underlying": [
+            {"underlying": "ZZZ", "spot": 100.0, "delta_target": 0, "tolerance": 5,
+             "max_positions": 8, "tradeable": tradeable}],
+        "policy": dict(POLICY),
+        "capital": {"net_liq": 250000.0, "current_bp_usage": 0.0, "current_margin": 0.0},
+    }
+
+
+def overlap_gamma_penalty(lam_gamma, legs):
+    """−λ · Σ_U Σ_i Σ_j γ_i q_i γ_j q_j · min(h_i, h_j); legs = [(underlying, γ, q, h)]."""
+    total = 0.0
+    for (ui, gi, qi, hi) in legs:
+        for (uj, gj, qj, hj) in legs:
+            if ui == uj:
+                total += gi * qi * gj * qj * min(hi, hj)
+    return -lam_gamma * total
+
+
 def horizon(dv):
     if dv["type"] == "option":
         return min(dv["days_to_expiry"], HORIZON_DAYS)
@@ -180,7 +242,7 @@ def check_arithmetic(req, resp, label):
     lam = req["policy"]
     score, comps = resp["score"], resp["score"]["components"]
     sums = defaultdict(float)
-    group_x = defaultdict(float)
+    legs = []
     for r in resp["recommendations"]:
         dv = dv_by_id[r["id"]]
         oc = r["objective_contribution"]
@@ -194,15 +256,19 @@ def check_arithmetic(req, resp, label):
             f"{label} {r['id']}: theta {oc['theta']} != theta·h·target ({h=})"
         assert abs(oc["exec_cost"] - (-lam["lambda_spread"] * dv["exec_cost_per_unit"] * abs(t - c))) < TOL, \
             f"{label} {r['id']}: exec_cost not −λ·exec·|target−current|"
-        group_x[r["underlying"]] += math.sqrt(h) * dv["gamma_per_unit"] * t
+        legs.append((r["underlying"], dv["gamma_per_unit"], t, h))
     assert abs(comps["theta_total"] - sums["theta"]) < TOL, f"{label}: theta_total mismatch"
     assert abs(comps["exec_cost_total"] - sums["exec_cost"]) < TOL, f"{label}: exec_cost_total mismatch"
     assert abs(comps["delta_ceiling_penalty"] - sums["delta_ceiling"]) < TOL, f"{label}: delta_ceiling_penalty mismatch"
     assert abs(comps["gamma_penalty"] - sums["gamma"]) < TOL, f"{label}: gamma_penalty mismatch"
     assert abs(score["objective_value"] - sums["total"]) < TOL, f"{label}: objective_value mismatch"
-    expected_gamma = -lam["lambda_gamma"] * sum(s * s for s in group_x.values())
+    held = {r["id"] for r in resp["recommendations"] if r["optimal_quantity"] > 0}
+    for rid in held:
+        if rid.endswith("-long"):
+            assert rid[: -len("-long")] + "-short" not in held, f"{label} {rid}: held long and short"
+    expected_gamma = overlap_gamma_penalty(lam["lambda_gamma"], legs)
     assert abs(comps["gamma_penalty"] - expected_gamma) < TOL, \
-        f"{label}: gamma_penalty {comps['gamma_penalty']} != −λ·Σ(Σ√h·γ·q)² = {expected_gamma}"
+        f"{label}: gamma_penalty {comps['gamma_penalty']} != −λ·ΣΣ γqγq·min(h) = {expected_gamma}"
 
 
 def main():
@@ -274,7 +340,7 @@ def main():
     check_arithmetic(vreq, vresp, "main")
     same_day = by_id(vresp)["O:MU260512C00120000-short"]
     print(f"OK: components sum; theta = θ·min(dte,5)·q (same-day dte 0.25 -> h=0.25, "
-          f"target={same_day['target_quantity']}); exec = −λ·exec·|Δq|; gamma = −λ·Σ(Σ√h·γ·q)²")
+          f"target={same_day['target_quantity']}); exec = −λ·exec·|Δq|; gamma = −λ·ΣΣ γqγq·min(h_i,h_j)")
 
     # --- Holding is free ---
     print("\n--- Run loop: Holding Is Free ---")
@@ -324,6 +390,31 @@ def main():
     total_target = sum(r["target_quantity"] for r in bresp["recommendations"])
     assert total_target <= 2, f"recommended book should be back in band, got {total_target} contracts"
     print("OK: current book out of band -> action=trade despite min_improvement=1e9")
+
+    # --- Rounding: stock repairs a band the rounding broke ---
+    print("\n--- Rounding: Stock Repair ---")
+    rreq = make_rounding_request(tradeable=True)
+    rresp = send_request(dealer, rreq)
+    assert rresp["status"] == "optimal", f"repairable rounding should be optimal, got {rresp['status']}: {rresp.get('error')}"
+    q = {r["id"]: r["optimal_quantity"] for r in rresp["recommendations"]}
+    assert q["O:ZZZ260515C00100000-short"] == 10 and q["O:ZZZ260515P00100000-short"] == 10, q
+    net = PUT_DELTA * 10 - 20.0 * 10 + q["ZZZ-equity-long"] - q["ZZZ-equity-short"]
+    assert (q["ZZZ-equity-long"], q["ZZZ-equity-short"]) == (0, 99), f"repair should short 1 more share (99): {q}"
+    assert abs(net) <= 5, f"repaired net delta {net} outside 0 ± 5"
+    check_arithmetic(rreq, rresp, "repair")
+    print(f"OK: flooring 98.7 shares to 98 broke the band (+5.7); repair shorted 1 more (99), net {net:+.2f}")
+
+    # --- Rounding: no stock (non-tradeable) -> the breach is infeasible, by name ---
+    print("\n--- Rounding: Breach Without Stock ---")
+    nresp = send_request(dealer, make_rounding_request(tradeable=False))
+    assert nresp["status"] == "infeasible", f"got {nresp['status']}"
+    bc = nresp["binding_constraints"]
+    assert any(c["type"] == "delta_target" and c["underlying"] == "ZZZ"
+               and abs(c["value_at_solution"] - (PUT_DELTA * 6 - 200.0)) < TOL for c in bc), bc
+    assert "ZZZ delta_target" in nresp["error"], nresp["error"]
+    for absent in ("recommendations", "score", "action"):
+        assert absent not in nresp, f"post-rounding infeasible must omit {absent}"
+    print(f"OK: non-tradeable band breach -> infeasible: {nresp['error']}")
 
     # --- Option without days_to_expiry / negative days_to_expiry -> ok:false ---
     print("\n--- Inputs: days_to_expiry Required For Options ---")

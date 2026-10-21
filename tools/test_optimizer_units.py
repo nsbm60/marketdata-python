@@ -101,6 +101,33 @@ def test_optimal_branch_has_no_error():
     print("OK: optimal -> recs+score present, no error field")
 
 
+def test_gamma_overlap_same_day_hedge():
+    """A same-day long call (h = 0.25) hedging a 5-day short gets hedge credit only for
+    the 0.25-day overlap: the cross term is 2·γ_s q_s·γ_l q_l·min(h_s, h_l), not √(h_s·h_l)."""
+    def dv(name, direction, gamma, dte):
+        return {"id": f"O:ZZZ{name}-{direction}", "underlying": "ZZZ", "type": "option",
+                "direction": direction, "current_quantity": 0, "delta_per_unit": 0.0,
+                "theta_per_unit": 0.0, "gamma_per_unit": gamma, "margin_per_unit": 1.0,
+                "exec_cost_per_unit": 0.0, "days_to_expiry": dte}
+    dvs = [dv("260519C00100000", "short", -2.0, 7.235),   # h = min(7.235, 5) = 5
+           dv("260512C00100000", "long", 3.0, 0.25)]      # h = 0.25 (same day)
+    per_underlying = [{"underlying": "ZZZ", "spot": 100.0, "delta_target": 0,
+                       "tolerance": 25, "max_positions": 8, "tradeable": True}]
+    policy = {"bp_limit_pct": 60, "concentration_limit_pct": 30, "delta_ceiling_threshold": 0.30,
+              "lambda_delta_ceiling": 1.0, "lambda_gamma": 0.7, "lambda_spread": 1.0,
+              "min_improvement": 0.0}
+    groups = opt._group_by_underlying(dvs)
+    bundle = opt._extract_inputs(dvs, per_underlying, policy, {"net_liq": 250000.0}, groups, horizon_days=5)
+    qs, ql = 3, 4
+    xs, xl = -2.0 * qs, 3.0 * ql
+    expected = -0.7 * (xs * xs * 5.0 + xl * xl * 0.25 + 2 * xs * xl * 0.25)
+    sqrt_h_form = -0.7 * (xs * np.sqrt(5.0) + xl * np.sqrt(0.25)) ** 2
+    got = float(opt._compute_contributions(bundle, [qs, ql])[opt.OC_GAMMA].sum())
+    assert abs(got - expected) < 1e-9, f"gamma penalty {got} != overlap form {expected}"
+    assert abs(got - sqrt_h_form) > 1.0, "overlap form should differ from the √h form here"
+    print(f"OK: same-day hedge credited for 0.25 days only: penalty {got:.4f} (√h form would give {sqrt_h_form:.4f})")
+
+
 def main():
     print("=" * 60)
     print("Optimizer Unit Tests")
@@ -108,6 +135,7 @@ def main():
     test_map_status()
     test_timeout_feasible_branch()
     test_optimal_branch_has_no_error()
+    test_gamma_overlap_same_day_hedge()
     print("\n" + "=" * 60)
     print("UNIT TESTS PASSED")
     print("=" * 60)

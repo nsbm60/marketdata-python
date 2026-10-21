@@ -18,7 +18,13 @@ optimal/timeout (dual-based detection is a deferred future enhancement).
 RUN-LOOP AMENDMENTS (optimizer-run-loop-spec-draft.md §3, 2026-10-21):
   - execution cost on the trade: exec_cost_per_unit · |target − current|;
   - interim holding horizon h = min(days_to_expiry, horizon_days): theta × h,
-    gamma scaled by √h inside the per-underlying sum, delta ceiling unscaled;
+    delta ceiling unscaled, gamma variance over each pair's overlapping horizon
+    min(h_i, h_j), built as time slices (interim, like the horizon itself);
+  - an instrument's long and short legs are netted (the split is degenerate);
+  - rounding: floor every quantity that consumes buying power, nearest otherwise;
+    then stock repairs any delta band the rounding broke, by the fewest shares that
+    bring it back inside; then every hard
+    constraint is re-checked, and a remaining breach is `infeasible`;
   - min_improvement: the current book is scored under the same objective and
     the response carries action hold|trade (never hold a book that breaks BP,
     concentration or the delta band);
@@ -88,6 +94,7 @@ from wire_format import (
     F_DELTA_TARGET,
     F_TOLERANCE,
     F_MAX_POSITIONS,
+    F_TRADEABLE,
     F_BP_LIMIT_PCT,
     F_CONCENTRATION_LIMIT_PCT,
     F_DELTA_CEILING_THRESHOLD,
@@ -181,6 +188,13 @@ DELTA_RAW_DIVISOR = 100.0
 # (D4: never hold a book that breaks one). Floating-point noise only — the
 # current book's values are request constants, not solver output.
 CONSTRAINT_CHECK_EPS = 1e-6
+
+# Solver noise allowance when flooring: 1.9999999 is 2 contracts, not 1.
+ROUNDING_EPS = 1e-6
+
+# Operator-facing message for a book that still breaks a hard constraint after
+# rounding and the stock repair (normally only a non-tradeable underlying).
+ERR_POST_ROUNDING = "Rounded book breaks hard constraints after the stock repair: "
 
 # CVXPY status → our status. Verified empirically: Clarabel reports "user_limit"
 # when the time limit is hit (see tools/test_optimizer_units.py).
@@ -302,6 +316,30 @@ def _group_matrix(rows: np.ndarray, values: np.ndarray, n_groups: int) -> sp.csr
     return sp.csr_matrix((values, (rows, np.arange(n))), shape=(n_groups, n))
 
 
+def _gamma_slice_matrix(rows: np.ndarray, h: np.ndarray, gamma: np.ndarray, n_u: int) -> sp.csr_matrix:
+    """Gamma variance over overlapping horizons, as a sum of squares.
+
+    Two positions are both held for min(h_i, h_j), so the per-underlying variance is
+    Σ_i Σ_j γ_i q_i γ_j q_j · min(h_i, h_j). Sorting the distinct horizons
+    t_1 < t_2 < … (t_0 = 0) turns that into Σ_k (t_k − t_(k−1)) · (Σ_(i: h_i ≥ t_k) γ_i q_i)².
+    Row (u, k) of the returned matrix holds √(t_k − t_(k−1)) · γ_i for every record i of
+    underlying u still held in slice k, so the penalty is ‖M q‖². Interim, like the
+    horizon itself, until lifecycle valuation.
+    """
+    n = len(h)
+    t = np.unique(h[h > 0.0])                       # sorted distinct positive horizons
+    n_slices = t.size
+    if n_slices == 0:
+        return sp.csr_matrix((0, n))
+    dt = np.diff(np.concatenate(([0.0], t)))
+    held_slices = np.searchsorted(t, h, side="right")  # slices k with t_k <= h_i
+    cols = np.repeat(np.arange(n), held_slices)
+    starts = np.repeat(np.cumsum(held_slices) - held_slices, held_slices)
+    ks = np.arange(cols.size) - starts
+    vals = np.sqrt(dt[ks]) * gamma[cols]
+    return sp.csr_matrix((vals, (rows[cols] * n_slices + ks, cols)), shape=(n_u * n_slices, n))
+
+
 def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict,
                     groups: dict, horizon_days) -> dict:
     """Validate and convert every numeric input the solver consumes, plus touch
@@ -340,6 +378,7 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     net_liq = float(capital[F_NET_LIQ])
     pu_map = {rec[F_UNDERLYING]: rec for rec in per_underlying}
     pu = {}
+    tradeable = {}
     for u in groups:
         rec = pu_map[u]  # missing per_underlying record for a traded underlying → KeyError (malformed)
         pu[u] = (
@@ -348,18 +387,44 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
             float(rec[F_TOLERANCE]),
             int(rec[F_MAX_POSITIONS]),
         )
+        tradeable[u] = bool(rec[F_TRADEABLE])
+
+    # Equity legs per underlying: the stock that repairs a rounding-broken band.
+    # Equity delta is ±1 per share by definition (pc-optimization-spec-draft.md).
+    equity_legs = {}
+    for i, dv in enumerate(dvs):
+        if dv[F_TYPE] != TYPE_EQUITY:
+            continue
+        direction = dv[F_DIRECTION]
+        expected = {"long": 1.0, "short": -1.0}.get(direction)
+        if expected is None or delta[i] != expected:
+            raise ValueError(f"{dv[F_ID]}: equity {direction!r} must have delta_per_unit {expected!r}, got {delta[i]!r}")
+        legs = equity_legs.setdefault(dv[F_UNDERLYING], {})
+        if direction in legs:
+            raise ValueError(f"{dv[F_ID]}: more than one {direction} equity record for {dv[F_UNDERLYING]}")
+        legs[direction] = i
+
+    # Long/short pairs of the same instrument, by the wire id convention: the id is the
+    # instrument plus a direction suffix (pc-optimization-spec-draft.md, `id`).
+    stems = {}
+    for i, dv in enumerate(dvs):
+        for suffix in ("-long", "-short"):
+            if dv[F_ID].endswith(suffix) and dv[F_DIRECTION] == suffix[1:]:
+                stems.setdefault(dv[F_ID][: -len(suffix)], {})[suffix[1:]] = i
+    pairs = [(legs["long"], legs["short"]) for legs in stems.values() if "long" in legs and "short" in legs]
 
     # Per-underlying vectors in group order; row index per record.
     und_names = list(groups)
     row_of = {u: k for k, u in enumerate(und_names)}
     rows = np.array([row_of[u] for u in und], dtype=int)
     n_u = len(und_names)
-    sqrt_h = np.sqrt(h)
 
     return {
         "theta": theta, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
         "margin": margin, "current_qty": current_qty, "delta_pen": delta_pen,
-        "h": h, "sqrt_h": sqrt_h, "closeable": closeable, "und": und,
+        "h": h, "closeable": closeable, "und": und,
+        "und_names": und_names, "tradeable": tradeable, "equity_legs": equity_legs,
+        "pairs": pairs,
         "lam_spread": float(policy[F_LAMBDA_SPREAD]),
         "lam_delta": float(policy[F_LAMBDA_DELTA_CEILING]),
         "lam_gamma": float(policy[F_LAMBDA_GAMMA]),
@@ -368,10 +433,8 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         "conc_limit": float(policy[F_CONCENTRATION_LIMIT_PCT]) / 100.0 * net_liq,
         "pu": pu,
         # Vectorized per-underlying structure (§3.4)
-        "rows": rows,
-        "G": _group_matrix(rows, np.ones(n), n_u),
         "G_delta": _group_matrix(rows, delta, n_u),
-        "G_gamma_h": _group_matrix(rows, sqrt_h * gamma, n_u),
+        "G_gamma_slices": _gamma_slice_matrix(rows, h, gamma, n_u),
         "u_spot": np.array([pu[u][0] for u in und_names]),
         "u_lo": np.array([pu[u][1] - pu[u][2] for u in und_names]),
         "u_hi": np.array([pu[u][1] + pu[u][2] for u in und_names]),
@@ -401,7 +464,7 @@ def _build_and_solve(n: int, bundle: dict):
     float conversion happens here — all of that is done in _extract_inputs.
 
     Maximize  (theta∘h)·q − λ_spread·exec·|q − current| − λ_delta·delta_pen·q
-              − λ_gamma·‖G_γ√h · q‖²
+              − λ_gamma·‖M_slices · q‖²
     s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
               per underlying: |spot·(G_δ q)| ≤ conc_limit,  lo ≤ G_δ q ≤ hi.
     """
@@ -424,11 +487,11 @@ def _build_and_solve(n: int, bundle: dict):
     constraints.append(net_delta <= bundle["u_hi"])
 
     # Objective over the holding horizon (§3.2): theta × h, exec cost on the
-    # trade (one-off), delta ceiling unscaled, gamma with √h in the group sum.
+    # trade (one-off), delta ceiling unscaled, gamma over overlapping horizons.
     obj = (bundle["theta"] * bundle["h"]) @ target
     obj = obj - bundle["lam_spread"] * (bundle["exec_cost"] @ cp.abs(target - current))
     obj = obj - bundle["lam_delta"] * (bundle["delta_pen"] @ target)
-    obj = obj - bundle["lam_gamma"] * cp.sum_squares(bundle["G_gamma_h"] @ target)
+    obj = obj - bundle["lam_gamma"] * cp.sum_squares(bundle["G_gamma_slices"] @ target)
 
     problem = cp.Problem(cp.Maximize(obj), constraints)
     problem.solve(solver=SOLVER_BACKEND, **_solve_kwargs())
@@ -444,12 +507,91 @@ def _solve_kwargs() -> dict:
     return {}
 
 
-def _extract_targets(target_value, n: int) -> list:
-    """Round the continuous solution to integers (options and equity alike).
-    Clears sub-tolerance solver noise on degenerate variables. None → all zero."""
+def _net_pairs(target_value, bundle: dict):
+    """Net each instrument's long and short legs into one side.
+
+    A contract's long and short records (and a stock's) have exactly opposite delta, gamma
+    and theta and the same execution cost, so the objective cannot tell holding 0.24 long
+    and 1.90 short apart from 1.66 short: the split is degenerate and the solver may return
+    either. Netting keeps every greek, never raises execution cost (|a| + |b| ≥ |a − b|) or
+    the delta-ceiling penalty, and lowers margin, so the netted book is at least as good
+    and satisfies every constraint the split did. None stays None."""
+    if target_value is None:
+        return None
+    x = np.asarray(target_value, dtype=float).copy()
+    for li, si in bundle["pairs"]:
+        net = x[li] - x[si]
+        x[li], x[si] = max(net, 0.0), max(-net, 0.0)
+    return x
+
+
+def _extract_targets(target_value, bundle: dict) -> list:
+    """Round the continuous solution to whole units (options and equity alike).
+
+    A quantity that consumes a Category 1 budget rounds toward zero (solver spec,
+    handler step 8): every record with margin_per_unit > 0 consumes buying power, so
+    rounding down can never breach BP. Records with no margin round to nearest.
+    ROUNDING_EPS keeps solver noise (1.9999999) from losing a whole contract.
+    The delta band is two-sided, so rounding can still break it; the stock repair
+    and the re-check handle that."""
+    n = len(bundle["margin"])
     if target_value is None:
         return [0] * n
-    return [max(0, int(round(float(target_value[i])))) for i in range(n)]
+    x = np.maximum(np.asarray(target_value, dtype=float), 0.0)
+    rounded = np.where(bundle["margin"] > 0.0, np.floor(x + ROUNDING_EPS), np.floor(x + 0.5))
+    return [int(v) for v in rounded]
+
+
+def _repair_band_with_stock(q: list, bundle: dict) -> tuple:
+    """For each tradeable underlying whose rounded book is outside its delta band, move
+    the stock by the smallest whole number of shares that brings net delta back inside
+    the band — not all the way to the target. The continuous optimum sat at the band
+    edge because that was optimal; the repair undoes the rounding error, it does not
+    overrule the solver. Stock carries exactly 1 delta per share. Underlyings already
+    inside their band are left alone. Returns (q, repaired underlyings)."""
+    q = list(q)
+    repaired = []
+    eps = CONSTRAINT_CHECK_EPS
+    net_delta = bundle["G_delta"] @ np.asarray(q, dtype=float)
+    for k, u in enumerate(bundle["und_names"]):
+        if bundle["u_lo"][k] - eps <= net_delta[k] <= bundle["u_hi"][k] + eps:
+            continue
+        legs = bundle["equity_legs"].get(u, {})
+        if not bundle["tradeable"][u] or "long" not in legs or "short" not in legs:
+            continue  # no stock to repair with; the re-check reports it
+        li, si = legs["long"], legs["short"]
+        if net_delta[k] > bundle["u_hi"][k]:
+            shift = -int(np.ceil(net_delta[k] - bundle["u_hi"][k] - eps))   # sell just enough
+        else:
+            shift = int(np.ceil(bundle["u_lo"][k] - net_delta[k] - eps))    # buy just enough
+        shares = (q[li] - q[si]) + shift
+        q[li], q[si] = max(shares, 0), max(-shares, 0)
+        repaired.append(u)
+        log.info("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f]; stock moved %+d to %+d shares",
+                 u, net_delta[k], bundle["u_lo"][k], bundle["u_hi"][k], shift, shares)
+    return q, repaired
+
+
+def _breached_constraints(bundle: dict, q) -> list:
+    """Hard constraints (BP, concentration, delta band) that book q breaks, as
+    binding_constraints records with value_at_solution."""
+    q = np.asarray(q, dtype=float)
+    eps = CONSTRAINT_CHECK_EPS
+    out = []
+    margin_used = float(bundle["margin"] @ q)
+    if margin_used > bundle["bp_limit"] + eps:
+        out.append({BC_TYPE: BCT_BP_LIMIT, BC_LIMIT: bundle["bp_limit"], BC_VALUE_AT_SOLUTION: margin_used})
+    net_delta = bundle["G_delta"] @ q
+    for k, u in enumerate(bundle["und_names"]):
+        dollar_delta = float(bundle["u_spot"][k] * net_delta[k])
+        if abs(dollar_delta) > bundle["conc_limit"] + eps:
+            out.append({BC_TYPE: BCT_CONCENTRATION_LIMIT, BC_UNDERLYING: u,
+                        BC_LIMIT: bundle["conc_limit"], BC_VALUE_AT_SOLUTION: dollar_delta})
+        if not (bundle["u_lo"][k] - eps <= net_delta[k] <= bundle["u_hi"][k] + eps):
+            _spot, dt, tol, _maxpos = bundle["pu"][u]
+            out.append({BC_TYPE: BCT_DELTA_TARGET, BC_UNDERLYING: u, BC_TARGET: dt,
+                        BC_TOLERANCE: tol, BC_VALUE_AT_SOLUTION: float(net_delta[k])})
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -461,23 +603,22 @@ def _compute_contributions(bundle: dict, q) -> dict:
     """Per-position objective_contribution, decomposed by term, as index-aligned
     numpy arrays keyed by the OC_* component names.
 
-    The gamma term uses the group-sum attribution from expanding
-    (Σ x_i)² = Σ x_i·(Σ_j x_j) with x_i = √h_i·gamma_i·q_i:
+    The gamma term attributes the overlap-form penalty λ·Σ_r Y_r², Y = M q (time
+    slices, see _gamma_slice_matrix), by each position's share of every slice sum:
 
-        gamma_i = −λ_gamma · x_i · (Σ_{j in U(i)} x_j)
+        gamma_i = −λ_gamma · q_i · (Mᵀ Y)_i
+                = −λ_gamma · Σ_(slices k it is held in) Δt_k · γ_i q_i · S_k
 
-    NOT x_i². Per-position gamma terms sum across a group to −λ_gamma·(Σ x)² and
-    across groups to the score's gamma_penalty. The group sum is recomputed from
-    the q passed in, serving the ranking pass (rounded q, full composition), the
-    reporting pass (post-cardinality q) and the current book (q = current).
+    where S_k is the underlying's Σ γ q over the positions held in slice k. These sum
+    across positions to −λ_gamma·‖Mq‖², the score's gamma_penalty. Recomputed from the
+    q passed in, serving the ranking pass, the reporting pass and the current book.
     """
     q = np.asarray(q, dtype=float)
     theta_c = bundle["theta"] * bundle["h"] * q
     exec_c = -bundle["lam_spread"] * bundle["exec_cost"] * np.abs(q - bundle["current_qty"])
     dceil_c = -bundle["lam_delta"] * bundle["delta_pen"] * q
-    x = bundle["sqrt_h"] * bundle["gamma"] * q
-    group_sum = bundle["G"] @ x
-    gamma_c = -bundle["lam_gamma"] * x * group_sum[bundle["rows"]]
+    m = bundle["G_gamma_slices"]
+    gamma_c = -bundle["lam_gamma"] * q * (m.T @ (m @ q))
     return {
         OC_THETA: theta_c,
         OC_EXEC_COST: exec_c,
@@ -510,18 +651,10 @@ def _book_meets_constraints(bundle: dict, q) -> bool:
     BP, per-underlying concentration and the delta band. Used on the CURRENT book
     to decide whether hold is allowed (never hold a book that breaks one)."""
     q = np.asarray(q, dtype=float)
-    eps = CONSTRAINT_CHECK_EPS
     closeable = bundle["closeable"]
-    if np.any(q[closeable] > bundle["current_qty"][closeable] + eps):
+    if np.any(q[closeable] > bundle["current_qty"][closeable] + CONSTRAINT_CHECK_EPS):
         return False
-    if float(bundle["margin"] @ q) > bundle["bp_limit"] + eps:
-        return False
-    net_delta = bundle["G_delta"] @ q
-    if np.any(np.abs(bundle["u_spot"] * net_delta) > bundle["conc_limit"] + eps):
-        return False
-    if np.any(net_delta < bundle["u_lo"] - eps) or np.any(net_delta > bundle["u_hi"] + eps):
-        return False
-    return True
+    return not _breached_constraints(bundle, q)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -550,9 +683,25 @@ def _build_solved_response(meta, status, target_value, problem, dvs, bundle, gro
             F_SOLVER_META: solver_meta,
         }
 
-    rounded = _extract_targets(target_value, n)
+    # Net long/short legs → round (step 8) → cardinality (step 9) → stock repair →
+    # re-check (step 10).
+    rounded = _extract_targets(_net_pairs(target_value, bundle), bundle)
     ranking_contribs = _compute_contributions(bundle, rounded)
-    optimal_q = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
+    carded = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
+    optimal_q, _repaired = _repair_band_with_stock(carded, bundle)
+    breaches = _breached_constraints(bundle, optimal_q)
+    if breaches:
+        detail = "; ".join(
+            f"{b.get(BC_UNDERLYING, 'portfolio')} {b[BC_TYPE]} (value {b[BC_VALUE_AT_SOLUTION]:.4f})"
+            for b in breaches)
+        log.warning("[Solver] post-rounding breach: %s", detail)
+        return {
+            **meta,
+            F_STATUS: STATUS_INFEASIBLE,
+            F_BINDING_CONSTRAINTS: breaches,
+            F_ERROR: ERR_POST_ROUNDING + detail + ".",
+            F_SOLVER_META: solver_meta,
+        }
     optimal_contribs = _compute_contributions(bundle, optimal_q)
 
     current_q = [dv[F_CURRENT_QUANTITY] for dv in dvs]

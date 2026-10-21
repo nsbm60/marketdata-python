@@ -82,6 +82,53 @@ def test_golden_request_decodes_and_solves_optimal() -> None:
     assert _solve()["status"] == "optimal"
 
 
+def _golden() -> tuple[dict, dict]:
+    request = json.loads(_REQUEST.read_text(encoding="utf-8"))
+    response = json.loads(_RESPONSE.read_text(encoding="utf-8"))
+    return request, response
+
+
+def test_golden_book_is_inside_every_delta_band() -> None:
+    """The golden continuous optimum sits on the band edges (NVDA +25, MU −25); the
+    rounded book must still be inside every band. (The case where rounding crosses the
+    edge and stock repairs it is tools/test_real_optimizer.py, "Rounding: Stock Repair".)"""
+    request, response = _golden()
+    dvs = {dv["id"]: dv for dv in request["decision_variables"]}
+    net: dict[str, float] = {}
+    for r in response["recommendations"]:
+        net[r["underlying"]] = net.get(r["underlying"], 0.0) + dvs[r["id"]]["delta_per_unit"] * r["optimal_quantity"]
+    for pu in request["per_underlying"]:
+        u = pu["underlying"]
+        assert abs(net.get(u, 0.0) - pu["delta_target"]) <= pu["tolerance"] + 1e-9, \
+            f"{u} net delta {net.get(u, 0.0)} outside {pu['delta_target']} ± {pu['tolerance']}"
+
+
+def test_golden_gamma_penalty_is_the_overlap_form() -> None:
+    """The golden book has a same-day MU call next to a 5-day-horizon MU short: the gamma
+    penalty must equal −λ·Σ_U Σ_i Σ_j γ_i q_i γ_j q_j · min(h_i, h_j) (hedge credit only
+    for the overlap)."""
+    request, response = _golden()
+    dvs = {dv["id"]: dv for dv in request["decision_variables"]}
+    horizon = request["horizon_days"]
+    legs = []
+    for r in response["recommendations"]:
+        dv = dvs[r["id"]]
+        h = min(dv["days_to_expiry"], horizon) if dv["type"] == "option" else horizon
+        legs.append((r["underlying"], dv["gamma_per_unit"] * r["target_quantity"], h))
+    expected = -request["policy"]["lambda_gamma"] * sum(
+        xi * xj * min(hi, hj) for (ui, xi, hi) in legs for (uj, xj, hj) in legs if ui == uj)
+    got = response["score"]["components"]["gamma_penalty"]
+    assert math.isclose(got, expected, rel_tol=1e-9, abs_tol=1e-9), f"{got} != {expected}"
+
+
+def test_golden_book_never_holds_both_legs_of_an_instrument() -> None:
+    _request, response = _golden()
+    held = {r["id"] for r in response["recommendations"] if r["optimal_quantity"] > 0}
+    for rid in held:
+        if rid.endswith("-long"):
+            assert rid[: -len("-long")] + "-short" not in held, f"{rid} held long and short"
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--regenerate"]:
         _RESPONSE.write_text(json.dumps(_solve(), indent=2) + "\n", encoding="utf-8")

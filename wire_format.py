@@ -61,6 +61,7 @@ F_SPOT = "spot"
 F_DELTA_TARGET = "delta_target"
 F_TOLERANCE = "tolerance"
 F_MAX_POSITIONS = "max_positions"
+F_TRADEABLE = "tradeable"
 
 # Policy field names
 F_BP_LIMIT_PCT = "bp_limit_pct"
