@@ -8,4 +8,5 @@ xgboost>=2.0.0
 scikit-learn>=1.3.0
 matplotlib>=3.7.0
 cvxpy>=1.8.0
+scipy>=1.10.0  # sparse group-membership matrix in optimizer.py (already a cvxpy dependency)
 httpx[http2]>=0.27.0

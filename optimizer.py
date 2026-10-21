@@ -15,14 +15,20 @@ internal_error — with per-status response shapes matching the optimization spe
 request's hard constraints for infeasible, and is an empty list for
 optimal/timeout (dual-based detection is a deferred future enhancement).
 
+RUN-LOOP AMENDMENTS (optimizer-run-loop-spec-draft.md §3, 2026-10-21):
+  - execution cost on the trade: exec_cost_per_unit · |target − current|;
+  - interim holding horizon h = min(days_to_expiry, horizon_days): theta × h,
+    gamma scaled by √h inside the per-underlying sum, delta ceiling unscaled;
+  - min_improvement: the current book is scored under the same objective and
+    the response carries action hold|trade (never hold a book that breaks BP,
+    concentration or the delta band);
+  - per-underlying terms built from a sparse group-membership matrix.
+
 Status boundary: request interpretation (field access + float conversions)
 happens OUTSIDE the error-catch, so missing/ill-typed fields propagate to the
 service library's {ok:false,error} wrapper — never miscategorized as
 internal_error. The internal_error catch wraps only the solve and
 post-processing, where NaN/solver failures actually arise.
-
-There is no yield floor: yield is a display measure, not an optimization
-control. yield_floor_pct (if present in policy) is ignored.
 
 Persistence: deferred. The handler does not write to ClickHouse — that
 infrastructure (pc-persistence-draft.md) does not exist yet (post-Layer-4).
@@ -43,6 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cvxpy as cp
 import numpy as np
+import scipy.sparse as sp
 
 from discovery import ControlService
 from service import Service
@@ -64,16 +71,18 @@ from wire_format import (
     F_PER_UNDERLYING,
     F_POLICY,
     F_CAPITAL,
+    F_HORIZON_DAYS,
     F_ID,
     F_UNDERLYING,
     F_TYPE,
     F_DIRECTION,
     F_CURRENT_QUANTITY,
     F_THETA_PER_UNIT,
-    F_SPREAD_COST_PER_UNIT,
+    F_EXEC_COST_PER_UNIT,
     F_MARGIN_PER_UNIT,
     F_CLOSEABLE_ONLY,
     F_DELTA_PER_UNIT,
+    F_DAYS_TO_EXPIRY,
     F_GAMMA_PER_UNIT,
     F_SPOT,
     F_DELTA_TARGET,
@@ -85,6 +94,7 @@ from wire_format import (
     F_LAMBDA_DELTA_CEILING,
     F_LAMBDA_GAMMA,
     F_LAMBDA_SPREAD,
+    F_MIN_IMPROVEMENT,
     F_NET_LIQ,
     F_REQUEST_TIMESTAMP,
     F_RESPONSE_TIMESTAMP,
@@ -95,16 +105,24 @@ from wire_format import (
     F_ERROR,
     F_SOLVER_META,
     F_TARGET_QUANTITY,
+    F_OPTIMAL_QUANTITY,
+    F_ACTION,
+    ACTION_TRADE,
+    ACTION_HOLD,
+    TYPE_OPTION,
+    TYPE_EQUITY,
     F_OBJECTIVE_CONTRIBUTION,
     OC_TOTAL,
     OC_THETA,
-    OC_SPREAD_COST,
+    OC_EXEC_COST,
     OC_DELTA_CEILING,
     OC_GAMMA,
     SC_OBJECTIVE_VALUE,
+    SC_OPTIMAL_OBJECTIVE_VALUE,
+    SC_CURRENT_OBJECTIVE_VALUE,
     SC_COMPONENTS,
     SC_THETA_TOTAL,
-    SC_SPREAD_COST_TOTAL,
+    SC_EXEC_COST_TOTAL,
     SC_DELTA_CEILING_PENALTY,
     SC_GAMMA_PENALTY,
     SM_SOLVER_NAME,
@@ -158,6 +176,11 @@ except ValueError:
 
 # Recovers the raw 0..1 delta from share-equivalent delta_per_unit (× multiplier).
 DELTA_RAW_DIVISOR = 100.0
+
+# Absolute slack when checking the CURRENT book against the hard constraints
+# (D4: never hold a book that breaks one). Floating-point noise only — the
+# current book's values are request constants, not solver output.
+CONSTRAINT_CHECK_EPS = 1e-6
 
 # CVXPY status → our status. Verified empirically: Clarabel reports "user_limit"
 # when the time limit is hit (see tools/test_optimizer_units.py).
@@ -213,6 +236,7 @@ def handle_optimize(payload: dict) -> dict:
     per_underlying = payload[F_PER_UNDERLYING]
     policy = payload[F_POLICY]
     capital = payload[F_CAPITAL]
+    horizon_days = payload[F_HORIZON_DAYS]
 
     log.info("[Solver] request_id=%s, %d decision_variables, solver=%s",
              request_id, len(dvs), SOLVER_NAME)
@@ -222,12 +246,12 @@ def handle_optimize(payload: dict) -> dict:
     # and ill-typed fields (ValueError) propagate to the library, never becoming
     # internal_error. NaN survives float() and is caught later as a solve failure.
     groups = _group_by_underlying(dvs)
-    bundle = _extract_inputs(dvs, per_underlying, policy, capital, groups)
+    bundle = _extract_inputs(dvs, per_underlying, policy, capital, groups, horizon_days)
     n = len(dvs)
 
     # Solve + post-process INSIDE the catch: NaN/solver crashes → internal_error.
     try:
-        target, problem, n_constraints = _build_and_solve(n, bundle, groups)
+        target, problem, n_constraints = _build_and_solve(n, bundle)
         our_status = _map_status(problem.status)
         log.info("[Solver] request_id=%s, solver_status=%s -> %s, wall_clock=%.4fs",
                  request_id, problem.status, our_status, time.monotonic() - start)
@@ -256,30 +280,59 @@ def _group_by_underlying(dvs: list) -> dict:
     return groups
 
 
-def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict, groups: dict) -> dict:
+def _horizon(dv: dict, horizon_days: float) -> float:
+    """Record's holding horizon h. Options: min(days_to_expiry, horizon_days),
+    with days_to_expiry required, fractional, and non-negative. Equity: horizon_days
+    (its theta and gamma are 0, so h has no effect). Any other type is rejected."""
+    kind = dv[F_TYPE]
+    if kind == TYPE_OPTION:
+        dte = float(dv[F_DAYS_TO_EXPIRY])  # missing → KeyError (malformed)
+        if not dte >= 0.0:  # also rejects NaN
+            raise ValueError(f"{dv[F_ID]}: days_to_expiry must be >= 0, got {dte!r}")
+        return min(dte, horizon_days)
+    if kind == TYPE_EQUITY:
+        return horizon_days
+    raise ValueError(f"{dv[F_ID]}: unknown type {kind!r} (expected {TYPE_OPTION!r} or {TYPE_EQUITY!r})")
+
+
+def _group_matrix(rows: np.ndarray, values: np.ndarray, n_groups: int) -> sp.csr_matrix:
+    """Sparse (n_groups × n) matrix with values[i] at (rows[i], i): row u of
+    M @ q is Σ_(i in u) values[i]·q[i]."""
+    n = len(values)
+    return sp.csr_matrix((values, (rows, np.arange(n))), shape=(n_groups, n))
+
+
+def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict,
+                    groups: dict, horizon_days) -> dict:
     """Validate and convert every numeric input the solver consumes, plus touch
     the required identity fields so any missing/ill-typed field raises here —
     outside the internal_error catch. Returns a bundle of Python/numpy values."""
+    horizon = float(horizon_days)
+    if not horizon > 0.0:
+        raise ValueError(f"horizon_days must be > 0, got {horizon_days!r}")
+
     n = len(dvs)
     theta = np.empty(n)
-    spread = np.empty(n)
+    exec_cost = np.empty(n)
     delta = np.empty(n)
     gamma = np.empty(n)
     margin = np.empty(n)
     current_qty = np.empty(n)
-    closeable = []
+    h = np.empty(n)
+    closeable = np.zeros(n, dtype=bool)
     und = []
     for i, dv in enumerate(dvs):
         # Touch required identity fields (presence validation; echoed later).
         _ = (dv[F_ID], dv[F_TYPE], dv[F_DIRECTION])
         und.append(dv[F_UNDERLYING])
         theta[i] = float(dv[F_THETA_PER_UNIT])
-        spread[i] = float(dv[F_SPREAD_COST_PER_UNIT])
+        exec_cost[i] = float(dv[F_EXEC_COST_PER_UNIT])
         delta[i] = float(dv[F_DELTA_PER_UNIT])
         gamma[i] = float(dv[F_GAMMA_PER_UNIT])
         margin[i] = float(dv[F_MARGIN_PER_UNIT])
         current_qty[i] = float(dv[F_CURRENT_QUANTITY])
-        closeable.append(bool(dv.get(F_CLOSEABLE_ONLY)))
+        h[i] = _horizon(dv, horizon)
+        closeable[i] = bool(dv.get(F_CLOSEABLE_ONLY))
 
     thr = float(policy[F_DELTA_CEILING_THRESHOLD])
     delta_pen = np.maximum(0.0, np.abs(delta / DELTA_RAW_DIVISOR) - thr)
@@ -296,16 +349,32 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
             int(rec[F_MAX_POSITIONS]),
         )
 
+    # Per-underlying vectors in group order; row index per record.
+    und_names = list(groups)
+    row_of = {u: k for k, u in enumerate(und_names)}
+    rows = np.array([row_of[u] for u in und], dtype=int)
+    n_u = len(und_names)
+    sqrt_h = np.sqrt(h)
+
     return {
-        "theta": theta, "spread": spread, "delta": delta, "gamma": gamma,
+        "theta": theta, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
         "margin": margin, "current_qty": current_qty, "delta_pen": delta_pen,
-        "closeable": closeable, "und": und,
+        "h": h, "sqrt_h": sqrt_h, "closeable": closeable, "und": und,
         "lam_spread": float(policy[F_LAMBDA_SPREAD]),
         "lam_delta": float(policy[F_LAMBDA_DELTA_CEILING]),
         "lam_gamma": float(policy[F_LAMBDA_GAMMA]),
+        "min_improvement": float(policy[F_MIN_IMPROVEMENT]),
         "bp_limit": float(policy[F_BP_LIMIT_PCT]) / 100.0 * net_liq,
         "conc_limit": float(policy[F_CONCENTRATION_LIMIT_PCT]) / 100.0 * net_liq,
         "pu": pu,
+        # Vectorized per-underlying structure (§3.4)
+        "rows": rows,
+        "G": _group_matrix(rows, np.ones(n), n_u),
+        "G_delta": _group_matrix(rows, delta, n_u),
+        "G_gamma_h": _group_matrix(rows, sqrt_h * gamma, n_u),
+        "u_spot": np.array([pu[u][0] for u in und_names]),
+        "u_lo": np.array([pu[u][1] - pu[u][2] for u in und_names]),
+        "u_hi": np.array([pu[u][1] + pu[u][2] for u in und_names]),
     }
 
 
@@ -327,41 +396,44 @@ def _map_status(cvxpy_status: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 
-def _build_and_solve(n: int, bundle: dict, groups: dict):
+def _build_and_solve(n: int, bundle: dict):
     """Build the QP from the pre-extracted bundle and solve. No field access or
-    float conversion happens here — all of that is done in _extract_inputs."""
+    float conversion happens here — all of that is done in _extract_inputs.
+
+    Maximize  (theta∘h)·q − λ_spread·exec·|q − current| − λ_delta·delta_pen·q
+              − λ_gamma·‖G_γ√h · q‖²
+    s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
+              per underlying: |spot·(G_δ q)| ≤ conc_limit,  lo ≤ G_δ q ≤ hi.
+    """
     target = cp.Variable(n, nonneg=True)  # lower bound 0
+    current = bundle["current_qty"]
     constraints = []
 
     # Upper bound on closeable_only records: target_i <= current_quantity_i
-    for i in range(n):
-        if bundle["closeable"][i]:
-            constraints.append(target[i] <= bundle["current_qty"][i])
+    closeable_idx = np.flatnonzero(bundle["closeable"])
+    if closeable_idx.size:
+        constraints.append(target[closeable_idx] <= current[closeable_idx])
 
     # Buying-power limit
     constraints.append(bundle["margin"] @ target <= bundle["bp_limit"])
 
-    # Per-underlying concentration and delta-target constraints
-    delta = bundle["delta"]
-    for u, idx in groups.items():
-        spot, dt, tol, _maxpos = bundle["pu"][u]
-        net_delta = sum(delta[i] * target[i] for i in idx)  # share-equivalent
-        constraints.append(cp.abs(spot * net_delta) <= bundle["conc_limit"])
-        constraints.append(net_delta >= dt - tol)
-        constraints.append(net_delta <= dt + tol)
+    # Per-underlying concentration and delta-target constraints (vectorized)
+    net_delta = bundle["G_delta"] @ target  # share-equivalent, one entry per underlying
+    constraints.append(cp.abs(cp.multiply(bundle["u_spot"], net_delta)) <= bundle["conc_limit"])
+    constraints.append(net_delta >= bundle["u_lo"])
+    constraints.append(net_delta <= bundle["u_hi"])
 
-    # Objective: theta − λ_spread·spread − λ_delta·delta_penalty − λ_gamma·gamma²(per underlying)
-    gamma = bundle["gamma"]
-    obj = bundle["theta"] @ target
-    obj = obj - bundle["lam_spread"] * (bundle["spread"] @ target)
+    # Objective over the holding horizon (§3.2): theta × h, exec cost on the
+    # trade (one-off), delta ceiling unscaled, gamma with √h in the group sum.
+    obj = (bundle["theta"] * bundle["h"]) @ target
+    obj = obj - bundle["lam_spread"] * (bundle["exec_cost"] @ cp.abs(target - current))
     obj = obj - bundle["lam_delta"] * (bundle["delta_pen"] @ target)
-    for u, idx in groups.items():
-        group_gamma = sum(gamma[i] * target[i] for i in idx)
-        obj = obj - bundle["lam_gamma"] * cp.square(group_gamma)
+    obj = obj - bundle["lam_gamma"] * cp.sum_squares(bundle["G_gamma_h"] @ target)
 
     problem = cp.Problem(cp.Maximize(obj), constraints)
     problem.solve(solver=SOLVER_BACKEND, **_solve_kwargs())
-    return target, problem, len(constraints)
+    n_scalar_constraints = sum(int(c.size) for c in constraints)
+    return target, problem, n_scalar_constraints
 
 
 def _solve_kwargs() -> dict:
@@ -385,56 +457,71 @@ def _extract_targets(target_value, n: int) -> list:
 # ─────────────────────────────────────────────────────────────
 
 
-def _compute_contributions(bundle: dict, groups: dict, q: list) -> list:
-    """Per-position objective_contribution, decomposed by term, index-aligned.
+def _compute_contributions(bundle: dict, q) -> dict:
+    """Per-position objective_contribution, decomposed by term, as index-aligned
+    numpy arrays keyed by the OC_* component names.
 
     The gamma term uses the group-sum attribution from expanding
-    (Σ x_i)² = Σ x_i·(Σ_j x_j) with x_i = gamma_i·q_i:
+    (Σ x_i)² = Σ x_i·(Σ_j x_j) with x_i = √h_i·gamma_i·q_i:
 
-        gamma_i = −λ_gamma · (gamma_i·q_i) · (Σ_{j in U(i)} gamma_j·q_j)
+        gamma_i = −λ_gamma · x_i · (Σ_{j in U(i)} x_j)
 
-    NOT (gamma_i·q_i)². Per-position gamma terms sum across a group to
-    −λ_gamma·(Σ gamma·q)² and across groups to the score's gamma_penalty. The
-    group sum is recomputed from the q passed in, serving both the ranking pass
-    (rounded q, full composition) and the reporting pass (post-cardinality q).
+    NOT x_i². Per-position gamma terms sum across a group to −λ_gamma·(Σ x)² and
+    across groups to the score's gamma_penalty. The group sum is recomputed from
+    the q passed in, serving the ranking pass (rounded q, full composition), the
+    reporting pass (post-cardinality q) and the current book (q = current).
     """
-    theta, spread, delta_pen, gamma = bundle["theta"], bundle["spread"], bundle["delta_pen"], bundle["gamma"]
-    lam_spread, lam_delta, lam_gamma = bundle["lam_spread"], bundle["lam_delta"], bundle["lam_gamma"]
-    und = bundle["und"]
-
-    group_gamma_sum = {u: sum(gamma[i] * q[i] for i in idx) for u, idx in groups.items()}
-
-    contribs = []
-    for i in range(len(q)):
-        theta_c = float(theta[i] * q[i])
-        spread_c = float(-lam_spread * spread[i] * q[i])
-        dceil_c = float(-lam_delta * delta_pen[i] * q[i])
-        gamma_c = float(-lam_gamma * (gamma[i] * q[i]) * group_gamma_sum[und[i]])
-        contribs.append({
-            OC_THETA: theta_c,
-            OC_SPREAD_COST: spread_c,
-            OC_DELTA_CEILING: dceil_c,
-            OC_GAMMA: gamma_c,
-            OC_TOTAL: theta_c + spread_c + dceil_c + gamma_c,
-        })
-    return contribs
+    q = np.asarray(q, dtype=float)
+    theta_c = bundle["theta"] * bundle["h"] * q
+    exec_c = -bundle["lam_spread"] * bundle["exec_cost"] * np.abs(q - bundle["current_qty"])
+    dceil_c = -bundle["lam_delta"] * bundle["delta_pen"] * q
+    x = bundle["sqrt_h"] * bundle["gamma"] * q
+    group_sum = bundle["G"] @ x
+    gamma_c = -bundle["lam_gamma"] * x * group_sum[bundle["rows"]]
+    return {
+        OC_THETA: theta_c,
+        OC_EXEC_COST: exec_c,
+        OC_DELTA_CEILING: dceil_c,
+        OC_GAMMA: gamma_c,
+        OC_TOTAL: theta_c + exec_c + dceil_c + gamma_c,
+    }
 
 
-def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: list) -> list:
+def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: dict) -> list:
     """Keep the top max_positions nonzero positions per underlying, zero the rest.
     Ranking uses contributions against the full pre-cardinality composition."""
     q = list(q)
+    totals = ranking_contribs[OC_TOTAL]
     for u, idx in groups.items():
         max_pos = bundle["pu"][u][3]
         nonzero = [i for i in idx if q[i] > 0]
         if len(nonzero) <= max_pos:
             continue
-        nonzero.sort(key=lambda i: ranking_contribs[i][OC_TOTAL], reverse=True)
+        nonzero.sort(key=lambda i: totals[i], reverse=True)
         for i in nonzero[max_pos:]:
             q[i] = 0
         log.info("[Solver] cardinality: underlying %s had %d positions, kept top %d",
                  u, len(nonzero), max_pos)
     return q
+
+
+def _book_meets_constraints(bundle: dict, q) -> bool:
+    """True when book q satisfies every hard constraint: closeable_only bounds,
+    BP, per-underlying concentration and the delta band. Used on the CURRENT book
+    to decide whether hold is allowed (never hold a book that breaks one)."""
+    q = np.asarray(q, dtype=float)
+    eps = CONSTRAINT_CHECK_EPS
+    closeable = bundle["closeable"]
+    if np.any(q[closeable] > bundle["current_qty"][closeable] + eps):
+        return False
+    if float(bundle["margin"] @ q) > bundle["bp_limit"] + eps:
+        return False
+    net_delta = bundle["G_delta"] @ q
+    if np.any(np.abs(bundle["u_spot"] * net_delta) > bundle["conc_limit"] + eps):
+        return False
+    if np.any(net_delta < bundle["u_lo"] - eps) or np.any(net_delta > bundle["u_hi"] + eps):
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -445,7 +532,13 @@ def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: l
 def _build_solved_response(meta, status, target_value, problem, dvs, bundle, groups,
                            verbose, n, n_constraints, start) -> dict:
     """Build the response for optimal or timeout status. For timeout with no
-    feasible point, recommendations and score are omitted."""
+    feasible point, recommendations and score are omitted.
+
+    After the cardinality filter the current book is scored under the same
+    objective. Hold when optimal − current < min_improvement AND the current
+    book meets every hard constraint; trade otherwise. On hold every record's
+    target_quantity is its current_quantity; optimal_quantity always carries the
+    solver's book."""
     solver_meta = _build_solver_meta(problem, n, n_constraints, start)
 
     if status == STATUS_TIMEOUT and target_value is None:
@@ -458,15 +551,31 @@ def _build_solved_response(meta, status, target_value, problem, dvs, bundle, gro
         }
 
     rounded = _extract_targets(target_value, n)
-    ranking_contribs = _compute_contributions(bundle, groups, rounded)
-    final_q = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
-    final_contribs = _compute_contributions(bundle, groups, final_q)
+    ranking_contribs = _compute_contributions(bundle, rounded)
+    optimal_q = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
+    optimal_contribs = _compute_contributions(bundle, optimal_q)
+
+    current_q = [dv[F_CURRENT_QUANTITY] for dv in dvs]
+    current_contribs = _compute_contributions(bundle, current_q)
+
+    optimal_obj = float(optimal_contribs[OC_TOTAL].sum())
+    current_obj = float(current_contribs[OC_TOTAL].sum())
+    current_valid = _book_meets_constraints(bundle, current_q)
+    hold = current_valid and (optimal_obj - current_obj < bundle["min_improvement"])
+    action = ACTION_HOLD if hold else ACTION_TRADE
+    log.info("[Solver] action=%s optimal=%.4f current=%.4f gap=%.4f min_improvement=%.4f current_valid=%s",
+             action, optimal_obj, current_obj, optimal_obj - current_obj,
+             bundle["min_improvement"], current_valid)
+
+    target_q = current_q if hold else optimal_q
+    target_contribs = current_contribs if hold else optimal_contribs
 
     response = {
         **meta,
         F_STATUS: status,
-        F_RECOMMENDATIONS: _build_recommendations(dvs, final_q, final_contribs, verbose),
-        F_SCORE: _build_score(final_contribs),
+        F_ACTION: action,
+        F_RECOMMENDATIONS: _build_recommendations(dvs, target_q, optimal_q, target_contribs, verbose),
+        F_SCORE: _build_score(target_contribs, optimal_obj, current_obj),
         F_BINDING_CONSTRAINTS: [],  # dual-based detection deferred to shape-experiment phase
         F_SOLVER_META: solver_meta,
     }
@@ -475,16 +584,18 @@ def _build_solved_response(meta, status, target_value, problem, dvs, bundle, gro
     return response
 
 
-def _build_recommendations(dvs: list, q: list, contribs: list, verbose: bool) -> list:
+def _build_recommendations(dvs: list, target_q: list, optimal_q: list, contribs: dict,
+                           verbose: bool) -> list:
     """One record per decision variable. Default scope: target_quantity > 0 OR
-    current_quantity > 0. Verbose: every decision variable."""
+    current_quantity > 0 OR optimal_quantity > 0 (so a hold still shows what the
+    solver would have opened). Verbose: every decision variable."""
     recs = []
     for i, dv in enumerate(dvs):
         current_qty = dv[F_CURRENT_QUANTITY]
-        qi = q[i]
-        if not (qi > 0 or current_qty > 0 or verbose):
+        qi = target_q[i]
+        oi = optimal_q[i]
+        if not (qi > 0 or current_qty > 0 or oi > 0 or verbose):
             continue
-        c = contribs[i]
         rec = {
             F_ID: dv[F_ID],
             F_UNDERLYING: dv[F_UNDERLYING],
@@ -492,12 +603,13 @@ def _build_recommendations(dvs: list, q: list, contribs: list, verbose: bool) ->
             F_DIRECTION: dv[F_DIRECTION],
             F_CURRENT_QUANTITY: current_qty,
             F_TARGET_QUANTITY: qi,
+            F_OPTIMAL_QUANTITY: oi,
             F_OBJECTIVE_CONTRIBUTION: {
-                OC_TOTAL: c[OC_TOTAL],
-                OC_THETA: c[OC_THETA],
-                OC_SPREAD_COST: c[OC_SPREAD_COST],
-                OC_DELTA_CEILING: c[OC_DELTA_CEILING],
-                OC_GAMMA: c[OC_GAMMA],
+                OC_TOTAL: float(contribs[OC_TOTAL][i]),
+                OC_THETA: float(contribs[OC_THETA][i]),
+                OC_EXEC_COST: float(contribs[OC_EXEC_COST][i]),
+                OC_DELTA_CEILING: float(contribs[OC_DELTA_CEILING][i]),
+                OC_GAMMA: float(contribs[OC_GAMMA][i]),
             },
         }
         for field in DIAGNOSTIC_FIELDS:
@@ -507,16 +619,19 @@ def _build_recommendations(dvs: list, q: list, contribs: list, verbose: bool) ->
     return recs
 
 
-def _build_score(contribs: list) -> dict:
-    """Score summed from the realized per-position contributions (== sum over
-    recommendations, since excluded positions contribute zero)."""
+def _build_score(contribs: dict, optimal_obj: float, current_obj: float) -> dict:
+    """Score of the recommended book, summed from its per-position contributions
+    (== sum over recommendations, since excluded positions contribute zero),
+    plus both books' objectives so the optimal-vs-current gap is visible."""
     return {
-        SC_OBJECTIVE_VALUE: sum(c[OC_TOTAL] for c in contribs),
+        SC_OBJECTIVE_VALUE: float(contribs[OC_TOTAL].sum()),
+        SC_OPTIMAL_OBJECTIVE_VALUE: optimal_obj,
+        SC_CURRENT_OBJECTIVE_VALUE: current_obj,
         SC_COMPONENTS: {
-            SC_THETA_TOTAL: sum(c[OC_THETA] for c in contribs),
-            SC_SPREAD_COST_TOTAL: sum(c[OC_SPREAD_COST] for c in contribs),
-            SC_DELTA_CEILING_PENALTY: sum(c[OC_DELTA_CEILING] for c in contribs),
-            SC_GAMMA_PENALTY: sum(c[OC_GAMMA] for c in contribs),
+            SC_THETA_TOTAL: float(contribs[OC_THETA].sum()),
+            SC_EXEC_COST_TOTAL: float(contribs[OC_EXEC_COST].sum()),
+            SC_DELTA_CEILING_PENALTY: float(contribs[OC_DELTA_CEILING].sum()),
+            SC_GAMMA_PENALTY: float(contribs[OC_GAMMA].sum()),
         },
     }
 

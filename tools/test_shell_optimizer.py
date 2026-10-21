@@ -42,9 +42,9 @@ def make_request(verbose=False, num_dvs=20):
             "gamma_per_unit": -1.5 if direction == "short" else 1.5,
             "margin_per_unit": 4000.0,
             "premium_per_unit": 250.0 if direction == "short" else -250.0,
-            "spread_cost_per_unit": 8.0,
+            "exec_cost_per_unit": 8.0,
             "iv": 0.35,
-            "days_to_expiry": 5,
+            "days_to_expiry": 4.25,
             "strike": float(strike),
             "expiry": "2026-05-15",
         })
@@ -66,7 +66,6 @@ def make_request(verbose=False, num_dvs=20):
             "bp_limit_pct": 60,
             "max_positions_per_underlying": 8,
             "concentration_limit_pct": 30,
-            "yield_floor_pct": 0.1,
             "delta_ceiling_threshold": 0.30,
             "lambda_delta_ceiling": 1.0,
             "lambda_gamma": 1.0,
@@ -137,9 +136,9 @@ def main():
     # Verify score arithmetic
     score = resp["score"]
     theta_sum = sum(r["objective_contribution"]["theta"] for r in recs)
-    spread_sum = sum(r["objective_contribution"]["spread_cost"] for r in recs)
+    spread_sum = sum(r["objective_contribution"]["exec_cost"] for r in recs)
     assert abs(score["components"]["theta_total"] - theta_sum) < 0.01, "theta_total mismatch"
-    assert abs(score["components"]["spread_cost_total"] - spread_sum) < 0.01, "spread_cost_total mismatch"
+    assert abs(score["components"]["exec_cost_total"] - spread_sum) < 0.01, "exec_cost_total mismatch"
     expected_obj = theta_sum + spread_sum
     assert abs(score["objective_value"] - expected_obj) < 0.01, "objective_value mismatch"
 
@@ -196,7 +195,6 @@ def main():
     print(f"OK: Unknown op handled — {err['error']}")
 
     dealer.close()
-    ctx.term()
 
     print("\n" + "=" * 60)
     print("ALL LAYERS PASSED")

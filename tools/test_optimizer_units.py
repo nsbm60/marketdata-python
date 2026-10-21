@@ -44,16 +44,17 @@ def _tiny_bundle_and_groups():
         "id": "O:ZZZ260515P00100000-short", "underlying": "ZZZ", "type": "option",
         "direction": "short", "current_quantity": 0, "delta_per_unit": 20.0,
         "theta_per_unit": 10.0, "gamma_per_unit": -1.0, "margin_per_unit": 1000.0,
-        "spread_cost_per_unit": 5.0, "strike": 100.0, "expiry": "2026-05-15",
-        "days_to_expiry": 5, "iv": 0.3,
+        "exec_cost_per_unit": 5.0, "strike": 100.0, "expiry": "2026-05-15",
+        "days_to_expiry": 4.25, "iv": 0.3,
     }]
     per_underlying = [{"underlying": "ZZZ", "spot": 100.0, "delta_target": 0,
                        "tolerance": 25, "max_positions": 8, "tradeable": True}]
     policy = {"bp_limit_pct": 60, "concentration_limit_pct": 30, "delta_ceiling_threshold": 0.30,
-              "lambda_delta_ceiling": 1.0, "lambda_gamma": 1.0, "lambda_spread": 0.65}
+              "lambda_delta_ceiling": 1.0, "lambda_gamma": 1.0, "lambda_spread": 1.0,
+              "min_improvement": 0.0}
     capital = {"net_liq": 250000.0}
     groups = opt._group_by_underlying(dvs)
-    bundle = opt._extract_inputs(dvs, per_underlying, policy, capital, groups)
+    bundle = opt._extract_inputs(dvs, per_underlying, policy, capital, groups, horizon_days=5)
     return dvs, bundle, groups
 
 

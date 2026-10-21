@@ -60,7 +60,7 @@ from wire_format import (
     F_DIRECTION,
     F_CURRENT_QUANTITY,
     F_THETA_PER_UNIT,
-    F_SPREAD_COST_PER_UNIT,
+    F_EXEC_COST_PER_UNIT,
     F_REQUEST_TIMESTAMP,
     F_RESPONSE_TIMESTAMP,
     F_STATUS,
@@ -73,13 +73,13 @@ from wire_format import (
     F_OBJECTIVE_CONTRIBUTION,
     OC_TOTAL,
     OC_THETA,
-    OC_SPREAD_COST,
+    OC_EXEC_COST,
     OC_DELTA_CEILING,
     OC_GAMMA,
     SC_OBJECTIVE_VALUE,
     SC_COMPONENTS,
     SC_THETA_TOTAL,
-    SC_SPREAD_COST_TOTAL,
+    SC_EXEC_COST_TOTAL,
     SC_DELTA_CEILING_PENALTY,
     SC_GAMMA_PENALTY,
     SM_SOLVER_NAME,
@@ -268,7 +268,7 @@ def _build_recommendations(dvs: list, selected_ids: set, verbose: bool) -> list:
             continue
 
         theta = dv.get(F_THETA_PER_UNIT, 0) * target_qty
-        spread = -(dv.get(F_SPREAD_COST_PER_UNIT, 0) * target_qty)
+        spread = -(dv.get(F_EXEC_COST_PER_UNIT, 0) * target_qty)
         total = theta + spread
 
         rec = {
@@ -281,7 +281,7 @@ def _build_recommendations(dvs: list, selected_ids: set, verbose: bool) -> list:
             F_OBJECTIVE_CONTRIBUTION: {
                 OC_TOTAL: total,
                 OC_THETA: theta,
-                OC_SPREAD_COST: spread,
+                OC_EXEC_COST: spread,
                 OC_DELTA_CEILING: 0,
                 OC_GAMMA: 0,
             },
@@ -300,13 +300,13 @@ def _build_recommendations(dvs: list, selected_ids: set, verbose: bool) -> list:
 def _build_score(recommendations: list) -> dict:
     objective_value = sum(r[F_OBJECTIVE_CONTRIBUTION][OC_TOTAL] for r in recommendations)
     theta_total = sum(r[F_OBJECTIVE_CONTRIBUTION][OC_THETA] for r in recommendations)
-    spread_total = sum(r[F_OBJECTIVE_CONTRIBUTION][OC_SPREAD_COST] for r in recommendations)
+    spread_total = sum(r[F_OBJECTIVE_CONTRIBUTION][OC_EXEC_COST] for r in recommendations)
 
     return {
         SC_OBJECTIVE_VALUE: objective_value,
         SC_COMPONENTS: {
             SC_THETA_TOTAL: theta_total,
-            SC_SPREAD_COST_TOTAL: spread_total,
+            SC_EXEC_COST_TOTAL: spread_total,
             SC_DELTA_CEILING_PENALTY: 0,
             SC_GAMMA_PENALTY: 0,
         },

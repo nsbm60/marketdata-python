@@ -34,6 +34,7 @@ F_DECISION_VARIABLES = "decision_variables"
 F_PER_UNDERLYING = "per_underlying"
 F_POLICY = "policy"
 F_CAPITAL = "capital"
+F_HORIZON_DAYS = "horizon_days"
 
 # Decision variable field names
 F_ID = "id"
@@ -42,7 +43,7 @@ F_TYPE = "type"
 F_DIRECTION = "direction"
 F_CURRENT_QUANTITY = "current_quantity"
 F_THETA_PER_UNIT = "theta_per_unit"
-F_SPREAD_COST_PER_UNIT = "spread_cost_per_unit"
+F_EXEC_COST_PER_UNIT = "exec_cost_per_unit"
 F_MARGIN_PER_UNIT = "margin_per_unit"
 F_CLOSEABLE_ONLY = "closeable_only"
 F_DELTA_PER_UNIT = "delta_per_unit"
@@ -64,11 +65,11 @@ F_MAX_POSITIONS = "max_positions"
 # Policy field names
 F_BP_LIMIT_PCT = "bp_limit_pct"
 F_CONCENTRATION_LIMIT_PCT = "concentration_limit_pct"
-F_YIELD_FLOOR_PCT = "yield_floor_pct"
 F_DELTA_CEILING_THRESHOLD = "delta_ceiling_threshold"
 F_LAMBDA_DELTA_CEILING = "lambda_delta_ceiling"
 F_LAMBDA_GAMMA = "lambda_gamma"
 F_LAMBDA_SPREAD = "lambda_spread"
+F_MIN_IMPROVEMENT = "min_improvement"
 
 # Capital field names
 F_NET_LIQ = "net_liq"
@@ -83,20 +84,28 @@ F_BINDING_CONSTRAINTS = "binding_constraints"
 F_ERROR = "error"
 F_SOLVER_META = "solver_meta"
 F_TARGET_QUANTITY = "target_quantity"
+F_OPTIMAL_QUANTITY = "optimal_quantity"
+F_ACTION = "action"
+
+# Response `action` enum values (present whenever recommendations are present)
+ACTION_TRADE = "trade"
+ACTION_HOLD = "hold"
 F_OBJECTIVE_CONTRIBUTION = "objective_contribution"
 
 # Objective contribution component keys
 OC_TOTAL = "total"
 OC_THETA = "theta"
-OC_SPREAD_COST = "spread_cost"
+OC_EXEC_COST = "exec_cost"
 OC_DELTA_CEILING = "delta_ceiling"
 OC_GAMMA = "gamma"
 
 # Score keys
 SC_OBJECTIVE_VALUE = "objective_value"
+SC_OPTIMAL_OBJECTIVE_VALUE = "optimal_objective_value"
+SC_CURRENT_OBJECTIVE_VALUE = "current_objective_value"
 SC_COMPONENTS = "components"
 SC_THETA_TOTAL = "theta_total"
-SC_SPREAD_COST_TOTAL = "spread_cost_total"
+SC_EXEC_COST_TOTAL = "exec_cost_total"
 SC_DELTA_CEILING_PENALTY = "delta_ceiling_penalty"
 SC_GAMMA_PENALTY = "gamma_penalty"
 
