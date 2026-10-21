@@ -39,7 +39,7 @@ tier2 = [
 include = ["greeks*", "option_archive*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server"]
+testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server", "tests/solver"]
 pythonpath = ["."]
 
 [tool.mypy]
