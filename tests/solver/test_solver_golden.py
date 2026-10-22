@@ -89,18 +89,21 @@ def _golden() -> tuple[dict, dict]:
 
 
 def test_golden_book_is_inside_every_delta_band() -> None:
-    """The golden continuous optimum sits on the band edges (NVDA +25, MU −25); the
-    rounded book must still be inside every band. (The case where rounding crosses the
+    """The golden continuous optimum sits on the band edges (NVDA +25 shares, MU −25: the
+    2.15% and 1.18% bands of $250k at their spots); the rounded book must still be inside
+    every band, checked in % of net liq. (The case where rounding crosses the
     edge and stock repairs it is tools/test_real_optimizer.py, "Rounding: Stock Repair".)"""
     request, response = _golden()
     dvs = {dv["id"]: dv for dv in request["decision_variables"]}
     net: dict[str, float] = {}
     for r in response["recommendations"]:
         net[r["underlying"]] = net.get(r["underlying"], 0.0) + dvs[r["id"]]["delta_per_unit"] * r["optimal_quantity"]
+    net_liq = request["capital"]["net_liq"]
     for pu in request["per_underlying"]:
         u = pu["underlying"]
-        assert abs(net.get(u, 0.0) - pu["delta_target"]) <= pu["tolerance"] + 1e-9, \
-            f"{u} net delta {net.get(u, 0.0)} outside {pu['delta_target']} ± {pu['tolerance']}"
+        pct = pu["spot"] * net.get(u, 0.0) / net_liq * 100.0
+        assert abs(pct - pu["delta_target_pct"]) <= pu["delta_tolerance_pct"] + 1e-9, \
+            f"{u} dollar delta {pct:.4f}% outside {pu['delta_target_pct']} ± {pu['delta_tolerance_pct']}%"
 
 
 def test_golden_gamma_penalty_is_the_overlap_form() -> None:

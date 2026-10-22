@@ -47,9 +47,9 @@ def _tiny_bundle_and_groups():
         "exec_cost_per_unit": 5.0, "strike": 100.0, "expiry": "2026-05-15",
         "days_to_expiry": 4.25, "iv": 0.3,
     }]
-    per_underlying = [{"underlying": "ZZZ", "spot": 100.0, "delta_target": 0,
-                       "tolerance": 25, "max_positions": 8, "tradeable": True}]
-    policy = {"bp_limit_pct": 60, "concentration_limit_pct": 30, "delta_ceiling_threshold": 0.30,
+    per_underlying = [{"underlying": "ZZZ", "spot": 100.0, "delta_target_pct": 0,
+                       "delta_tolerance_pct": 1.0, "max_positions": 8, "tradeable": True}]
+    policy = {"bp_limit_pct": 60, "delta_ceiling_threshold": 0.30,
               "lambda_delta_ceiling": 1.0, "lambda_gamma": 1.0, "lambda_spread": 1.0,
               "min_improvement": 0.0}
     capital = {"net_liq": 250000.0}
@@ -111,9 +111,9 @@ def test_gamma_overlap_same_day_hedge():
                 "exec_cost_per_unit": 0.0, "days_to_expiry": dte}
     dvs = [dv("260519C00100000", "short", -2.0, 7.235),   # h = min(7.235, 5) = 5
            dv("260512C00100000", "long", 3.0, 0.25)]      # h = 0.25 (same day)
-    per_underlying = [{"underlying": "ZZZ", "spot": 100.0, "delta_target": 0,
-                       "tolerance": 25, "max_positions": 8, "tradeable": True}]
-    policy = {"bp_limit_pct": 60, "concentration_limit_pct": 30, "delta_ceiling_threshold": 0.30,
+    per_underlying = [{"underlying": "ZZZ", "spot": 100.0, "delta_target_pct": 0,
+                       "delta_tolerance_pct": 1.0, "max_positions": 8, "tradeable": True}]
+    policy = {"bp_limit_pct": 60, "delta_ceiling_threshold": 0.30,
               "lambda_delta_ceiling": 1.0, "lambda_gamma": 0.7, "lambda_spread": 1.0,
               "min_improvement": 0.0}
     groups = opt._group_by_underlying(dvs)
@@ -128,6 +128,45 @@ def test_gamma_overlap_same_day_hedge():
     print(f"OK: same-day hedge credited for 0.25 days only: penalty {got:.4f} (√h form would give {sqrt_h_form:.4f})")
 
 
+def test_dollar_band_becomes_a_share_band():
+    """(target_pct ± tolerance_pct)/100 · net_liq / spot: the same 10% band is 50 shares on
+    a $500 stock and 2,500 on a $10 one; a −2% target shifts it."""
+    def eq(u, direction):
+        return {"id": f"{u}-equity-{direction}", "underlying": u, "type": "equity",
+                "direction": direction, "current_quantity": 0,
+                "delta_per_unit": 1.0 if direction == "long" else -1.0, "theta_per_unit": 0.0,
+                "gamma_per_unit": 0.0, "margin_per_unit": 1.0, "exec_cost_per_unit": 0.0}
+    dvs = [eq("AAA", "long"), eq("AAA", "short"), eq("BBB", "long"), eq("BBB", "short")]
+    per_underlying = [
+        {"underlying": "AAA", "spot": 500.0, "delta_target_pct": 0, "delta_tolerance_pct": 10,
+         "max_positions": 8, "tradeable": True},
+        {"underlying": "BBB", "spot": 10.0, "delta_target_pct": -2, "delta_tolerance_pct": 10,
+         "max_positions": 8, "tradeable": True}]
+    policy = {"bp_limit_pct": 60, "delta_ceiling_threshold": 0.30, "lambda_delta_ceiling": 1.0,
+              "lambda_gamma": 1.0, "lambda_spread": 1.0, "min_improvement": 0.0}
+    groups = opt._group_by_underlying(dvs)
+    bundle = opt._extract_inputs(dvs, per_underlying, policy, {"net_liq": 250000.0}, groups, horizon_days=5)
+    k = {u: i for i, u in enumerate(bundle["und_names"])}
+    assert np.allclose([bundle["u_lo"][k["AAA"]], bundle["u_hi"][k["AAA"]]], [-50.0, 50.0])
+    assert np.allclose([bundle["u_lo"][k["BBB"]], bundle["u_hi"][k["BBB"]]], [-3000.0, 2000.0])
+    # A book outside the band reports it in % of net liq.
+    q = [0, 60, 0, 0]  # 60 shares short AAA = −$30,000 = −12% of net liq
+    breach = opt._breached_constraints(bundle, q)
+    assert len(breach) == 1 and breach[0]["underlying"] == "AAA", breach
+    assert abs(breach[0]["value_pct"] - (-12.0)) < 1e-9 and breach[0]["tolerance_pct"] == 10.0, breach
+    print("OK: 10% band = ±50 shares at $500, [−3000, +2000] at $10 with a −2% target; breach in % of net liq")
+
+    # Non-positive net liq or tolerance is malformed input.
+    for capital, pu_patch in (({"net_liq": 0.0}, {}), ({"net_liq": 250000.0}, {"delta_tolerance_pct": 0})):
+        bad = [dict(per_underlying[0], **pu_patch), per_underlying[1]]
+        try:
+            opt._extract_inputs(dvs, bad, policy, capital, groups, horizon_days=5)
+        except ValueError as e:
+            print(f"OK: rejected: {e}")
+        else:
+            raise AssertionError(f"expected ValueError for {capital} {pu_patch}")
+
+
 def main():
     print("=" * 60)
     print("Optimizer Unit Tests")
@@ -136,6 +175,7 @@ def main():
     test_timeout_feasible_branch()
     test_optimal_branch_has_no_error()
     test_gamma_overlap_same_day_hedge()
+    test_dollar_band_becomes_a_share_band()
     print("\n" + "=" * 60)
     print("UNIT TESTS PASSED")
     print("=" * 60)

@@ -41,9 +41,9 @@ TOL = 1e-4  # arithmetic-sanity tolerance
 HORIZON_DAYS = 5.0
 
 POLICY = {
-    "bp_limit_pct": 60, "max_positions_per_underlying": 8, "concentration_limit_pct": 30,
+    "bp_limit_pct": 60, "max_positions_per_underlying": 8,
     "delta_ceiling_threshold": 0.30, "lambda_delta_ceiling": 1.0, "lambda_gamma": 1.0,
-    "lambda_spread": 1.0, "min_improvement": 0.0, "default_delta_tolerance": 25.0,
+    "lambda_spread": 1.0, "min_improvement": 0.0,
 }
 
 
@@ -101,9 +101,9 @@ def make_request(verbose=False):
         "verbose": verbose,
         "decision_variables": dvs,
         "per_underlying": [
-            {"underlying": "NVDA", "spot": 215.0, "delta_target": 0, "tolerance": 25, "max_positions": 8, "tradeable": True},
-            {"underlying": "MU", "spot": 118.0, "delta_target": 0, "tolerance": 25, "max_positions": 8, "tradeable": True},
-            {"underlying": "TSLA", "spot": 250.0, "delta_target": 0, "tolerance": 25, "max_positions": 8, "tradeable": False},
+            {"underlying": "NVDA", "spot": 215.0, "delta_target_pct": 0, "delta_tolerance_pct": 2.15, "max_positions": 8, "tradeable": True},
+            {"underlying": "MU", "spot": 118.0, "delta_target_pct": 0, "delta_tolerance_pct": 1.18, "max_positions": 8, "tradeable": True},
+            {"underlying": "TSLA", "spot": 250.0, "delta_target_pct": 0, "delta_tolerance_pct": 2.5, "max_positions": 8, "tradeable": False},
         ],
         "policy": dict(POLICY),
         "capital": {"net_liq": 250000.0, "current_bp_usage": 45000.0, "current_margin": 32000.0},
@@ -111,9 +111,9 @@ def make_request(verbose=False):
 
 
 def make_infeasible_request():
-    """Single positive-delta short with a large NEGATIVE delta target. Net delta
-    is >= 0 for any non-negative quantity, so the target band [-100001, -99999]
-    is unreachable — a deterministic infeasibility."""
+    """Single positive-delta short with a NEGATIVE delta target. Net delta is >= 0
+    for any non-negative quantity, so the band −50% ± 0.04% of net liq (−1251 to −1249
+    shares at $100 on $250k) is unreachable — a deterministic infeasibility."""
     return {
         "schema_version": 1,
         "request_id": f"test-inf-{uuid.uuid4().hex[:8]}",
@@ -128,7 +128,7 @@ def make_infeasible_request():
             "premium_per_unit": 100.0, "exec_cost_per_unit": 2.5, "iv": 0.3,
             "days_to_expiry": 3.235, "strike": 100.0, "expiry": "2026-05-15"}],
         "per_underlying": [
-            {"underlying": "ZZZ", "spot": 100.0, "delta_target": -100000, "tolerance": 1,
+            {"underlying": "ZZZ", "spot": 100.0, "delta_target_pct": -50, "delta_tolerance_pct": 0.04,
              "max_positions": 8, "tradeable": True}],
         "policy": dict(POLICY),
         "capital": {"net_liq": 250000.0, "current_bp_usage": 0.0, "current_margin": 0.0},
@@ -137,7 +137,7 @@ def make_infeasible_request():
 
 def make_switch_request(exec_cost, min_improvement=0.0, held_qty=2):
     """One underlying, two near-identical short puts. A is held; B has slightly
-    more theta (+0.5/day). The delta band (tolerance 40, delta 20 each) caps the
+    more theta (+0.5/day). The delta band (1.6% of $250k = 40 shares at $100, delta 20 each) caps the
     book at 2 contracts, so the only question is whether switching A→B pays.
     Gamma is 0 so the comparison is theta over the horizon vs execution cost."""
     def leg(name, theta, current):
@@ -157,7 +157,7 @@ def make_switch_request(exec_cost, min_improvement=0.0, held_qty=2):
         "verbose": True,
         "decision_variables": [leg("100000A", 10.0, held_qty), leg("100000B", 10.5, 0)],
         "per_underlying": [
-            {"underlying": "ZZZ", "spot": 100.0, "delta_target": 0, "tolerance": 40,
+            {"underlying": "ZZZ", "spot": 100.0, "delta_target_pct": 0, "delta_tolerance_pct": 1.6,
              "max_positions": 8, "tradeable": True}],
         "policy": policy,
         "capital": {"net_liq": 250000.0, "current_bp_usage": 0.0, "current_margin": 0.0},
@@ -169,7 +169,7 @@ PUT_DELTA = 30.37
 
 def make_rounding_request(tradeable):
     """Two short options on ZZZ whose continuous optimum sits on the delta-band edge.
-    Put +30.37 delta, call −20 delta, band 0 ± 5, both held 10 and closeable.
+    Put +30.37 delta, call −20 delta, band 0 ± 0.2% of $250k (± 5 shares at $100), both held 10 and closeable.
 
     With stock (tradeable): the solver keeps both legs and shorts 98.7 shares to sit at the
     band edge (net +5; stock has no theta, so it uses as little as it can). Flooring to 98
@@ -203,7 +203,7 @@ def make_rounding_request(tradeable):
         "verbose": True,
         "decision_variables": dvs,
         "per_underlying": [
-            {"underlying": "ZZZ", "spot": 100.0, "delta_target": 0, "tolerance": 5,
+            {"underlying": "ZZZ", "spot": 100.0, "delta_target_pct": 0, "delta_tolerance_pct": 0.2,
              "max_positions": 8, "tradeable": tradeable}],
         "policy": dict(POLICY),
         "capital": {"net_liq": 250000.0, "current_bp_usage": 0.0, "current_margin": 0.0},
@@ -410,7 +410,8 @@ def main():
     assert nresp["status"] == "infeasible", f"got {nresp['status']}"
     bc = nresp["binding_constraints"]
     assert any(c["type"] == "delta_target" and c["underlying"] == "ZZZ"
-               and abs(c["value_at_solution"] - (PUT_DELTA * 6 - 200.0)) < TOL for c in bc), bc
+               and abs(c["value_pct"] - (PUT_DELTA * 6 - 200.0) * 100.0 / 250000.0 * 100.0) < TOL
+               and c["tolerance_pct"] == 0.2 for c in bc), bc
     assert "ZZZ delta_target" in nresp["error"], nresp["error"]
     for absent in ("recommendations", "score", "action"):
         assert absent not in nresp, f"post-rounding infeasible must omit {absent}"
@@ -452,7 +453,9 @@ def main():
     types = {c["type"] for c in bc}
     assert {"bp_limit", "delta_target"} <= types, f"expected request constraints listed, got {types}"
     for c in bc:
-        assert c["value_at_solution"] is None, "infeasible value_at_solution must be null"
+        value_key = "value_pct" if c["type"] == "delta_target" else "value_at_solution"
+        assert c[value_key] is None, f"infeasible {value_key} must be null"
+    assert not any(c["type"] == "concentration_limit" for c in bc), "concentration limit is retired"
     for absent in ("recommendations", "score", "action"):
         assert absent not in iresp, f"infeasible must omit {absent}"
     print(f"OK: unsatisfiable delta target -> infeasible, {len(bc)} constraints in play, recs/score absent")

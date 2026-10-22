@@ -202,24 +202,24 @@
     {
       "underlying": "NVDA",
       "spot": 215.0,
-      "delta_target": 0.0,
-      "tolerance": 25.0,
+      "delta_target_pct": 0.0,
+      "delta_tolerance_pct": 2.15,
       "max_positions": 8,
       "tradeable": true
     },
     {
       "underlying": "MU",
       "spot": 118.0,
-      "delta_target": 0.0,
-      "tolerance": 25.0,
+      "delta_target_pct": 0.0,
+      "delta_tolerance_pct": 1.18,
       "max_positions": 8,
       "tradeable": true
     },
     {
       "underlying": "TSLA",
       "spot": 250.0,
-      "delta_target": 0.0,
-      "tolerance": 25.0,
+      "delta_target_pct": 0.0,
+      "delta_tolerance_pct": 2.5,
       "max_positions": 8,
       "tradeable": false
     }
@@ -227,13 +227,11 @@
   "policy": {
     "bp_limit_pct": 60.0,
     "max_positions_per_underlying": 8,
-    "concentration_limit_pct": 30.0,
     "delta_ceiling_threshold": 0.3,
     "lambda_delta_ceiling": 1.0,
     "lambda_gamma": 1.0,
     "lambda_spread": 1.0,
-    "min_improvement": 0.0,
-    "default_delta_tolerance": 25.0
+    "min_improvement": 0.0
   },
   "capital": {
     "net_liq": 250000.0

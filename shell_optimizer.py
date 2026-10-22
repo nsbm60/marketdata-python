@@ -91,11 +91,9 @@ from wire_format import (
     SM_CONSTRAINTS,
     BC_TYPE,
     BC_UNDERLYING,
-    BC_LIMIT,
-    BC_VALUE_AT_SOLUTION,
-    BC_TARGET,
-    BC_TOLERANCE,
-    BCT_CONCENTRATION_LIMIT,
+    BC_TARGET_PCT,
+    BC_TOLERANCE_PCT,
+    BC_VALUE_PCT,
     BCT_DELTA_TARGET,
     DIAGNOSTIC_FIELDS,
 )
@@ -198,8 +196,7 @@ def _build_infeasible(dvs: list, start: float) -> dict:
     return {
         F_STATUS: STATUS_INFEASIBLE,
         F_BINDING_CONSTRAINTS: [
-            {BC_TYPE: BCT_CONCENTRATION_LIMIT, BC_UNDERLYING: first_underlying, BC_LIMIT: 75000.0, BC_VALUE_AT_SOLUTION: None},
-            {BC_TYPE: BCT_DELTA_TARGET, BC_UNDERLYING: first_underlying, BC_TARGET: 0, BC_TOLERANCE: 25, BC_VALUE_AT_SOLUTION: None},
+            {BC_TYPE: BCT_DELTA_TARGET, BC_UNDERLYING: first_underlying, BC_TARGET_PCT: 0, BC_TOLERANCE_PCT: 10, BC_VALUE_PCT: None},
         ],
         F_ERROR: "Shell-injected infeasibility for testing. Constraints would conflict given the request.",
         F_SOLVER_META: _build_solver_meta(STATUS_INFEASIBLE, dvs, start),

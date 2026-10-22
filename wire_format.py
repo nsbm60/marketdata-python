@@ -58,14 +58,13 @@ TYPE_EQUITY = "equity"
 
 # Per-underlying record field names
 F_SPOT = "spot"
-F_DELTA_TARGET = "delta_target"
-F_TOLERANCE = "tolerance"
+F_DELTA_TARGET_PCT = "delta_target_pct"        # dollar delta as % of net liq
+F_DELTA_TOLERANCE_PCT = "delta_tolerance_pct"  # band half-width, same unit
 F_MAX_POSITIONS = "max_positions"
 F_TRADEABLE = "tradeable"
 
 # Policy field names
 F_BP_LIMIT_PCT = "bp_limit_pct"
-F_CONCENTRATION_LIMIT_PCT = "concentration_limit_pct"
 F_DELTA_CEILING_THRESHOLD = "delta_ceiling_threshold"
 F_LAMBDA_DELTA_CEILING = "lambda_delta_ceiling"
 F_LAMBDA_GAMMA = "lambda_gamma"
@@ -124,12 +123,12 @@ BC_TYPE = "type"
 BC_UNDERLYING = "underlying"
 BC_LIMIT = "limit"
 BC_VALUE_AT_SOLUTION = "value_at_solution"
-BC_TARGET = "target"
-BC_TOLERANCE = "tolerance"
+BC_TARGET_PCT = "target_pct"        # delta_target records: dollar delta as % of net liq
+BC_TOLERANCE_PCT = "tolerance_pct"
+BC_VALUE_PCT = "value_pct"
 
 # Binding constraints type discriminator values
 BCT_BP_LIMIT = "bp_limit"
-BCT_CONCENTRATION_LIMIT = "concentration_limit"
 BCT_DELTA_TARGET = "delta_target"
 
 # Diagnostic fields echoed from request to response recommendations

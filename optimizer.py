@@ -26,8 +26,11 @@ RUN-LOOP AMENDMENTS (optimizer-run-loop-spec-draft.md §3, 2026-10-21):
     bring it back inside; then every hard
     constraint is re-checked, and a remaining breach is `infeasible`;
   - min_improvement: the current book is scored under the same objective and
-    the response carries action hold|trade (never hold a book that breaks BP,
-    concentration or the delta band);
+    the response carries action hold|trade (never hold a book that breaks BP
+    or the delta band);
+  - the delta band is dollar delta as % of net liq, turned into a share band per
+    underlying: (target_pct ± tolerance_pct)/100 · net_liq / spot. It is the one
+    per-name limit (the concentration limit was retired, same measure);
   - per-underlying terms built from a sparse group-membership matrix.
 
 Status boundary: request interpretation (field access + float conversions)
@@ -91,12 +94,11 @@ from wire_format import (
     F_DAYS_TO_EXPIRY,
     F_GAMMA_PER_UNIT,
     F_SPOT,
-    F_DELTA_TARGET,
-    F_TOLERANCE,
+    F_DELTA_TARGET_PCT,
+    F_DELTA_TOLERANCE_PCT,
     F_MAX_POSITIONS,
     F_TRADEABLE,
     F_BP_LIMIT_PCT,
-    F_CONCENTRATION_LIMIT_PCT,
     F_DELTA_CEILING_THRESHOLD,
     F_LAMBDA_DELTA_CEILING,
     F_LAMBDA_GAMMA,
@@ -143,10 +145,10 @@ from wire_format import (
     BC_UNDERLYING,
     BC_LIMIT,
     BC_VALUE_AT_SOLUTION,
-    BC_TARGET,
-    BC_TOLERANCE,
+    BC_TARGET_PCT,
+    BC_TOLERANCE_PCT,
+    BC_VALUE_PCT,
     BCT_BP_LIMIT,
-    BCT_CONCENTRATION_LIMIT,
     BCT_DELTA_TARGET,
     DIAGNOSTIC_FIELDS,
 )
@@ -376,6 +378,8 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     delta_pen = np.maximum(0.0, np.abs(delta / DELTA_RAW_DIVISOR) - thr)
 
     net_liq = float(capital[F_NET_LIQ])
+    if not net_liq > 0:
+        raise ValueError(f"net_liq must be positive (the delta band is a % of it), got {net_liq!r}")
     pu_map = {rec[F_UNDERLYING]: rec for rec in per_underlying}
     pu = {}
     tradeable = {}
@@ -383,10 +387,14 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         rec = pu_map[u]  # missing per_underlying record for a traded underlying → KeyError (malformed)
         pu[u] = (
             float(rec[F_SPOT]),
-            float(rec[F_DELTA_TARGET]),
-            float(rec[F_TOLERANCE]),
+            float(rec[F_DELTA_TARGET_PCT]),
+            float(rec[F_DELTA_TOLERANCE_PCT]),
             int(rec[F_MAX_POSITIONS]),
         )
+        if not pu[u][0] > 0:
+            raise ValueError(f"{u}: spot must be positive, got {pu[u][0]!r}")
+        if not pu[u][2] > 0:
+            raise ValueError(f"{u}: delta_tolerance_pct must be positive, got {pu[u][2]!r}")
         tradeable[u] = bool(rec[F_TRADEABLE])
 
     # Equity legs per underlying: the stock that repairs a rounding-broken band.
@@ -430,14 +438,14 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         "lam_gamma": float(policy[F_LAMBDA_GAMMA]),
         "min_improvement": float(policy[F_MIN_IMPROVEMENT]),
         "bp_limit": float(policy[F_BP_LIMIT_PCT]) / 100.0 * net_liq,
-        "conc_limit": float(policy[F_CONCENTRATION_LIMIT_PCT]) / 100.0 * net_liq,
+        "net_liq": net_liq,
         "pu": pu,
         # Vectorized per-underlying structure (§3.4)
         "G_delta": _group_matrix(rows, delta, n_u),
         "G_gamma_slices": _gamma_slice_matrix(rows, h, gamma, n_u),
-        "u_spot": np.array([pu[u][0] for u in und_names]),
-        "u_lo": np.array([pu[u][1] - pu[u][2] for u in und_names]),
-        "u_hi": np.array([pu[u][1] + pu[u][2] for u in und_names]),
+        # Share band from the dollar band: (target_pct ∓ tolerance_pct)/100 · net_liq / spot.
+        "u_lo": np.array([(pu[u][1] - pu[u][2]) / 100.0 * net_liq / pu[u][0] for u in und_names]),
+        "u_hi": np.array([(pu[u][1] + pu[u][2]) / 100.0 * net_liq / pu[u][0] for u in und_names]),
     }
 
 
@@ -466,7 +474,7 @@ def _build_and_solve(n: int, bundle: dict):
     Maximize  (theta∘h)·q − λ_spread·exec·|q − current| − λ_delta·delta_pen·q
               − λ_gamma·‖M_slices · q‖²
     s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
-              per underlying: |spot·(G_δ q)| ≤ conc_limit,  lo ≤ G_δ q ≤ hi.
+              per underlying: lo ≤ G_δ q ≤ hi (the dollar band in shares).
     """
     target = cp.Variable(n, nonneg=True)  # lower bound 0
     current = bundle["current_qty"]
@@ -480,9 +488,8 @@ def _build_and_solve(n: int, bundle: dict):
     # Buying-power limit
     constraints.append(bundle["margin"] @ target <= bundle["bp_limit"])
 
-    # Per-underlying concentration and delta-target constraints (vectorized)
+    # Per-underlying delta band (vectorized), in shares
     net_delta = bundle["G_delta"] @ target  # share-equivalent, one entry per underlying
-    constraints.append(cp.abs(cp.multiply(bundle["u_spot"], net_delta)) <= bundle["conc_limit"])
     constraints.append(net_delta >= bundle["u_lo"])
     constraints.append(net_delta <= bundle["u_hi"])
 
@@ -573,8 +580,8 @@ def _repair_band_with_stock(q: list, bundle: dict) -> tuple:
 
 
 def _breached_constraints(bundle: dict, q) -> list:
-    """Hard constraints (BP, concentration, delta band) that book q breaks, as
-    binding_constraints records with value_at_solution."""
+    """Hard constraints (BP, delta band) that book q breaks, as binding_constraints
+    records: BP with value_at_solution, the band with value_pct (% of net liq)."""
     q = np.asarray(q, dtype=float)
     eps = CONSTRAINT_CHECK_EPS
     out = []
@@ -583,14 +590,11 @@ def _breached_constraints(bundle: dict, q) -> list:
         out.append({BC_TYPE: BCT_BP_LIMIT, BC_LIMIT: bundle["bp_limit"], BC_VALUE_AT_SOLUTION: margin_used})
     net_delta = bundle["G_delta"] @ q
     for k, u in enumerate(bundle["und_names"]):
-        dollar_delta = float(bundle["u_spot"][k] * net_delta[k])
-        if abs(dollar_delta) > bundle["conc_limit"] + eps:
-            out.append({BC_TYPE: BCT_CONCENTRATION_LIMIT, BC_UNDERLYING: u,
-                        BC_LIMIT: bundle["conc_limit"], BC_VALUE_AT_SOLUTION: dollar_delta})
         if not (bundle["u_lo"][k] - eps <= net_delta[k] <= bundle["u_hi"][k] + eps):
-            _spot, dt, tol, _maxpos = bundle["pu"][u]
-            out.append({BC_TYPE: BCT_DELTA_TARGET, BC_UNDERLYING: u, BC_TARGET: dt,
-                        BC_TOLERANCE: tol, BC_VALUE_AT_SOLUTION: float(net_delta[k])})
+            spot, dt, tol, _maxpos = bundle["pu"][u]
+            value_pct = float(spot * net_delta[k] / bundle["net_liq"] * 100.0)
+            out.append({BC_TYPE: BCT_DELTA_TARGET, BC_UNDERLYING: u, BC_TARGET_PCT: dt,
+                        BC_TOLERANCE_PCT: tol, BC_VALUE_PCT: value_pct})
     return out
 
 
@@ -648,7 +652,7 @@ def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: d
 
 def _book_meets_constraints(bundle: dict, q) -> bool:
     """True when book q satisfies every hard constraint: closeable_only bounds,
-    BP, per-underlying concentration and the delta band. Used on the CURRENT book
+    BP and the delta band. Used on the CURRENT book
     to decide whether hold is allowed (never hold a book that breaks one)."""
     q = np.asarray(q, dtype=float)
     closeable = bundle["closeable"]
@@ -692,7 +696,8 @@ def _build_solved_response(meta, status, target_value, problem, dvs, bundle, gro
     breaches = _breached_constraints(bundle, optimal_q)
     if breaches:
         detail = "; ".join(
-            f"{b.get(BC_UNDERLYING, 'portfolio')} {b[BC_TYPE]} (value {b[BC_VALUE_AT_SOLUTION]:.4f})"
+            f"{b.get(BC_UNDERLYING, 'portfolio')} {b[BC_TYPE]} (value "
+            + (f"{b[BC_VALUE_PCT]:.4f}% of net liq" if BC_VALUE_PCT in b else f"{b[BC_VALUE_AT_SOLUTION]:.4f}") + ")"
             for b in breaches)
         log.warning("[Solver] post-rounding breach: %s", detail)
         return {
@@ -786,8 +791,8 @@ def _build_score(contribs: dict, optimal_obj: float, current_obj: float) -> dict
 
 
 def _request_constraints(bundle: dict, groups: dict) -> list:
-    """The request's hard constraints as binding_constraints records, with
-    value_at_solution null (there is no solution for an infeasible problem). We
+    """The request's hard constraints as binding_constraints records, with the
+    value (value_at_solution / value_pct) null (there is no solution for an infeasible problem). We
     list all constraints in play — without IIS extraction we cannot single out
     the conflicting subset."""
     records = [{
@@ -796,19 +801,13 @@ def _request_constraints(bundle: dict, groups: dict) -> list:
         BC_VALUE_AT_SOLUTION: None,
     }]
     for u in groups:
-        spot, dt, tol, _maxpos = bundle["pu"][u]
-        records.append({
-            BC_TYPE: BCT_CONCENTRATION_LIMIT,
-            BC_UNDERLYING: u,
-            BC_LIMIT: bundle["conc_limit"],
-            BC_VALUE_AT_SOLUTION: None,
-        })
+        _spot, dt, tol, _maxpos = bundle["pu"][u]
         records.append({
             BC_TYPE: BCT_DELTA_TARGET,
             BC_UNDERLYING: u,
-            BC_TARGET: dt,
-            BC_TOLERANCE: tol,
-            BC_VALUE_AT_SOLUTION: None,
+            BC_TARGET_PCT: dt,
+            BC_TOLERANCE_PCT: tol,
+            BC_VALUE_PCT: None,
         })
     return records
 
