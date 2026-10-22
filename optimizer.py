@@ -222,6 +222,23 @@ ROUTER_PORT = 6051
 # ─────────────────────────────────────────────────────────────
 
 
+_CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "captured_requests")
+
+
+def _capture_request(payload: dict, request_id: str) -> None:
+    """Persist the exact incoming request so a run can be replayed offline through
+    pipeline_trace (tools/replay_optimizer_run.py). One JSON per request; the directory is
+    gitignored. Best-effort — a capture failure is logged and never affects the solve."""
+    try:
+        os.makedirs(_CAPTURE_DIR, exist_ok=True)
+        path = os.path.join(_CAPTURE_DIR, f"{request_id}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        log.info("[Solver] captured request to %s", path)
+    except Exception as e:
+        log.warning("[Solver] request capture failed (%s): %s", request_id, e)
+
+
 def handle_optimize(payload: dict) -> dict:
     """Handle an optimize request. Returns the data portion of the response."""
     start = time.monotonic()
@@ -257,6 +274,7 @@ def handle_optimize(payload: dict) -> dict:
     log.info("[Solver] request_id=%s, %d decision_variables, solver=%s",
              request_id, len(dvs), SOLVER_NAME)
     log.debug("[Solver] Full request: %s", json.dumps(payload))
+    _capture_request(payload, request_id)
 
     # Interpret inputs OUTSIDE the internal_error catch: missing fields (KeyError)
     # and ill-typed fields (ValueError) propagate to the library, never becoming
@@ -661,6 +679,65 @@ def _book_meets_constraints(bundle: dict, q) -> bool:
     return not _breached_constraints(bundle, q)
 
 
+def _book_margin(bundle: dict, q) -> float:
+    """Buying power the book q consumes: margin_per_unit · q, the quantity the BP
+    constraint and the re-check both use."""
+    return float(bundle["margin"] @ np.asarray(q, dtype=float))
+
+
+def _post_solve_pipeline(target_value, bundle: dict, groups: dict) -> dict:
+    """The deterministic post-solve sequence as named, inspectable stages, so the real
+    response path and the diagnostics (pipeline_trace) run the identical steps with no
+    drift. Keys, in order: solve, netting, rounding, cap, repair. 'solve' and 'netting'
+    carry the continuous book; the recommended integer book is 'rounding' onward, and
+    'repair' is optimal_q. Insertion order is preserved (dict, py3.7+)."""
+    n = len(bundle["margin"])
+    cont = [0.0] * n if target_value is None else list(np.maximum(np.asarray(target_value, dtype=float), 0.0))
+    netted = _net_pairs(target_value, bundle)
+    rounded = _extract_targets(netted, bundle)
+    ranking_contribs = _compute_contributions(bundle, rounded)
+    carded = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
+    repaired, _repaired_names = _repair_band_with_stock(carded, bundle)
+    return {
+        "solve": cont,
+        "netting": cont if netted is None else list(netted),
+        "rounding": rounded,
+        "cap": carded,
+        "repair": repaired,
+    }
+
+
+def pipeline_trace(payload: dict) -> dict:
+    """Replay a request through the solve and the post-solve pipeline and report, after
+    each step, the BP consumed and the per-underlying net delta (shares and % of net liq).
+    Makes visible which step adds margin or pushes a name outside its band. For
+    tools/replay_optimizer_run.py and regression tests — no wire I/O."""
+    dvs = payload[F_DECISION_VARIABLES]
+    groups = _group_by_underlying(dvs)
+    bundle = _extract_inputs(dvs, payload[F_PER_UNDERLYING], payload[F_POLICY],
+                             payload[F_CAPITAL], groups, payload[F_HORIZON_DAYS])
+    target, problem, _ = _build_and_solve(len(dvs), bundle)
+    stages = _post_solve_pipeline(target.value, bundle, groups)
+    und = bundle["und_names"]
+    steps = []
+    for name, q in stages.items():
+        nd = bundle["G_delta"] @ np.asarray(q, dtype=float)
+        steps.append({
+            "step": name,
+            "bp_used": _book_margin(bundle, q),
+            "net_delta_shares": {u: float(nd[k]) for k, u in enumerate(und)},
+            "net_delta_pct": {u: float(bundle["pu"][u][0] * nd[k] / bundle["net_liq"] * 100.0)
+                              for k, u in enumerate(und)},
+        })
+    return {
+        "status": _map_status(problem.status),
+        "bp_limit": bundle["bp_limit"],
+        "net_liq": bundle["net_liq"],
+        "bands_pct": {u: {"target": bundle["pu"][u][1], "tol": bundle["pu"][u][2]} for u in und},
+        "steps": steps,
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # Response construction
 # ─────────────────────────────────────────────────────────────
@@ -688,11 +765,9 @@ def _build_solved_response(meta, status, target_value, problem, dvs, bundle, gro
         }
 
     # Net long/short legs → round (step 8) → cardinality (step 9) → stock repair →
-    # re-check (step 10).
-    rounded = _extract_targets(_net_pairs(target_value, bundle), bundle)
-    ranking_contribs = _compute_contributions(bundle, rounded)
-    carded = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
-    optimal_q, _repaired = _repair_band_with_stock(carded, bundle)
+    # re-check (step 10). One inspectable pipeline, shared with pipeline_trace.
+    stages = _post_solve_pipeline(target_value, bundle, groups)
+    optimal_q = stages["repair"]
     breaches = _breached_constraints(bundle, optimal_q)
     if breaches:
         detail = "; ".join(

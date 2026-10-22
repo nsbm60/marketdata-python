@@ -38,4 +38,5 @@ __pycache__/
 # Local run artifacts
 messages.jsonl
 out.jsonl
+tools/captured_requests/
 *.html
