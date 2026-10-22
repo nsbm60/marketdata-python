@@ -589,12 +589,44 @@ def _repair_band_with_stock(q: list, bundle: dict) -> tuple:
             shift = -int(np.ceil(net_delta[k] - bundle["u_hi"][k] - eps))   # sell just enough
         else:
             shift = int(np.ceil(bundle["u_lo"][k] - net_delta[k] - eps))    # buy just enough
-        shares = (q[li] - q[si]) + shift
+        s0 = q[li] - q[si]
+        s1 = s0 + shift
+        # The repair consumes buying power like any position. The continuous solve respected
+        # bp_limit and rounding/cap only lowered margin, so the book is within BP here — never
+        # let the stock move push it back over (it used to: a cap-dropped hedge sent the band
+        # far out and the repair shorted whatever closed it, ignoring BP). Cap the move at the
+        # BP the rest of the book leaves free; the re-check reports any residual band breach.
+        m_other = _book_margin(bundle, q) - (bundle["margin"][li] * q[li] + bundle["margin"][si] * q[si])
+        budget = bundle["bp_limit"] - m_other
+        shares = _max_stock_within_bp(s0, s1, bundle["margin"][li], bundle["margin"][si], budget)
         q[li], q[si] = max(shares, 0), max(-shares, 0)
         repaired.append(u)
-        log.info("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f]; stock moved %+d to %+d shares",
-                 u, net_delta[k], bundle["u_lo"][k], bundle["u_hi"][k], shift, shares)
+        if shares != s1:
+            log.info("[Solver] stock repair BP-capped: %s net delta %.4f outside [%.4f, %.4f]; "
+                     "wanted %+d shares, moved to %+d within remaining BP %.2f (residual band breach left to re-check)",
+                     u, net_delta[k], bundle["u_lo"][k], bundle["u_hi"][k], s1, shares, budget)
+        else:
+            log.info("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f]; stock moved %+d to %+d shares",
+                     u, net_delta[k], bundle["u_lo"][k], bundle["u_hi"][k], shift, shares)
     return q, repaired
+
+
+def _max_stock_within_bp(s0: int, s1: int, m_long: float, m_short: float, budget: float) -> int:
+    """The whole-share net stock position nearest the band-repair target s1, travelling from
+    the pre-repair position s0, whose stock margin fits `budget`. Stock margin is m_long·s for
+    a net-long position and m_short·|s| for a net-short one. The book before this repair is
+    within BP, so s0 itself always fits; move toward s1 only as far as the budget allows."""
+    def stock_margin(s: int) -> float:
+        return m_long * s if s >= 0 else m_short * (-s)
+    if s1 == s0:
+        return s0
+    step = 1 if s1 > s0 else -1
+    s = s1
+    while s != s0:
+        if stock_margin(s) <= budget + CONSTRAINT_CHECK_EPS:
+            return s
+        s -= step
+    return s0
 
 
 def _breached_constraints(bundle: dict, q) -> list:

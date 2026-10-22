@@ -1,0 +1,97 @@
+{
+  "op": "optimize",
+  "schema_version": 1,
+  "request_id": "repair-bp-1",
+  "policy_version": 3,
+  "timestamp": "2026-05-12T14:22:37Z",
+  "horizon_days": 5.0,
+  "verbose": true,
+  "decision_variables": [
+    {
+      "id": "WWW260515P00100000-short",
+      "underlying": "WWW",
+      "type": "option",
+      "direction": "short",
+      "current_quantity": 10,
+      "closeable_only": true,
+      "delta_per_unit": 45.0,
+      "theta_per_unit": 50.0,
+      "gamma_per_unit": 0.0,
+      "margin_per_unit": 550.0,
+      "premium_per_unit": 150.0,
+      "exec_cost_per_unit": 0.0,
+      "iv": 0.3,
+      "days_to_expiry": 3.235,
+      "strike": 100.0,
+      "expiry": "2026-05-15"
+    },
+    {
+      "id": "WWW260515C00100000-short",
+      "underlying": "WWW",
+      "type": "option",
+      "direction": "short",
+      "current_quantity": 10,
+      "closeable_only": true,
+      "delta_per_unit": -45.0,
+      "theta_per_unit": 50.0,
+      "gamma_per_unit": 0.0,
+      "margin_per_unit": 550.0,
+      "premium_per_unit": 150.0,
+      "exec_cost_per_unit": 0.0,
+      "iv": 0.3,
+      "days_to_expiry": 3.235,
+      "strike": 100.0,
+      "expiry": "2026-05-15"
+    },
+    {
+      "id": "WWW-equity-long",
+      "underlying": "WWW",
+      "type": "equity",
+      "direction": "long",
+      "current_quantity": 0,
+      "delta_per_unit": 1.0,
+      "theta_per_unit": 0.0,
+      "gamma_per_unit": 0.0,
+      "margin_per_unit": 50.0,
+      "premium_per_unit": 100.0,
+      "exec_cost_per_unit": 0.0
+    },
+    {
+      "id": "WWW-equity-short",
+      "underlying": "WWW",
+      "type": "equity",
+      "direction": "short",
+      "current_quantity": 0,
+      "delta_per_unit": -1.0,
+      "theta_per_unit": 0.0,
+      "gamma_per_unit": 0.0,
+      "margin_per_unit": 50.0,
+      "premium_per_unit": -100.0,
+      "exec_cost_per_unit": 0.0
+    }
+  ],
+  "per_underlying": [
+    {
+      "underlying": "WWW",
+      "spot": 100.0,
+      "delta_target_pct": 0.0,
+      "delta_tolerance_pct": 5.0,
+      "max_positions": 1,
+      "tradeable": true
+    }
+  ],
+  "policy": {
+    "bp_limit_pct": 11,
+    "max_positions_per_underlying": 1,
+    "delta_ceiling_threshold": 0.30,
+    "lambda_delta_ceiling": 0.0,
+    "lambda_gamma": 0.0,
+    "lambda_spread": 1.0,
+    "min_improvement": 0.0
+  },
+  "capital": {
+    "net_liq": 100000.0,
+    "current_bp_usage": 0.0,
+    "current_margin": 0.0
+  }
+}

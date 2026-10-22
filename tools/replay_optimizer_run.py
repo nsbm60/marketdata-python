@@ -40,7 +40,7 @@ def main() -> None:
         for u in unds:
             cells.append(f"{s['net_delta_shares'][u]:+8.1f} /{s['net_delta_pct'][u]:+5.1f}%")
         mark = ""
-        if prev_bp is not None and bp - prev_bp > 1e-6:
+        if prev_bp is not None and bp - prev_bp > 1e-2:
             mark += f"   <== +{bp - prev_bp:.2f} BP"
         if bp > tr["bp_limit"] + 1e-6:
             mark += "   OVER"
