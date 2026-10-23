@@ -1,0 +1,59 @@
+{
+  "snapshot_name": "hand_built_cap_drops_hedge",
+  "source": "hand_built",
+  "captured_at": null,
+  "notes": "The 87e615b0 mechanism in miniature: a held, balanced short strangle on ZED (both legs close-only) with max_positions=1, so the per-underlying cap must drop one hedge leg. The continuous solve holds both legs at the BP limit with net delta 0. Proves equity is excluded from the cap, the re-solve freezes the dropped held leg and re-hedges, and the stock repair stays within BP.",
+  "op": "optimize",
+  "schema_version": 1,
+  "request_id": "hand-built-cap-drops-hedge",
+  "policy_version": 3,
+  "timestamp": "2026-10-22T00:00:00Z",
+  "horizon_days": 5.0,
+  "verbose": true,
+  "decision_variables": [
+    {
+      "id": "ZED261120P00100000-short", "underlying": "ZED", "type": "option", "direction": "short",
+      "current_quantity": 10, "closeable_only": true,
+      "delta_per_unit": 45.0, "theta_per_unit": 50.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 550.0, "premium_per_unit": 150.0, "exec_cost_per_unit": 1.0,
+      "iv": 0.30, "days_to_expiry": 29.0, "strike": 100.0, "expiry": "2026-11-20"
+    },
+    {
+      "id": "ZED261120C00100000-short", "underlying": "ZED", "type": "option", "direction": "short",
+      "current_quantity": 10, "closeable_only": true,
+      "delta_per_unit": -45.0, "theta_per_unit": 50.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 550.0, "premium_per_unit": 150.0, "exec_cost_per_unit": 1.0,
+      "iv": 0.30, "days_to_expiry": 29.0, "strike": 100.0, "expiry": "2026-11-20"
+    },
+    {
+      "id": "ZED-equity-long", "underlying": "ZED", "type": "equity", "direction": "long",
+      "current_quantity": 0, "delta_per_unit": 1.0, "theta_per_unit": 0.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 50.0, "premium_per_unit": 100.0, "exec_cost_per_unit": 0.0
+    },
+    {
+      "id": "ZED-equity-short", "underlying": "ZED", "type": "equity", "direction": "short",
+      "current_quantity": 0, "delta_per_unit": -1.0, "theta_per_unit": 0.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 50.0, "premium_per_unit": -100.0, "exec_cost_per_unit": 0.0
+    }
+  ],
+  "per_underlying": [
+    {
+      "underlying": "ZED", "spot": 100.0, "delta_target_pct": 0.0, "delta_tolerance_pct": 5.0,
+      "max_positions": 1, "tradeable": true
+    }
+  ],
+  "policy": {
+    "bp_limit_pct": 11,
+    "max_positions_per_underlying": 1,
+    "delta_ceiling_threshold": 0.30,
+    "lambda_delta_ceiling": 0.0,
+    "lambda_gamma": 0.0,
+    "lambda_spread": 1.0,
+    "min_improvement": 0.0
+  },
+  "capital": {
+    "net_liq": 100000.0,
+    "current_bp_usage": 11000.0,
+    "current_margin": 11000.0
+  }
+}
