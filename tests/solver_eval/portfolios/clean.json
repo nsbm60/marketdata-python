@@ -1,0 +1,13 @@
+{
+  "name": "clean",
+  "tests": "A hedged book inside every limit: short ~0.20-delta strangles on NVDA and MU, each hedged to 0% dollar-delta with stock. Does the solver hold it?",
+  "net_liq": "snapshot",
+  "positions": [
+    { "underlying": "NVDA", "right": "C", "expiry": { "dte": 30 }, "strike": { "delta": 0.20 }, "qty": -1 },
+    { "underlying": "NVDA", "right": "P", "expiry": { "dte": 30 }, "strike": { "delta": 0.20 }, "qty": -1 },
+    { "underlying": "NVDA", "shares": { "hedge_to_pct": 0 } },
+    { "underlying": "MU", "right": "C", "expiry": { "dte": 30 }, "strike": { "delta": 0.20 }, "qty": -1 },
+    { "underlying": "MU", "right": "P", "expiry": { "dte": 30 }, "strike": { "delta": 0.20 }, "qty": -1 },
+    { "underlying": "MU", "shares": { "hedge_to_pct": 0 } }
+  ]
+}
