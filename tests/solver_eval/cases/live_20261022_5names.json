@@ -1,0 +1,9 @@
+{
+  "name": "live_20261022_5names",
+  "tests": "The promoted live capture solves feasibly on its own book: a real 5-name, 3520-variable market.",
+  "market": "live_20261022_5names",
+  "portfolio": "snapshot",
+  "policy": {},
+  "perturb": null,
+  "expect": { "status_not": ["infeasible"], "bp_within_limit": true, "bands_within": true }
+}

@@ -39,4 +39,5 @@ __pycache__/
 messages.jsonl
 out.jsonl
 tools/captured_requests/
+tests/solver_eval/results/
 *.html
