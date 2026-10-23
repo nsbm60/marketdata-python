@@ -378,6 +378,7 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     current_qty = np.empty(n)
     h = np.empty(n)
     closeable = np.zeros(n, dtype=bool)
+    is_equity = np.zeros(n, dtype=bool)
     und = []
     for i, dv in enumerate(dvs):
         # Touch required identity fields (presence validation; echoed later).
@@ -391,6 +392,7 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         current_qty[i] = float(dv[F_CURRENT_QUANTITY])
         h[i] = _horizon(dv, horizon)
         closeable[i] = bool(dv.get(F_CLOSEABLE_ONLY))
+        is_equity[i] = dv[F_TYPE] == TYPE_EQUITY
 
     thr = float(policy[F_DELTA_CEILING_THRESHOLD])
     delta_pen = np.maximum(0.0, np.abs(delta / DELTA_RAW_DIVISOR) - thr)
@@ -448,7 +450,7 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     return {
         "theta": theta, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
         "margin": margin, "current_qty": current_qty, "delta_pen": delta_pen,
-        "h": h, "closeable": closeable, "und": und,
+        "h": h, "closeable": closeable, "is_equity": is_equity, "und": und,
         "und_names": und_names, "tradeable": tradeable, "equity_legs": equity_legs,
         "pairs": pairs,
         "lam_spread": float(policy[F_LAMBDA_SPREAD]),
@@ -485,7 +487,7 @@ def _map_status(cvxpy_status: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 
-def _build_and_solve(n: int, bundle: dict):
+def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
     """Build the QP from the pre-extracted bundle and solve. No field access or
     float conversion happens here — all of that is done in _extract_inputs.
 
@@ -493,10 +495,19 @@ def _build_and_solve(n: int, bundle: dict):
               − λ_gamma·‖M_slices · q‖²
     s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
               per underlying: lo ≤ G_δ q ≤ hi (the dollar band in shares).
+
+    `fixed` (index → value) pins those variables with an equality constraint — the
+    re-solve after cardinality fixes the dropped contracts so it, not the stock repair,
+    sets the hedge, BP and band around the kept book.
     """
     target = cp.Variable(n, nonneg=True)  # lower bound 0
     current = bundle["current_qty"]
     constraints = []
+
+    if fixed:
+        fidx = np.array(sorted(fixed), dtype=int)
+        fval = np.array([fixed[int(i)] for i in fidx], dtype=float)
+        constraints.append(target[fidx] == fval)
 
     # Upper bound on closeable_only records: target_i <= current_quantity_i
     closeable_idx = np.flatnonzero(bundle["closeable"])
@@ -682,22 +693,28 @@ def _compute_contributions(bundle: dict, q) -> dict:
     }
 
 
-def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: dict) -> list:
-    """Keep the top max_positions nonzero positions per underlying, zero the rest.
-    Ranking uses contributions against the full pre-cardinality composition."""
+def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: dict) -> tuple:
+    """Keep the top max_positions nonzero OPTION positions per underlying, zero the rest.
+    Ranking uses contributions against the full pre-cardinality composition. Equity is the
+    hedge, not a position: it is excluded from the count (the cap is options-only per the
+    spec). Returns (q, dropped) — dropped is the list of indices the cap zeroed, which the
+    re-solve then fixes."""
     q = list(q)
     totals = ranking_contribs[OC_TOTAL]
+    is_equity = bundle["is_equity"]
+    dropped = []
     for u, idx in groups.items():
         max_pos = bundle["pu"][u][3]
-        nonzero = [i for i in idx if q[i] > 0]
+        nonzero = [i for i in idx if q[i] > 0 and not is_equity[i]]
         if len(nonzero) <= max_pos:
             continue
         nonzero.sort(key=lambda i: totals[i], reverse=True)
         for i in nonzero[max_pos:]:
             q[i] = 0
-        log.info("[Solver] cardinality: underlying %s had %d positions, kept top %d",
+            dropped.append(i)
+        log.info("[Solver] cardinality: underlying %s had %d option positions, kept top %d",
                  u, len(nonzero), max_pos)
-    return q
+    return q, dropped
 
 
 def _book_meets_constraints(bundle: dict, q) -> bool:
@@ -720,23 +737,51 @@ def _book_margin(bundle: dict, q) -> float:
 def _post_solve_pipeline(target_value, bundle: dict, groups: dict) -> dict:
     """The deterministic post-solve sequence as named, inspectable stages, so the real
     response path and the diagnostics (pipeline_trace) run the identical steps with no
-    drift. Keys, in order: solve, netting, rounding, cap, repair. 'solve' and 'netting'
-    carry the continuous book; the recommended integer book is 'rounding' onward, and
-    'repair' is optimal_q. Insertion order is preserved (dict, py3.7+)."""
+    drift. Insertion order (dict, py3.7+) is the step order; the final stage is optimal_q.
+
+    Stages: solve, netting, rounding, cap, then — when the cap dropped contracts — resolve,
+    resolve_round, and finally repair. The re-solve is the stability fix: the cardinality
+    cap is a discontinuous step (a dropped hedge swings net delta), and leaving the band to
+    the stock repair let a tiny input change flip the book between feasible and over-BP.
+    Instead, after the cap we re-solve the continuous problem with the dropped contracts
+    fixed — at 0, or at current when they are held and close-only (we freeze a holding, we
+    do not force-close it). The re-solve, respecting BP and the band, sets the hedge; the
+    stock repair is then left with only rounding error."""
     n = len(bundle["margin"])
     cont = [0.0] * n if target_value is None else list(np.maximum(np.asarray(target_value, dtype=float), 0.0))
     netted = _net_pairs(target_value, bundle)
     rounded = _extract_targets(netted, bundle)
     ranking_contribs = _compute_contributions(bundle, rounded)
-    carded = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
-    repaired, _repaired_names = _repair_band_with_stock(carded, bundle)
-    return {
+    carded, dropped = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
+
+    stages = {
         "solve": cont,
         "netting": cont if netted is None else list(netted),
         "rounding": rounded,
         "cap": carded,
-        "repair": repaired,
     }
+
+    base = carded
+    if dropped:
+        fixed = {}
+        for i in dropped:
+            held_close = bundle["current_qty"][i] > 0 and bundle["closeable"][i]
+            fixed[i] = float(bundle["current_qty"][i]) if held_close else 0.0
+        target2, _problem2, _ = _build_and_solve(n, bundle, fixed=fixed)
+        if target2.value is not None:
+            netted2 = _net_pairs(target2.value, bundle)
+            resolve_round = _extract_targets(netted2, bundle)
+            stages["resolve"] = list(np.maximum(np.asarray(target2.value, dtype=float), 0.0))
+            stages["resolve_round"] = resolve_round
+            base = resolve_round
+        else:
+            # The frozen held book is itself infeasible (e.g. already over BP): keep the
+            # capped book; the BP-capped repair and the re-check report what cannot be fixed.
+            log.info("[Solver] re-solve after cardinality infeasible; keeping capped book")
+
+    repaired, _repaired_names = _repair_band_with_stock(base, bundle)
+    stages["repair"] = repaired
+    return stages
 
 
 def pipeline_trace(payload: dict) -> dict:

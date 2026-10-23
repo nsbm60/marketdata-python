@@ -1,0 +1,55 @@
+{
+  "op": "optimize",
+  "schema_version": 1,
+  "request_id": "perturb-1",
+  "policy_version": 3,
+  "timestamp": "2026-05-12T14:22:37Z",
+  "horizon_days": 5.0,
+  "verbose": true,
+  "decision_variables": [
+    {
+      "id": "PERT260515P00100000-short", "underlying": "PERT", "type": "option", "direction": "short",
+      "current_quantity": 0,
+      "delta_per_unit": 40.0, "theta_per_unit": 50.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 2000.0, "premium_per_unit": 150.0, "exec_cost_per_unit": 1.0,
+      "iv": 0.32, "days_to_expiry": 3.235, "strike": 100.0, "expiry": "2026-05-15"
+    },
+    {
+      "id": "PERT260515C00100000-short", "underlying": "PERT", "type": "option", "direction": "short",
+      "current_quantity": 0,
+      "delta_per_unit": -40.0, "theta_per_unit": 48.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 2000.0, "premium_per_unit": 150.0, "exec_cost_per_unit": 1.0,
+      "iv": 0.32, "days_to_expiry": 3.235, "strike": 100.0, "expiry": "2026-05-15"
+    },
+    {
+      "id": "PERT-equity-long", "underlying": "PERT", "type": "equity", "direction": "long",
+      "current_quantity": 0, "delta_per_unit": 1.0, "theta_per_unit": 0.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 40.0, "premium_per_unit": 100.0, "exec_cost_per_unit": 0.0
+    },
+    {
+      "id": "PERT-equity-short", "underlying": "PERT", "type": "equity", "direction": "short",
+      "current_quantity": 0, "delta_per_unit": -1.0, "theta_per_unit": 0.0, "gamma_per_unit": 0.0,
+      "margin_per_unit": 40.0, "premium_per_unit": -100.0, "exec_cost_per_unit": 0.0
+    }
+  ],
+  "per_underlying": [
+    {
+      "underlying": "PERT", "spot": 100.0, "delta_target_pct": 0.0, "delta_tolerance_pct": 8.0,
+      "max_positions": 1, "tradeable": true
+    }
+  ],
+  "policy": {
+    "bp_limit_pct": 40,
+    "max_positions_per_underlying": 1,
+    "delta_ceiling_threshold": 0.30,
+    "lambda_delta_ceiling": 0.0,
+    "lambda_gamma": 0.0,
+    "lambda_spread": 1.0,
+    "min_improvement": 0.0
+  },
+  "capital": {
+    "net_liq": 100000.0,
+    "current_bp_usage": 0.0,
+    "current_margin": 0.0
+  }
+}

@@ -1,15 +1,17 @@
-"""Regression: the stock repair must respect bp_limit.
+"""The cardinality cap must not turn a hedged book into a BP breach.
 
 `solver_request_repair_bp.json` is a WWW strangle — short put (+45 delta) and short call
-(-45 delta), both held 10 — with max_positions_per_underlying = 1 and bp_limit = 11,000.
-The continuous optimum holds both legs at the BP limit with net delta 0. The cardinality
-cap drops one leg, throwing WWW net delta to +450 shares (+45% of net liq, far outside the
-±5% band). The stock repair hedges that back toward the band.
+(-45 delta), both held 10 and close-only — with max_positions_per_underlying = 1 and
+bp_limit = 11,000. The continuous optimum holds both legs at the BP limit with net delta 0.
+The cardinality cap keeps one leg and drops the other, throwing WWW net delta to +450 shares
+(+45% of net liq, far outside the ±5% band).
 
-Before the fix the repair shorted 400 shares (+20,000 margin → a 25,500 book, over the
-11,000 limit): a cap-dropped hedge, rebuilt in stock with no BP check. Now the repair moves
-only as many shares as the remaining BP allows (110, to 11,000) and the re-check reports the
-residual delta-band breach rather than a fabricated BP breach. This mirrors run 87e615b0.
+Before the fix the stock repair then shorted 400 shares to drag the band back — adding 20,000
+of margin with no BP check, a 25,500 book over the 11,000 limit (the run-87e615b0 mechanism).
+Now the cap drop triggers a re-solve with the dropped contract fixed: it is held and
+close-only, so it is frozen at its current quantity (we keep the holding, we do not
+force-close it), and the re-solve re-hedges within BP and the band. The book stays within
+bp_limit, the hedge is preserved, and the stock repair is left with only rounding error.
 """
 from __future__ import annotations
 
@@ -17,6 +19,8 @@ import copy
 import json
 from pathlib import Path
 import sys
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import optimizer  # noqa: E402
@@ -29,20 +33,40 @@ def _request() -> dict:
 
 
 def test_no_post_solve_step_exceeds_bp_limit() -> None:
-    """Every stage — solve, netting, rounding, cap, repair — stays within bp_limit.
-    The repair is the only step that can raise margin; this is what used to break."""
+    """Every stage — solve, netting, rounding, cap, resolve, repair — stays within bp_limit.
+    The cap and the stock repair are the steps that used to break it."""
     tr = optimizer.pipeline_trace(_request())
-    bp_limit = tr["bp_limit"]
     for step in tr["steps"]:
-        assert step["bp_used"] <= bp_limit + 1e-6, \
-            f"{step['step']} uses {step['bp_used']:.2f} > bp_limit {bp_limit:.2f}"
+        assert step["bp_used"] <= tr["bp_limit"] + 1e-6, \
+            f"{step['step']} uses {step['bp_used']:.2f} > bp_limit {tr['bp_limit']:.2f}"
 
 
-def test_repair_reports_residual_band_breach_not_a_bp_breach() -> None:
+def test_cardinality_drop_preserves_the_held_hedge_feasibly() -> None:
+    """The dropped leg is held and close-only: the re-solve freezes it at its current
+    quantity rather than closing it, so both legs remain and the book is feasible — not a
+    fabricated infeasibility, not a BP breach."""
     resp = optimizer.handle_optimize(copy.deepcopy(_request()))
-    assert resp["status"] == optimizer.STATUS_INFEASIBLE
-    types = {b["type"] for b in resp["binding_constraints"]}
-    assert optimizer.BCT_DELTA_TARGET in types, \
-        f"expected the residual delta-band breach, got {resp['binding_constraints']}"
-    assert optimizer.BCT_BP_LIMIT not in types, \
-        f"BP is respected now; it must not appear as a breach: {resp['binding_constraints']}"
+    assert resp["status"] == optimizer.STATUS_OPTIMAL, resp.get("error")
+    assert not resp["binding_constraints"], resp["binding_constraints"]
+
+    recs = {r["id"]: r for r in resp["recommendations"]}
+    req = _request()
+    held_close = [dv for dv in req["decision_variables"]
+                  if dv["type"] == "option" and dv.get("closeable_only") and dv["current_quantity"] > 0]
+    kept = [dv for dv in held_close if recs[dv["id"]]["optimal_quantity"] > 0]
+    assert len(kept) == len(held_close), \
+        "a held close-only hedge leg was closed by the cardinality cap instead of frozen"
+
+    # Within BP and inside the band, computed from the recommended book.
+    net_liq = req["capital"]["net_liq"]
+    bp_limit = req["policy"]["bp_limit_pct"] / 100.0 * net_liq
+    dvs = {dv["id"]: dv for dv in req["decision_variables"]}
+    used = sum(r["optimal_quantity"] * dvs[r["id"]]["margin_per_unit"] for r in resp["recommendations"])
+    assert used <= bp_limit + 1e-6, f"BP {used:.2f} > limit {bp_limit:.2f}"
+    net = {}
+    for r in resp["recommendations"]:
+        net[r["underlying"]] = net.get(r["underlying"], 0.0) + dvs[r["id"]]["delta_per_unit"] * r["optimal_quantity"]
+    for pu in req["per_underlying"]:
+        pct = pu["spot"] * net.get(pu["underlying"], 0.0) / net_liq * 100.0
+        assert abs(pct - pu["delta_target_pct"]) <= pu["delta_tolerance_pct"] + 1e-6, \
+            f"{pu['underlying']} net delta {pct:.4f}% outside band"
