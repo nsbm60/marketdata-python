@@ -3,7 +3,7 @@
   "request_id": "golden-run-1",
   "policy_version": 2,
   "request_timestamp": "2026-05-12T14:22:37Z",
-  "response_timestamp": "2026-10-22T00:38:23.957090+00:00",
+  "response_timestamp": "2026-10-24T23:09:39.201670+00:00",
   "status": "optimal",
   "action": "trade",
   "recommendations": [
@@ -16,11 +16,11 @@
       "target_quantity": 0,
       "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 0.0,
+        "total": -0.0,
         "theta": -0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "gamma": 0.0
+        "risk": -0.0
       },
       "strike": 215.0,
       "expiry": "2026-05-15",
@@ -33,14 +33,14 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 2,
-      "target_quantity": 1,
-      "optimal_quantity": 1,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 19.710006018518524,
-        "theta": 40.42867476851852,
-        "exec_cost": -5.0,
+        "total": -10.0,
+        "theta": 0.0,
+        "exec_cost": -10.0,
         "delta_ceiling": -0.0,
-        "gamma": -15.718668749999996
+        "risk": -0.0
       },
       "strike": 215.0,
       "expiry": "2026-05-15",
@@ -53,14 +53,14 @@
       "type": "option",
       "direction": "long",
       "current_quantity": 0,
-      "target_quantity": 0,
-      "optimal_quantity": 0,
+      "target_quantity": 52,
+      "optimal_quantity": 52,
       "objective_contribution": {
-        "total": 0.0,
-        "theta": -0.0,
-        "exec_cost": -0.0,
+        "total": -470.5487895098531,
+        "theta": -365.49861111111113,
+        "exec_cost": -104.0,
         "delta_ceiling": -0.0,
-        "gamma": 0.0
+        "risk": -1.0501783987420135
       },
       "strike": 120.0,
       "expiry": "2026-05-12",
@@ -80,7 +80,7 @@
         "theta": 0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "gamma": -0.0
+        "risk": 0.0
       },
       "strike": 120.0,
       "expiry": "2026-05-12",
@@ -100,7 +100,7 @@
         "theta": -0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "gamma": 0.0
+        "risk": 0.0
       },
       "strike": 125.0,
       "expiry": "2026-05-29",
@@ -113,14 +113,14 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 0,
-      "target_quantity": 6,
-      "optimal_quantity": 6,
+      "target_quantity": 59,
+      "optimal_quantity": 59,
       "objective_contribution": {
-        "total": 88.2,
-        "theta": 183.0,
-        "exec_cost": -30.0,
+        "total": 1503.315444326307,
+        "theta": 1799.5,
+        "exec_cost": -295.0,
         "delta_ceiling": -0.0,
-        "gamma": -64.8
+        "risk": -1.184555673693103
       },
       "strike": 125.0,
       "expiry": "2026-05-29",
@@ -140,7 +140,7 @@
         "theta": 0.0,
         "exec_cost": -1.0,
         "delta_ceiling": -0.0,
-        "gamma": -0.0
+        "risk": -0.0
       }
     },
     {
@@ -149,14 +149,14 @@
       "type": "equity",
       "direction": "short",
       "current_quantity": 0,
-      "target_quantity": 32,
-      "optimal_quantity": 32,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": -0.32,
+        "total": 0.0,
         "theta": 0.0,
-        "exec_cost": -0.32,
+        "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "gamma": -0.0
+        "risk": -0.0
       }
     },
     {
@@ -165,14 +165,14 @@
       "type": "equity",
       "direction": "long",
       "current_quantity": 0,
-      "target_quantity": 114,
-      "optimal_quantity": 114,
+      "target_quantity": 11,
+      "optimal_quantity": 11,
       "objective_contribution": {
-        "total": -2.2800000000000002,
+        "total": -0.22,
         "theta": 0.0,
-        "exec_cost": -2.2800000000000002,
+        "exec_cost": -0.22,
         "delta_ceiling": -0.0,
-        "gamma": -0.0
+        "risk": -0.0
       }
     },
     {
@@ -188,7 +188,7 @@
         "theta": 0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "gamma": -0.0
+        "risk": -0.0
       }
     },
     {
@@ -197,14 +197,14 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 1,
-      "target_quantity": 1,
-      "optimal_quantity": 1,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 18.015017476851853,
-        "theta": 25.874351851851852,
-        "exec_cost": -0.0,
+        "total": -5.000000000000004,
+        "theta": 0.0,
+        "exec_cost": -5.000000000000004,
         "delta_ceiling": -0.0,
-        "gamma": -7.859334374999998
+        "risk": -0.0
       },
       "strike": 200.0,
       "expiry": "2026-05-15",
@@ -217,14 +217,14 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 2,
-      "target_quantity": 1,
-      "optimal_quantity": 1,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 17.51068611111111,
-        "theta": 27.168069444444445,
-        "exec_cost": -5.000000000000004,
+        "total": -10.000000000000009,
+        "theta": 0.0,
+        "exec_cost": -10.000000000000009,
         "delta_ceiling": -0.0,
-        "gamma": -4.657383333333333
+        "risk": -0.0
       },
       "strike": 250.0,
       "expiry": "2026-05-15",
@@ -233,22 +233,22 @@
     }
   ],
   "score": {
-    "objective_value": 139.8357096064815,
-    "optimal_objective_value": 139.8357096064815,
-    "current_objective_value": 76.94385381944447,
+    "objective_value": 1006.5466548164538,
+    "optimal_objective_value": 1006.5466548164538,
+    "current_objective_value": 160.9136351787305,
     "components": {
-      "theta_total": 276.47109606481484,
-      "exec_cost_total": -43.60000000000001,
+      "theta_total": 1434.0013888888889,
+      "exec_cost_total": -425.22,
       "delta_ceiling_penalty": 0.0,
-      "gamma_penalty": -93.03538645833332
+      "risk_penalty": -2.2347340724351166
     }
   },
   "binding_constraints": [],
   "solver_meta": {
     "solver_name": "clarabel",
     "solver_status": "optimal",
-    "iterations": 12,
-    "wall_clock_seconds": 0.0147,
+    "iterations": 13,
+    "wall_clock_seconds": 0.0252,
     "problem_size": {
       "decision_variables": 12,
       "constraints": 9

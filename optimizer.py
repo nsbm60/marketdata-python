@@ -18,8 +18,9 @@ optimal/timeout (dual-based detection is a deferred future enhancement).
 RUN-LOOP AMENDMENTS (optimizer-run-loop-spec-draft.md §3, 2026-10-21):
   - execution cost on the trade: exec_cost_per_unit · |target − current|;
   - interim holding horizon h = min(days_to_expiry, horizon_days): theta × h,
-    delta ceiling unscaled, gamma variance over each pair's overlapping horizon
-    min(h_i, h_j), built as time slices (interim, like the horizon itself);
+    delta ceiling unscaled, and a dollar P&L-variance risk term (pc-objective-function
+    §4, amendment 2026-10-23) over each pair's overlapping horizon min(h_i, h_j), built
+    as time slices (interim, like the horizon itself);
   - an instrument's long and short legs are netted (the split is degenerate);
   - rounding: floor every quantity that consumes buying power, nearest otherwise;
     then stock repairs any delta band the rounding broke, by the fewest shares that
@@ -81,6 +82,7 @@ from wire_format import (
     F_POLICY,
     F_CAPITAL,
     F_HORIZON_DAYS,
+    F_HEDGE_INTERVAL_DAYS,
     F_ID,
     F_UNDERLYING,
     F_TYPE,
@@ -93,6 +95,8 @@ from wire_format import (
     F_DELTA_PER_UNIT,
     F_DAYS_TO_EXPIRY,
     F_GAMMA_PER_UNIT,
+    F_STRIKE,
+    F_IV,
     F_SPOT,
     F_DELTA_TARGET_PCT,
     F_DELTA_TOLERANCE_PCT,
@@ -101,7 +105,7 @@ from wire_format import (
     F_BP_LIMIT_PCT,
     F_DELTA_CEILING_THRESHOLD,
     F_LAMBDA_DELTA_CEILING,
-    F_LAMBDA_GAMMA,
+    F_RISK_AVERSION,
     F_LAMBDA_SPREAD,
     F_MIN_IMPROVEMENT,
     F_NET_LIQ,
@@ -125,7 +129,7 @@ from wire_format import (
     OC_THETA,
     OC_EXEC_COST,
     OC_DELTA_CEILING,
-    OC_GAMMA,
+    OC_RISK,
     SC_OBJECTIVE_VALUE,
     SC_OPTIMAL_OBJECTIVE_VALUE,
     SC_CURRENT_OBJECTIVE_VALUE,
@@ -133,7 +137,7 @@ from wire_format import (
     SC_THETA_TOTAL,
     SC_EXEC_COST_TOTAL,
     SC_DELTA_CEILING_PENALTY,
-    SC_GAMMA_PENALTY,
+    SC_RISK_PENALTY,
     SM_SOLVER_NAME,
     SM_SOLVER_STATUS,
     SM_ITERATIONS,
@@ -185,6 +189,16 @@ except ValueError:
 
 # Recovers the raw 0..1 delta from share-equivalent delta_per_unit (× multiplier).
 DELTA_RAW_DIVISOR = 100.0
+
+# Risk term (pc-objective-function-draft.md §4; amendment 2026-10-23): dollar P&L variance,
+# R_U = 2·δ·σ_U⁴·Σ_k Δt_k (Σ ½·γ_i·S_U²·q_i)², penalty (A/2)·Σ_U R_U / net_liq.
+# A (risk_aversion) and hedge_interval_days default when the request omits them: unlike a greek
+# or a price, they only scale/tune the penalty — the hard walls (BP, band) bound the book — so a
+# missing value cannot produce an unsafe book. σ_U is the interim per-underlying ATM IV.
+DEFAULT_RISK_AVERSION = 4.0
+DEFAULT_HEDGE_INTERVAL_DAYS = 1.0
+TRADING_DAYS_PER_YEAR = 252.0   # δ = hedge_interval_days / 252 (trading-day hedge cadence)
+CALENDAR_DAYS_PER_YEAR = 365.0  # Δt_k in years from calendar holding horizons
 
 # Absolute slack when checking the CURRENT book against the hard constraints
 # (D4: never hold a book that breaks one). Floating-point noise only — the
@@ -270,6 +284,7 @@ def handle_optimize(payload: dict) -> dict:
     policy = payload[F_POLICY]
     capital = payload[F_CAPITAL]
     horizon_days = payload[F_HORIZON_DAYS]
+    hedge_interval_days = payload.get(F_HEDGE_INTERVAL_DAYS, DEFAULT_HEDGE_INTERVAL_DAYS)
 
     log.info("[Solver] request_id=%s, %d decision_variables, solver=%s",
              request_id, len(dvs), SOLVER_NAME)
@@ -280,7 +295,8 @@ def handle_optimize(payload: dict) -> dict:
     # and ill-typed fields (ValueError) propagate to the library, never becoming
     # internal_error. NaN survives float() and is caught later as a solve failure.
     groups = _group_by_underlying(dvs)
-    bundle = _extract_inputs(dvs, per_underlying, policy, capital, groups, horizon_days)
+    bundle = _extract_inputs(dvs, per_underlying, policy, capital, groups,
+                             horizon_days, hedge_interval_days)
     n = len(dvs)
 
     # Solve + post-process INSIDE the catch: NaN/solver crashes → internal_error.
@@ -336,15 +352,16 @@ def _group_matrix(rows: np.ndarray, values: np.ndarray, n_groups: int) -> sp.csr
     return sp.csr_matrix((values, (rows, np.arange(n))), shape=(n_groups, n))
 
 
-def _gamma_slice_matrix(rows: np.ndarray, h: np.ndarray, gamma: np.ndarray, n_u: int) -> sp.csr_matrix:
-    """Gamma variance over overlapping horizons, as a sum of squares.
+def _risk_slice_matrix(rows: np.ndarray, h: np.ndarray, coef: np.ndarray, n_u: int) -> sp.csr_matrix:
+    """Dollar P&L variance over overlapping horizons, as a sum of squares (risk term, §4).
 
     Two positions are both held for min(h_i, h_j), so the per-underlying variance is
-    Σ_i Σ_j γ_i q_i γ_j q_j · min(h_i, h_j). Sorting the distinct horizons
-    t_1 < t_2 < … (t_0 = 0) turns that into Σ_k (t_k − t_(k−1)) · (Σ_(i: h_i ≥ t_k) γ_i q_i)².
-    Row (u, k) of the returned matrix holds √(t_k − t_(k−1)) · γ_i for every record i of
-    underlying u still held in slice k, so the penalty is ‖M q‖². Interim, like the
-    horizon itself, until lifecycle valuation.
+    Σ_i Σ_j coef_i q_i coef_j q_j · min(h_i, h_j). Sorting the distinct horizons
+    t_1 < t_2 < … (t_0 = 0) turns that into Σ_k (t_k − t_(k−1)) · (Σ_(i: h_i ≥ t_k) coef_i q_i)².
+    Row (u, k) of the returned matrix holds √(t_k − t_(k−1)) · coef_i for every record i of
+    underlying u still held in slice k, so the penalty is ‖M q‖². `h` is in years and
+    `coef_i = √(2δ)·σ_u²·½·γ_i·S_u²` (the dollar-gamma-vol coefficient built in _extract_inputs),
+    so ‖M q‖² = Σ_u R_u exactly. Interim (flat ATM σ, fixed δ) until lifecycle valuation.
     """
     n = len(h)
     t = np.unique(h[h > 0.0])                       # sorted distinct positive horizons
@@ -356,18 +373,21 @@ def _gamma_slice_matrix(rows: np.ndarray, h: np.ndarray, gamma: np.ndarray, n_u:
     cols = np.repeat(np.arange(n), held_slices)
     starts = np.repeat(np.cumsum(held_slices) - held_slices, held_slices)
     ks = np.arange(cols.size) - starts
-    vals = np.sqrt(dt[ks]) * gamma[cols]
+    vals = np.sqrt(dt[ks]) * coef[cols]
     return sp.csr_matrix((vals, (rows[cols] * n_slices + ks, cols)), shape=(n_u * n_slices, n))
 
 
 def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict,
-                    groups: dict, horizon_days) -> dict:
+                    groups: dict, horizon_days, hedge_interval_days=DEFAULT_HEDGE_INTERVAL_DAYS) -> dict:
     """Validate and convert every numeric input the solver consumes, plus touch
     the required identity fields so any missing/ill-typed field raises here —
     outside the internal_error catch. Returns a bundle of Python/numpy values."""
     horizon = float(horizon_days)
     if not horizon > 0.0:
         raise ValueError(f"horizon_days must be > 0, got {horizon_days!r}")
+    delta_years = float(hedge_interval_days) / TRADING_DAYS_PER_YEAR  # δ in the risk term
+    if not delta_years > 0.0:
+        raise ValueError(f"hedge_interval_days must be > 0, got {hedge_interval_days!r}")
 
     n = len(dvs)
     theta = np.empty(n)
@@ -417,6 +437,19 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
             raise ValueError(f"{u}: delta_tolerance_pct must be positive, got {pu[u][2]!r}")
         tradeable[u] = bool(rec[F_TRADEABLE])
 
+    # Interim per-underlying ATM IV σ_u for the risk term: the IV of the nearest-the-money
+    # option candidate (stands in for the per-(underlying, expiry) RV forecast, §7). A name with
+    # no option candidates has no σ_u, but its gamma is 0 so its risk is 0 regardless → σ_u = 0.
+    atm_iv = {}
+    for u, idx in groups.items():
+        opts = [i for i in idx if dvs[i][F_TYPE] == TYPE_OPTION]
+        if opts:
+            spot_u = pu[u][0]
+            nearest = min(opts, key=lambda i: abs(float(dvs[i][F_STRIKE]) - spot_u))
+            atm_iv[u] = float(dvs[nearest][F_IV])
+        else:
+            atm_iv[u] = 0.0
+
     # Equity legs per underlying: the stock that repairs a rounding-broken band.
     # Equity delta is ±1 per share by definition (pc-optimization-spec-draft.md).
     equity_legs = {}
@@ -447,22 +480,32 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     rows = np.array([row_of[u] for u in und], dtype=int)
     n_u = len(und_names)
 
+    # Risk-term slice coefficient per record (amendment 2026-10-23):
+    #   c_i = √(2δ) · σ_u² · ½ · γ_i · S_u²  (the dollar gamma ½γS², the underlying's ATM IV
+    # σ_u outside the per-contract term, and √(2δ) folded in). Squared and summed over the
+    # horizon slices this gives R_u = 2δσ_u⁴ Σ_k Δt_k (Σ ½γ_i S_u² q_i)² per underlying, with Δt_k
+    # in years (h passed in years). Equity γ_i = 0 → c_i = 0.
+    spot_vec = np.array([pu[u][0] for u in und])
+    iv_vec = np.array([atm_iv[u] for u in und])
+    risk_coef = np.sqrt(2.0 * delta_years) * (iv_vec ** 2) * 0.5 * gamma * (spot_vec ** 2)
+    h_years = h / CALENDAR_DAYS_PER_YEAR
+
     return {
         "theta": theta, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
         "margin": margin, "current_qty": current_qty, "delta_pen": delta_pen,
         "h": h, "closeable": closeable, "is_equity": is_equity, "und": und,
         "und_names": und_names, "tradeable": tradeable, "equity_legs": equity_legs,
-        "pairs": pairs,
+        "pairs": pairs, "atm_iv": atm_iv,
         "lam_spread": float(policy[F_LAMBDA_SPREAD]),
         "lam_delta": float(policy[F_LAMBDA_DELTA_CEILING]),
-        "lam_gamma": float(policy[F_LAMBDA_GAMMA]),
+        "risk_aversion": float(policy.get(F_RISK_AVERSION, DEFAULT_RISK_AVERSION)),
         "min_improvement": float(policy[F_MIN_IMPROVEMENT]),
         "bp_limit": float(policy[F_BP_LIMIT_PCT]) / 100.0 * net_liq,
         "net_liq": net_liq,
         "pu": pu,
         # Vectorized per-underlying structure (§3.4)
         "G_delta": _group_matrix(rows, delta, n_u),
-        "G_gamma_slices": _gamma_slice_matrix(rows, h, gamma, n_u),
+        "G_risk_slices": _risk_slice_matrix(rows, h_years, risk_coef, n_u),
         # Share band from the dollar band: (target_pct ∓ tolerance_pct)/100 · net_liq / spot.
         "u_lo": np.array([(pu[u][1] - pu[u][2]) / 100.0 * net_liq / pu[u][0] for u in und_names]),
         "u_hi": np.array([(pu[u][1] + pu[u][2]) / 100.0 * net_liq / pu[u][0] for u in und_names]),
@@ -492,7 +535,7 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
     float conversion happens here — all of that is done in _extract_inputs.
 
     Maximize  (theta∘h)·q − λ_spread·exec·|q − current| − λ_delta·delta_pen·q
-              − λ_gamma·‖M_slices · q‖²
+              − (risk_aversion/2)/net_liq·‖M_risk_slices · q‖²   (dollar P&L-variance risk term)
     s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
               per underlying: lo ≤ G_δ q ≤ hi (the dollar band in shares).
 
@@ -527,7 +570,10 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
     obj = (bundle["theta"] * bundle["h"]) @ target
     obj = obj - bundle["lam_spread"] * (bundle["exec_cost"] @ cp.abs(target - current))
     obj = obj - bundle["lam_delta"] * (bundle["delta_pen"] @ target)
-    obj = obj - bundle["lam_gamma"] * cp.sum_squares(bundle["G_gamma_slices"] @ target)
+    # Dollar P&L-variance risk term: (risk_aversion/2)·Σ_U R_U / net_liq = that scalar · ‖M′q‖²
+    # (G_risk_slices already carries √(2δ)·σ_u²·½γS² per record, so ‖·‖² = Σ_U R_U).
+    obj = obj - (bundle["risk_aversion"] / (2.0 * bundle["net_liq"])) * cp.sum_squares(
+        bundle["G_risk_slices"] @ target)
 
     problem = cp.Problem(cp.Maximize(obj), constraints)
     problem.solve(solver=SOLVER_BACKEND, **_solve_kwargs())
@@ -668,28 +714,28 @@ def _compute_contributions(bundle: dict, q) -> dict:
     """Per-position objective_contribution, decomposed by term, as index-aligned
     numpy arrays keyed by the OC_* component names.
 
-    The gamma term attributes the overlap-form penalty λ·Σ_r Y_r², Y = M q (time
-    slices, see _gamma_slice_matrix), by each position's share of every slice sum:
+    The risk term attributes the overlap-form penalty κ·Σ_r Y_r², Y = M q (time slices, see
+    _risk_slice_matrix; κ = risk_aversion/(2·net_liq)), by each position's share of every slice sum:
 
-        gamma_i = −λ_gamma · q_i · (Mᵀ Y)_i
-                = −λ_gamma · Σ_(slices k it is held in) Δt_k · γ_i q_i · S_k
+        risk_i = −κ · q_i · (Mᵀ Y)_i
+               = −κ · Σ_(slices k it is held in) Δt_k · c_i q_i · S_k
 
-    where S_k is the underlying's Σ γ q over the positions held in slice k. These sum
-    across positions to −λ_gamma·‖Mq‖², the score's gamma_penalty. Recomputed from the
-    q passed in, serving the ranking pass, the reporting pass and the current book.
+    where c_i is the record's dollar-gamma-vol coefficient and S_k the underlying's Σ c q over the
+    positions held in slice k. These sum across positions to −κ·‖Mq‖², the score's risk_penalty.
+    Recomputed from the q passed in, serving the ranking pass, the reporting pass and the current book.
     """
     q = np.asarray(q, dtype=float)
     theta_c = bundle["theta"] * bundle["h"] * q
     exec_c = -bundle["lam_spread"] * bundle["exec_cost"] * np.abs(q - bundle["current_qty"])
     dceil_c = -bundle["lam_delta"] * bundle["delta_pen"] * q
-    m = bundle["G_gamma_slices"]
-    gamma_c = -bundle["lam_gamma"] * q * (m.T @ (m @ q))
+    m = bundle["G_risk_slices"]
+    risk_c = -(bundle["risk_aversion"] / (2.0 * bundle["net_liq"])) * q * (m.T @ (m @ q))
     return {
         OC_THETA: theta_c,
         OC_EXEC_COST: exec_c,
         OC_DELTA_CEILING: dceil_c,
-        OC_GAMMA: gamma_c,
-        OC_TOTAL: theta_c + exec_c + dceil_c + gamma_c,
+        OC_RISK: risk_c,
+        OC_TOTAL: theta_c + exec_c + dceil_c + risk_c,
     }
 
 
@@ -792,7 +838,8 @@ def pipeline_trace(payload: dict) -> dict:
     dvs = payload[F_DECISION_VARIABLES]
     groups = _group_by_underlying(dvs)
     bundle = _extract_inputs(dvs, payload[F_PER_UNDERLYING], payload[F_POLICY],
-                             payload[F_CAPITAL], groups, payload[F_HORIZON_DAYS])
+                             payload[F_CAPITAL], groups, payload[F_HORIZON_DAYS],
+                             payload.get(F_HEDGE_INTERVAL_DAYS, DEFAULT_HEDGE_INTERVAL_DAYS))
     target, problem, _ = _build_and_solve(len(dvs), bundle)
     stages = _post_solve_pipeline(target.value, bundle, groups)
     und = bundle["und_names"]
@@ -915,7 +962,7 @@ def _build_recommendations(dvs: list, target_q: list, optimal_q: list, contribs:
                 OC_THETA: float(contribs[OC_THETA][i]),
                 OC_EXEC_COST: float(contribs[OC_EXEC_COST][i]),
                 OC_DELTA_CEILING: float(contribs[OC_DELTA_CEILING][i]),
-                OC_GAMMA: float(contribs[OC_GAMMA][i]),
+                OC_RISK: float(contribs[OC_RISK][i]),
             },
         }
         for field in DIAGNOSTIC_FIELDS:
@@ -937,7 +984,7 @@ def _build_score(contribs: dict, optimal_obj: float, current_obj: float) -> dict
             SC_THETA_TOTAL: float(contribs[OC_THETA].sum()),
             SC_EXEC_COST_TOTAL: float(contribs[OC_EXEC_COST].sum()),
             SC_DELTA_CEILING_PENALTY: float(contribs[OC_DELTA_CEILING].sum()),
-            SC_GAMMA_PENALTY: float(contribs[OC_GAMMA].sum()),
+            SC_RISK_PENALTY: float(contribs[OC_RISK].sum()),
         },
     }
 

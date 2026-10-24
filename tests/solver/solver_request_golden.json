@@ -229,7 +229,7 @@
     "max_positions_per_underlying": 8,
     "delta_ceiling_threshold": 0.3,
     "lambda_delta_ceiling": 1.0,
-    "lambda_gamma": 1.0,
+    "risk_aversion": 4.0,
     "lambda_spread": 1.0,
     "min_improvement": 0.0
   },

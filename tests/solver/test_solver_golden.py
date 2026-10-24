@@ -106,21 +106,38 @@ def test_golden_book_is_inside_every_delta_band() -> None:
             f"{u} dollar delta {pct:.4f}% outside {pu['delta_target_pct']} ± {pu['delta_tolerance_pct']}%"
 
 
-def test_golden_gamma_penalty_is_the_overlap_form() -> None:
-    """The golden book has a same-day MU call next to a 5-day-horizon MU short: the gamma
-    penalty must equal −λ·Σ_U Σ_i Σ_j γ_i q_i γ_j q_j · min(h_i, h_j) (hedge credit only
-    for the overlap)."""
+def test_golden_risk_penalty_is_the_dollar_variance_overlap_form() -> None:
+    """The golden book has a same-day MU call next to a 5-day-horizon MU short: the dollar
+    P&L-variance risk penalty must equal −(A/2)/net_liq · Σ_U 2δ·σ_U⁴·Σ_i Σ_j cᵢcⱼ·min(hᵢ,hⱼ),
+    with cᵢ = ½·γ_i·S_U²·qᵢ the dollar gamma, σ_U the underlying's ATM IV, δ the hedge interval
+    in years, and hᵢ in years — hedge credit only for the overlap (amendment 2026-10-23)."""
     request, response = _golden()
     dvs = {dv["id"]: dv for dv in request["decision_variables"]}
     horizon = request["horizon_days"]
+    A = request["policy"]["risk_aversion"]
+    net_liq = request["capital"]["net_liq"]
+    delta_years = request.get("hedge_interval_days", 1.0) / 252.0
+    spot = {pu["underlying"]: pu["spot"] for pu in request["per_underlying"]}
+    atm_iv = {}
+    for pu in request["per_underlying"]:
+        opts = [dv for dv in request["decision_variables"]
+                if dv["type"] == "option" and dv["underlying"] == pu["underlying"]]
+        atm_iv[pu["underlying"]] = (
+            min(opts, key=lambda dv: abs(dv["strike"] - pu["spot"]))["iv"] if opts else 0.0)
     legs = []
     for r in response["recommendations"]:
         dv = dvs[r["id"]]
-        h = min(dv["days_to_expiry"], horizon) if dv["type"] == "option" else horizon
-        legs.append((r["underlying"], dv["gamma_per_unit"] * r["target_quantity"], h))
-    expected = -request["policy"]["lambda_gamma"] * sum(
-        xi * xj * min(hi, hj) for (ui, xi, hi) in legs for (uj, xj, hj) in legs if ui == uj)
-    got = response["score"]["components"]["gamma_penalty"]
+        u = r["underlying"]
+        h = (min(dv["days_to_expiry"], horizon) if dv["type"] == "option" else horizon) / 365.0
+        c = 0.5 * dv["gamma_per_unit"] * spot[u] ** 2 * r["target_quantity"]
+        legs.append((u, c, h))
+    r_u: dict[str, float] = {}
+    for (ui, ci, hi) in legs:
+        for (uj, cj, hj) in legs:
+            if ui == uj:
+                r_u[ui] = r_u.get(ui, 0.0) + ci * cj * min(hi, hj)
+    expected = -(A / 2.0) / net_liq * sum(2.0 * delta_years * atm_iv[u] ** 4 * r_u[u] for u in r_u)
+    got = response["score"]["components"]["risk_penalty"]
     assert math.isclose(got, expected, rel_tol=1e-9, abs_tol=1e-9), f"{got} != {expected}"
 
 
