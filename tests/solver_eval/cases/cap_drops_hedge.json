@@ -3,7 +3,7 @@
   "tests": "max_positions=1 on a held balanced strangle: the cap drops a hedge leg, and the solver must not break BP or the band.",
   "market": "hand_built_cap_drops_hedge",
   "portfolio": "snapshot",
-  "policy": {},
+  "policy": { "risk_aversion": 0, "hedge_interval_days": 1 },
   "perturb": null,
   "expect": { "status_not": ["infeasible"], "bp_within_limit": true, "bands_within": true }
 }

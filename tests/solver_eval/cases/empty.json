@@ -3,7 +3,7 @@
   "tests": "Nothing held. What does the solver build from a clean sheet against today's market?",
   "market": "live_20261022_5names",
   "portfolio": "empty",
-  "policy": {},
+  "policy": { "risk_aversion": 4, "hedge_interval_days": 1 },
   "perturb": { "spot_pct": 0.5, "iv_vol_points": 0.2, "seed": 1, "variants": 20 },
   "expect": {}
 }

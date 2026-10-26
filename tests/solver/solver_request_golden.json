@@ -230,6 +230,7 @@
     "delta_ceiling_threshold": 0.3,
     "lambda_delta_ceiling": 1.0,
     "risk_aversion": 4.0,
+    "hedge_interval_days": 1.0,
     "lambda_spread": 1.0,
     "min_improvement": 0.0
   },

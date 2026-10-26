@@ -3,7 +3,7 @@
   "request_id": "golden-run-1",
   "policy_version": 2,
   "request_timestamp": "2026-05-12T14:22:37Z",
-  "response_timestamp": "2026-10-24T23:09:39.201670+00:00",
+  "response_timestamp": "2026-10-25T22:30:24.917171+00:00",
   "status": "optimal",
   "action": "trade",
   "recommendations": [
@@ -248,7 +248,7 @@
     "solver_name": "clarabel",
     "solver_status": "optimal",
     "iterations": 13,
-    "wall_clock_seconds": 0.0252,
+    "wall_clock_seconds": 0.0176,
     "problem_size": {
       "decision_variables": 12,
       "constraints": 9

@@ -192,11 +192,9 @@ DELTA_RAW_DIVISOR = 100.0
 
 # Risk term (pc-objective-function-draft.md §4; amendment 2026-10-23): dollar P&L variance,
 # R_U = 2·δ·σ_U⁴·Σ_k Δt_k (Σ ½·γ_i·S_U²·q_i)², penalty (A/2)·Σ_U R_U / net_liq.
-# A (risk_aversion) and hedge_interval_days default when the request omits them: unlike a greek
-# or a price, they only scale/tune the penalty — the hard walls (BP, band) bound the book — so a
-# missing value cannot produce an unsafe book. σ_U is the interim per-underlying ATM IV.
-DEFAULT_RISK_AVERSION = 4.0
-DEFAULT_HEDGE_INTERVAL_DAYS = 1.0
+# A (risk_aversion) and hedge_interval_days are required policy fields — CalcServer sends both,
+# and a request without either is malformed (no solver-side default). σ_U is the interim
+# per-underlying ATM IV.
 TRADING_DAYS_PER_YEAR = 252.0   # δ = hedge_interval_days / 252 (trading-day hedge cadence)
 CALENDAR_DAYS_PER_YEAR = 365.0  # Δt_k in years from calendar holding horizons
 
@@ -284,7 +282,6 @@ def handle_optimize(payload: dict) -> dict:
     policy = payload[F_POLICY]
     capital = payload[F_CAPITAL]
     horizon_days = payload[F_HORIZON_DAYS]
-    hedge_interval_days = payload.get(F_HEDGE_INTERVAL_DAYS, DEFAULT_HEDGE_INTERVAL_DAYS)
 
     log.info("[Solver] request_id=%s, %d decision_variables, solver=%s",
              request_id, len(dvs), SOLVER_NAME)
@@ -295,8 +292,7 @@ def handle_optimize(payload: dict) -> dict:
     # and ill-typed fields (ValueError) propagate to the library, never becoming
     # internal_error. NaN survives float() and is caught later as a solve failure.
     groups = _group_by_underlying(dvs)
-    bundle = _extract_inputs(dvs, per_underlying, policy, capital, groups,
-                             horizon_days, hedge_interval_days)
+    bundle = _extract_inputs(dvs, per_underlying, policy, capital, groups, horizon_days)
     n = len(dvs)
 
     # Solve + post-process INSIDE the catch: NaN/solver crashes → internal_error.
@@ -378,14 +374,15 @@ def _risk_slice_matrix(rows: np.ndarray, h: np.ndarray, coef: np.ndarray, n_u: i
 
 
 def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict,
-                    groups: dict, horizon_days, hedge_interval_days=DEFAULT_HEDGE_INTERVAL_DAYS) -> dict:
+                    groups: dict, horizon_days) -> dict:
     """Validate and convert every numeric input the solver consumes, plus touch
     the required identity fields so any missing/ill-typed field raises here —
     outside the internal_error catch. Returns a bundle of Python/numpy values."""
     horizon = float(horizon_days)
     if not horizon > 0.0:
         raise ValueError(f"horizon_days must be > 0, got {horizon_days!r}")
-    delta_years = float(hedge_interval_days) / TRADING_DAYS_PER_YEAR  # δ in the risk term
+    hedge_interval_days = float(policy[F_HEDGE_INTERVAL_DAYS])  # required; no solver-side default
+    delta_years = hedge_interval_days / TRADING_DAYS_PER_YEAR   # δ in the risk term
     if not delta_years > 0.0:
         raise ValueError(f"hedge_interval_days must be > 0, got {hedge_interval_days!r}")
 
@@ -498,7 +495,7 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         "pairs": pairs, "atm_iv": atm_iv,
         "lam_spread": float(policy[F_LAMBDA_SPREAD]),
         "lam_delta": float(policy[F_LAMBDA_DELTA_CEILING]),
-        "risk_aversion": float(policy.get(F_RISK_AVERSION, DEFAULT_RISK_AVERSION)),
+        "risk_aversion": float(policy[F_RISK_AVERSION]),
         "min_improvement": float(policy[F_MIN_IMPROVEMENT]),
         "bp_limit": float(policy[F_BP_LIMIT_PCT]) / 100.0 * net_liq,
         "net_liq": net_liq,
@@ -838,8 +835,7 @@ def pipeline_trace(payload: dict) -> dict:
     dvs = payload[F_DECISION_VARIABLES]
     groups = _group_by_underlying(dvs)
     bundle = _extract_inputs(dvs, payload[F_PER_UNDERLYING], payload[F_POLICY],
-                             payload[F_CAPITAL], groups, payload[F_HORIZON_DAYS],
-                             payload.get(F_HEDGE_INTERVAL_DAYS, DEFAULT_HEDGE_INTERVAL_DAYS))
+                             payload[F_CAPITAL], groups, payload[F_HORIZON_DAYS])
     target, problem, _ = _build_and_solve(len(dvs), bundle)
     stages = _post_solve_pipeline(target.value, bundle, groups)
     und = bundle["und_names"]

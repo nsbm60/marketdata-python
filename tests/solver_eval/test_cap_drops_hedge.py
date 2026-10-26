@@ -26,7 +26,9 @@ def _case() -> dict:
 
 
 def _request() -> dict:
-    return se._market_request("hand_built_cap_drops_hedge")
+    # Resolve through the case so the policy (risk_aversion, hedge_interval_days — required, no
+    # solver default) is applied; the snapshot is the market, the case carries the policy.
+    return se._resolve_case(_case())
 
 
 def test_case_meets_its_expectations() -> None:

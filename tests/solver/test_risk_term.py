@@ -33,8 +33,8 @@ def _underlying(uid: str) -> dict:
 
 
 _POLICY = {"bp_limit_pct": 60, "max_positions_per_underlying": 8, "delta_ceiling_threshold": 0.30,
-           "lambda_delta_ceiling": 1.0, "risk_aversion": 4.0, "lambda_spread": 1.0,
-           "min_improvement": 0.0}
+           "lambda_delta_ceiling": 1.0, "risk_aversion": 4.0, "hedge_interval_days": 1.0,
+           "lambda_spread": 1.0, "min_improvement": 0.0}
 _CAPITAL = {"net_liq": 100000.0}
 
 

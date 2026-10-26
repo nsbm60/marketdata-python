@@ -3,7 +3,7 @@
   "tests": "A hedged book inside every limit: short ~0.20-delta strangles on NVDA and MU, each hedged to 0% dollar-delta. Does the solver hold it?",
   "market": "live_20261022_5names",
   "portfolio": "clean",
-  "policy": {},
+  "policy": { "risk_aversion": 4, "hedge_interval_days": 1 },
   "perturb": { "spot_pct": 0.5, "iv_vol_points": 0.2, "seed": 1, "variants": 20 },
   "expect": {}
 }
