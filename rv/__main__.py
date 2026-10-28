@@ -47,6 +47,7 @@ def main() -> None:
         sp = sub.add_parser(name)
         sp.add_argument("--start")
         sp.add_argument("--end")
+        sp.add_argument("--symbols", help="comma-separated names for a targeted rerun (default: all)")
     sub.add_parser("proof")
     sub.add_parser("forecast")
     args = p.parse_args()
@@ -56,8 +57,9 @@ def main() -> None:
 
     if args.cmd in ("backfill", "all"):
         start, end = _dates(args)
-        print(f"[backfill] rv_daily {start} .. {end}")
-        total = rv_daily.backfill(ch, start, end)
+        symbols = [s.strip().upper() for s in args.symbols.split(",")] if getattr(args, "symbols", None) else None
+        print(f"[backfill] rv_daily {start} .. {end}" + (f" symbols={symbols}" if symbols else ""))
+        total = rv_daily.backfill(ch, start, end, symbols)
         dropped = rv_daily.gap_dropped_count(ch)
         st = rv_daily.stats(ch)
         print(f"[backfill] {total:,} rv_daily rows")

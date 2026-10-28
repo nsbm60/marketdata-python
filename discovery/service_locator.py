@@ -151,6 +151,11 @@ class ServiceLocator:
         log_interval_sec: float = 5.0,
         warn_after_sec: float = 30.0,
     ) -> T:
+        def _endpoint_str(r) -> str:
+            host = getattr(r, "host", None)
+            port = getattr(r, "port", None) or getattr(r, "router", None)
+            return f"{host}:{port}" if host and port else repr(r)
+
         # The name check and parse run on the subscriber thread; the result (or the failure) is
         # handed back under the lock. A record for another service on the same topic prefix is
         # ignored. A malformed record for the requested service raises — a bug in the advertiser.
@@ -189,6 +194,8 @@ class ServiceLocator:
                     if "error" in state:
                         raise state["error"]
                     if "result" in state:
+                        log.info(f"✅ Discovered '{wire}': {_endpoint_str(state['result'])} "
+                                 f"in {time.time() - start_time:.2f}s")
                         return state["result"]
 
                 elapsed = time.time() - start_time

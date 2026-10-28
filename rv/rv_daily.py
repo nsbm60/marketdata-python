@@ -29,9 +29,18 @@ log = logging.getLogger("rv.rv_daily")
 _LOOKBACK_DAYS = 10
 
 
-def _with_core(lookback: dt.date, month_end: dt.date) -> str:
+def _symbol_filter(symbols) -> str:
+    """` AND symbol IN ('A','B')` for a targeted rerun, or '' for all names."""
+    if not symbols:
+        return ""
+    quoted = ", ".join("'" + s.replace("'", "") + "'" for s in symbols)
+    return f" AND symbol IN ({quoted})"
+
+
+def _with_core(lookback: dt.date, month_end: dt.date, sym: str = "") -> str:
     """The shared WITH clause producing `withsplit`: one row per complete (symbol, trading_date) in
-    [lookback, month_end] with the ordered grid prices, day open/close, prior close and split ratio."""
+    [lookback, month_end] with the ordered grid prices, day open/close, prior close and split ratio.
+    `sym` is an optional ` AND symbol IN (...)` filter for a targeted rerun."""
     lo, hi = lookback.isoformat(), month_end.isoformat()
     return f"""
 WITH
@@ -40,7 +49,7 @@ grid AS (
            toStartOfInterval(toTimezone(ts, 'America/New_York'), INTERVAL 5 minute) AS bucket,
            argMax(close, ts) AS px
     FROM trading.stock_bar
-    WHERE period = '1m' AND session = 1
+    WHERE period = '1m' AND session = 1{sym}
       AND trading_date >= toDate('{lo}') AND trading_date <= toDate('{hi}')
     GROUP BY symbol, trading_date, bucket
 ),
@@ -54,14 +63,14 @@ daygrid AS (
 oc AS (
     SELECT symbol, trading_date, argMin(open, ts) AS day_open, argMax(close, ts) AS day_close
     FROM trading.stock_bar
-    WHERE period = '1m' AND session = 1
+    WHERE period = '1m' AND session = 1{sym}
       AND trading_date >= toDate('{lo}') AND trading_date <= toDate('{hi}')
     GROUP BY symbol, trading_date
 ),
 complete AS (
     SELECT symbol, trading_date, toUInt16(intDiv(any(expected_regular), 5)) AS expected_bars
     FROM trading.stock_bar_ledger FINAL
-    WHERE status = 'complete'
+    WHERE status = 'complete'{sym}
       AND trading_date >= toDate('{lo}') AND trading_date <= toDate('{hi}')
     GROUP BY symbol, trading_date
 ),
@@ -79,7 +88,7 @@ ledger_days AS (
     SELECT symbol, trading_date,
            lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_trading_day
     FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL
-          WHERE trading_date >= toDate('{lo}') AND trading_date <= toDate('{hi}'))
+          WHERE trading_date >= toDate('{lo}') AND trading_date <= toDate('{hi}'){sym})
 ),
 withprev AS (
     SELECT m.symbol AS symbol, m.trading_date AS trading_date, m.n_bars AS n_bars,
@@ -109,15 +118,17 @@ def _month_ranges(start: dt.date, end: dt.date):
         cur = nxt
 
 
-def backfill(ch, start: dt.date, end: dt.date) -> int:
-    """Compute rv_daily for every complete (symbol, day) in [start, end], one statement per month."""
+def backfill(ch, start: dt.date, end: dt.date, symbols=None) -> int:
+    """Compute rv_daily for every complete (symbol, day) in [start, end], one statement per month.
+    `symbols` restricts to a targeted rerun (e.g. after a cut); None means all names."""
+    sym = _symbol_filter(symbols)
     total = 0
     for ms, me in _month_ranges(start, end):
         lookback = ms - dt.timedelta(days=_LOOKBACK_DAYS)
         sql = f"""
 INSERT INTO trading.rv_daily
     (symbol, trading_date, rv_intraday, rv_overnight, rv_total, n_bars, expected_bars, split_adjusted, source, computed_at)
-{_with_core(lookback, me)}
+{_with_core(lookback, me, sym)}
 SELECT
     symbol, trading_date,
     arraySum(arrayMap(x -> x * x, arrayDifference(arrayMap(p -> log(p), grid_px)))) AS rv_intraday,
@@ -136,14 +147,14 @@ SETTINGS join_use_nulls = 1
         ch.command(sql)
         n = ch.query(
             f"SELECT count() FROM trading.rv_daily FINAL WHERE trading_date >= '{ms.isoformat()}' "
-            f"AND trading_date <= '{me.isoformat()}'"
+            f"AND trading_date <= '{me.isoformat()}'{sym}"
         ).result_rows[0][0]
         # Refuse non-finite or negative variance — fail fast, by name and date, never persist it.
         # Zero is a real value (a thinly-traded day where every price equalled the prior close); it
         # is stored and excluded from the fit by load_series's rv_total > 0.
         bad = ch.query(
             f"SELECT symbol, toString(trading_date), rv_total FROM trading.rv_daily FINAL "
-            f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}' "
+            f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}'{sym} "
             f"AND (NOT isFinite(rv_total) OR rv_total < 0) ORDER BY symbol, trading_date LIMIT 100"
         ).result_rows
         if bad:
