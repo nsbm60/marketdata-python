@@ -66,6 +66,11 @@ def main() -> None:
         print(f"[backfill] split_adjusted=1 on {st['split_adjusted']:,} rows "
               f"({st['splits_in_table']:,} splits on these names since 2016)")
         print(f"[backfill] rv_total  min={st['rv_min']:.3e}  median={st['rv_median']:.3e}  max={st['rv_max']:.3e}")
+        zeros = rv_daily.zero_rv_by_name(ch)
+        total_zero = sum(n for _, n in zeros)
+        print(f"[backfill] zero-RV days: {total_zero:,} across {len(zeros)} names (stored, excluded from the fit)")
+        for sym, n in zeros:
+            print(f"    {sym:8s} {n}")
     if args.cmd in ("proof", "all"):
         _run_proof(ch)
     if args.cmd in ("forecast", "all"):

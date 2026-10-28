@@ -138,22 +138,33 @@ SETTINGS join_use_nulls = 1
             f"SELECT count() FROM trading.rv_daily FINAL WHERE trading_date >= '{ms.isoformat()}' "
             f"AND trading_date <= '{me.isoformat()}'"
         ).result_rows[0][0]
-        # Refuse non-finite or non-positive variance — fail fast, by name and date, never persist it.
+        # Refuse non-finite or negative variance — fail fast, by name and date, never persist it.
+        # Zero is a real value (a thinly-traded day where every price equalled the prior close); it
+        # is stored and excluded from the fit by load_series's rv_total > 0.
         bad = ch.query(
             f"SELECT symbol, toString(trading_date), rv_total FROM trading.rv_daily FINAL "
             f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}' "
-            f"AND (NOT isFinite(rv_total) OR rv_total <= 0) ORDER BY symbol, trading_date LIMIT 100"
+            f"AND (NOT isFinite(rv_total) OR rv_total < 0) ORDER BY symbol, trading_date LIMIT 100"
         ).result_rows
         if bad:
             lines = "\n".join(f"    {s:8s} {d}  rv_total={rv}" for s, d, rv in bad)
             raise RuntimeError(
-                f"rv_daily produced non-finite/non-positive rv_total for {ms}..{me} "
+                f"rv_daily produced non-finite/negative rv_total for {ms}..{me} "
                 f"({len(bad)}+ rows shown):\n{lines}"
             )
         log.info("rv_daily %s..%s: %d rows", ms, me, n)
         print(f"[rv_daily] {ms} .. {me}: {n:,} rows")
         total += n
     return total
+
+
+def zero_rv_by_name(ch) -> list[tuple]:
+    """(symbol, count) for every name with any zero-RV day — a real flat session, kept but excluded
+    from the fit. Returned most-frequent first."""
+    return ch.query(
+        "SELECT symbol, count() AS n FROM trading.rv_daily FINAL "
+        "WHERE source = 'har-rv' AND rv_total = 0 GROUP BY symbol ORDER BY n DESC, symbol"
+    ).result_rows
 
 
 def stats(ch) -> dict:
