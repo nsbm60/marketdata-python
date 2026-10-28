@@ -93,10 +93,33 @@ def _fit_models(
             if xs:
                 x = np.vstack(xs)
                 y = np.concatenate(ys)
-                per_h[h] = har.fit_pooled(x, y)
+                beta, s2 = har.fit_pooled(x, y)
+                per_h[h] = (beta, s2, len(y))
         if per_h:
             models[fd] = per_h
     return models
+
+
+def write_har_fit(ch, fit_date: dt.date, per_h: dict, now: dt.datetime) -> None:
+    """Persist one weekly pooled fit's coefficients (one row per horizon) to trading.har_fit."""
+    rows = [
+        (MODEL_VERSION, fit_date, int(h), float(beta[0]), float(beta[1]), float(beta[2]),
+         float(beta[3]), float(s2), int(n_obs), now)
+        for h, (beta, s2, n_obs) in sorted(per_h.items())
+    ]
+    if rows:
+        ch.insert("trading.har_fit", rows, column_names=[
+            "model_version", "fit_date", "horizon_days", "b0", "b_d", "b_w", "b_m", "s2", "n_obs", "computed_at"])
+
+
+def read_latest_har_fit(ch) -> dict:
+    """Latest stored fit per horizon: {horizon: (beta[4], s2)} from trading.har_fit, newest fit_date."""
+    rows = ch.query(
+        "SELECT horizon_days, b0, b_d, b_w, b_m, s2 FROM trading.har_fit FINAL "
+        f"WHERE model_version = '{MODEL_VERSION}' AND fit_date = "
+        f"(SELECT max(fit_date) FROM trading.har_fit FINAL WHERE model_version = '{MODEL_VERSION}')"
+    ).result_rows
+    return {int(h): (np.array([b0, bd, bw, bm]), float(s2)) for h, b0, bd, bw, bm, s2 in rows}
 
 
 def run(ch, batch_rows: int = 200_000) -> int:
@@ -122,6 +145,9 @@ def run(ch, batch_rows: int = 200_000) -> int:
     model_fit_ords = sorted(m.toordinal() for m in models)
 
     now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    for fd, per_h in models.items():
+        write_har_fit(ch, fd, per_h, now)
+    print(f"[forecast] wrote {sum(len(v) for v in models.values())} har_fit rows across {len(models)} fits")
     buf: list[tuple] = []
     written = 0
 
@@ -153,7 +179,7 @@ def run(ch, batch_rows: int = 200_000) -> int:
                 mh = per_h.get(h)
                 if mh is None:
                     continue
-                beta, s2 = mh
+                beta, s2, _ = mh
                 sigma = har.forecast_sigma(beta, s2, pred[t])
                 buf.append((sym, as_of, int(h), sigma, MODEL_VERSION, fd, rv_d, rv_w, rv_m, now))
             if len(buf) >= batch_rows:
@@ -161,3 +187,63 @@ def run(ch, batch_rows: int = 200_000) -> int:
     flush()
     print(f"[forecast] wrote {written:,} forecast rows ({MODEL_VERSION})")
     return written
+
+
+def daily(ch) -> int:
+    """The daily-job body (HAR edge §5): append yesterday's rv_daily, refit weekly into har_fit,
+    and write each name's latest forecast from the latest stored fit. Invoked by the Scala HarJob."""
+    from . import rv_daily
+
+    yesterday = dt.date.today() - dt.timedelta(days=1)
+    rv_daily.backfill(ch, yesterday, yesterday)  # set-based; no-op if yesterday wasn't a complete day
+
+    series = load_series(ch)
+    if not series:
+        print("[daily] no rv_daily rows")
+        return 0
+    all_dates = sorted({d for dates, _ in series.values() for d in dates})
+    latest = all_dates[-1]
+    preds = {s: har.predictors(rv) for s, (_, rv) in series.items()}
+    dates_ord = {s: np.array([d.toordinal() for d in dates]) for s, (dates, _) in series.items()}
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+    # Weekly refit: fit as of the latest complete day when there's no stored fit or it's ≥ 7 days old.
+    last_fit = ch.query(
+        f"SELECT max(fit_date) FROM trading.har_fit FINAL WHERE model_version = '{MODEL_VERSION}'"
+    ).result_rows[0][0]
+    if last_fit is None or (latest - last_fit).days >= 7:
+        targets = {h: {s: har.forward_log_mean(rv, h) for s, (_, rv) in series.items()} for h in HORIZONS}
+        per_h = _fit_models(preds, targets, dates_ord, [latest]).get(latest, {})
+        if per_h:
+            write_har_fit(ch, latest, per_h, now)
+            print(f"[daily] refit as of {latest}: {len(per_h)} horizons")
+
+    models = read_latest_har_fit(ch)
+    fit_date = ch.query(
+        f"SELECT max(fit_date) FROM trading.har_fit FINAL WHERE model_version = '{MODEL_VERSION}'"
+    ).result_rows[0][0]
+    if not models:
+        print("[daily] no stored fit — nothing to forecast")
+        return 0
+
+    buf: list[tuple] = []
+    for sym, (dates, rv) in series.items():
+        if len(dates) < MIN_SESSIONS:
+            continue
+        t = len(dates) - 1
+        pred = preds[sym]
+        if not np.isfinite(pred[t]).all():
+            continue
+        as_of = dates[t]  # each name's latest complete day
+        rv_d, rv_w, rv_m = float(np.exp(pred[t, 0])), float(np.exp(pred[t, 1])), float(np.exp(pred[t, 2]))
+        for h in HORIZONS:
+            mh = models.get(h)
+            if mh is None:
+                continue
+            beta, s2 = mh
+            sigma = har.forecast_sigma(beta, s2, pred[t])
+            buf.append((sym, as_of, int(h), sigma, MODEL_VERSION, fit_date, rv_d, rv_w, rv_m, now))
+    if buf:
+        ch.insert("trading.rv_forecast", buf, column_names=_INSERT_COLS)
+    print(f"[daily] wrote {len(buf)} forecast rows (as of each name's latest complete day)")
+    return len(buf)

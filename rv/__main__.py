@@ -50,6 +50,7 @@ def main() -> None:
         sp.add_argument("--symbols", help="comma-separated names for a targeted rerun (default: all)")
     sub.add_parser("proof")
     sub.add_parser("forecast")
+    sub.add_parser("daily")  # the daily-job body: append yesterday, weekly refit, write forecasts
     args = p.parse_args()
 
     ch = get_ch_client()
@@ -77,6 +78,8 @@ def main() -> None:
         _run_proof(ch)
     if args.cmd in ("forecast", "all"):
         forecast.run(ch)
+    if args.cmd == "daily":
+        forecast.daily(ch)
 
 
 if __name__ == "__main__":
