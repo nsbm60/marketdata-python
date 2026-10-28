@@ -51,7 +51,8 @@ F_DELTA_PER_UNIT = "delta_per_unit"
 F_GAMMA_PER_UNIT = "gamma_per_unit"
 F_PREMIUM_PER_UNIT = "premium_per_unit"
 F_STRIKE = "strike"
-F_IV = "iv"  # option implied vol; the risk term's interim per-underlying ATM vol
+F_IV = "iv"  # option implied vol; required on option records (§7)
+F_RV_FORECAST = "rv_forecast"  # option HAR forecast σ at its sessions-to-expiry; required on options (§7)
 F_DAYS_TO_EXPIRY = "days_to_expiry"
 
 # Decision variable `type` enum values
@@ -64,6 +65,7 @@ F_DELTA_TARGET_PCT = "delta_target_pct"        # dollar delta as % of net liq
 F_DELTA_TOLERANCE_PCT = "delta_tolerance_pct"  # band half-width, same unit
 F_MAX_POSITIONS = "max_positions"
 F_TRADEABLE = "tradeable"
+F_SIGMA_RV = "sigma_rv"  # 5-session HAR forecast σ per underlying — the risk term's vol (§7)
 
 # Policy field names
 F_BP_LIMIT_PCT = "bp_limit_pct"
@@ -97,6 +99,7 @@ F_OBJECTIVE_CONTRIBUTION = "objective_contribution"
 # Objective contribution component keys
 OC_TOTAL = "total"
 OC_THETA = "theta"
+OC_EDGE = "edge"  # theta × (1 − (rv_forecast ÷ iv)²), the maximize term's per-unit value (§7)
 OC_EXEC_COST = "exec_cost"
 OC_DELTA_CEILING = "delta_ceiling"
 OC_RISK = "risk"  # was OC_GAMMA; dollar P&L-variance risk term (2026-10-23)
@@ -134,4 +137,4 @@ BCT_BP_LIMIT = "bp_limit"
 BCT_DELTA_TARGET = "delta_target"
 
 # Diagnostic fields echoed from request to response recommendations
-DIAGNOSTIC_FIELDS = ("strike", "expiry", "days_to_expiry", "iv")
+DIAGNOSTIC_FIELDS = ("strike", "expiry", "days_to_expiry", "iv", "rv_forecast")

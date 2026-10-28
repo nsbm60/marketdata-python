@@ -3,7 +3,7 @@
   "request_id": "golden-run-1",
   "policy_version": 2,
   "request_timestamp": "2026-05-12T14:22:37Z",
-  "response_timestamp": "2026-10-25T22:30:24.917171+00:00",
+  "response_timestamp": "2026-10-28T15:19:30.555938+00:00",
   "status": "optimal",
   "action": "trade",
   "recommendations": [
@@ -16,16 +16,18 @@
       "target_quantity": 0,
       "optimal_quantity": 0,
       "objective_contribution": {
-        "total": -0.0,
+        "total": 0.0,
         "theta": -0.0,
+        "edge": -0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": -0.0
+        "risk": 0.0
       },
-      "strike": 215.0,
+      "strike": 215,
       "expiry": "2026-05-15",
       "days_to_expiry": 3.2342939814814815,
-      "iv": 0.319
+      "iv": 0.319,
+      "rv_forecast": 0.3
     },
     {
       "id": "NVDA260515P00215000-short",
@@ -33,19 +35,21 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 2,
-      "target_quantity": 0,
-      "optimal_quantity": 0,
+      "target_quantity": 2,
+      "optimal_quantity": 2,
       "objective_contribution": {
-        "total": -10.0,
-        "theta": 0.0,
-        "exec_cost": -10.0,
+        "total": 9.305629618014688,
+        "theta": 80.85734953703704,
+        "edge": 9.345066262174058,
+        "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": -0.0
+        "risk": -0.039436644159370406
       },
-      "strike": 215.0,
+      "strike": 215,
       "expiry": "2026-05-15",
       "days_to_expiry": 3.2342939814814815,
-      "iv": 0.319
+      "iv": 0.319,
+      "rv_forecast": 0.3
     },
     {
       "id": "MU260512C00120000-long",
@@ -53,19 +57,21 @@
       "type": "option",
       "direction": "long",
       "current_quantity": 0,
-      "target_quantity": 52,
-      "optimal_quantity": 52,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": -470.5487895098531,
-        "theta": -365.49861111111113,
-        "exec_cost": -104.0,
+        "total": -0.0,
+        "theta": -0.0,
+        "edge": -0.0,
+        "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": -1.0501783987420135
+        "risk": -0.0
       },
-      "strike": 120.0,
+      "strike": 120,
       "expiry": "2026-05-12",
       "days_to_expiry": 0.23429398148148148,
-      "iv": 0.41
+      "iv": 0.41,
+      "rv_forecast": 0.38
     },
     {
       "id": "MU260512C00120000-short",
@@ -78,14 +84,16 @@
       "objective_contribution": {
         "total": 0.0,
         "theta": 0.0,
+        "edge": 0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": 0.0
+        "risk": -0.0
       },
-      "strike": 120.0,
+      "strike": 120,
       "expiry": "2026-05-12",
       "days_to_expiry": 0.23429398148148148,
-      "iv": 0.41
+      "iv": 0.41,
+      "rv_forecast": 0.38
     },
     {
       "id": "MU260529C00125000-long",
@@ -96,16 +104,18 @@
       "target_quantity": 0,
       "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 0.0,
+        "total": -0.0,
         "theta": -0.0,
+        "edge": -0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": 0.0
+        "risk": -0.0
       },
-      "strike": 125.0,
+      "strike": 125,
       "expiry": "2026-05-29",
       "days_to_expiry": 17.234293981481482,
-      "iv": 0.4
+      "iv": 0.4,
+      "rv_forecast": 0.37
     },
     {
       "id": "MU260529C00125000-short",
@@ -113,19 +123,21 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 0,
-      "target_quantity": 59,
-      "optimal_quantity": 59,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 1503.315444326307,
-        "theta": 1799.5,
-        "exec_cost": -295.0,
+        "total": 0.0,
+        "theta": 0.0,
+        "edge": 0.0,
+        "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": -1.184555673693103
+        "risk": -0.0
       },
-      "strike": 125.0,
+      "strike": 125,
       "expiry": "2026-05-29",
       "days_to_expiry": 17.234293981481482,
-      "iv": 0.4
+      "iv": 0.4,
+      "rv_forecast": 0.37
     },
     {
       "id": "NVDA-equity-long",
@@ -138,6 +150,7 @@
       "objective_contribution": {
         "total": -1.0,
         "theta": 0.0,
+        "edge": 0.0,
         "exec_cost": -1.0,
         "delta_ceiling": -0.0,
         "risk": -0.0
@@ -149,12 +162,13 @@
       "type": "equity",
       "direction": "short",
       "current_quantity": 0,
-      "target_quantity": 0,
-      "optimal_quantity": 0,
+      "target_quantity": 42,
+      "optimal_quantity": 42,
       "objective_contribution": {
-        "total": 0.0,
+        "total": -0.42,
         "theta": 0.0,
-        "exec_cost": -0.0,
+        "edge": 0.0,
+        "exec_cost": -0.42,
         "delta_ceiling": -0.0,
         "risk": -0.0
       }
@@ -165,12 +179,13 @@
       "type": "equity",
       "direction": "long",
       "current_quantity": 0,
-      "target_quantity": 11,
-      "optimal_quantity": 11,
+      "target_quantity": 0,
+      "optimal_quantity": 0,
       "objective_contribution": {
-        "total": -0.22,
+        "total": 0.0,
         "theta": 0.0,
-        "exec_cost": -0.22,
+        "edge": 0.0,
+        "exec_cost": -0.0,
         "delta_ceiling": -0.0,
         "risk": -0.0
       }
@@ -186,6 +201,7 @@
       "objective_contribution": {
         "total": 0.0,
         "theta": 0.0,
+        "edge": 0.0,
         "exec_cost": -0.0,
         "delta_ceiling": -0.0,
         "risk": -0.0
@@ -197,19 +213,21 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 1,
-      "target_quantity": 0,
-      "optimal_quantity": 0,
+      "target_quantity": 1,
+      "optimal_quantity": 1,
       "objective_contribution": {
-        "total": -5.000000000000004,
-        "theta": 0.0,
-        "exec_cost": -5.000000000000004,
+        "total": 6.854764799655543,
+        "theta": 25.874351851851852,
+        "edge": 6.864623960695385,
+        "exec_cost": -0.0,
         "delta_ceiling": -0.0,
-        "risk": -0.0
+        "risk": -0.009859161039842601
       },
-      "strike": 200.0,
+      "strike": 200,
       "expiry": "2026-05-15",
       "days_to_expiry": 3.2342939814814815,
-      "iv": 0.35
+      "iv": 0.35,
+      "rv_forecast": 0.3
     },
     {
       "id": "TSLA260515P00250000-short",
@@ -217,30 +235,32 @@
       "type": "option",
       "direction": "short",
       "current_quantity": 2,
-      "target_quantity": 0,
-      "optimal_quantity": 0,
+      "target_quantity": 1,
+      "optimal_quantity": 1,
       "objective_contribution": {
-        "total": -10.000000000000009,
-        "theta": 0.0,
-        "exec_cost": -10.000000000000009,
+        "total": -3.4606955687250935,
+        "theta": 27.168069444444445,
+        "edge": 1.559558327049355,
+        "exec_cost": -5.000000000000004,
         "delta_ceiling": -0.0,
-        "risk": -0.0
+        "risk": -0.020253895774443725
       },
-      "strike": 250.0,
+      "strike": 250,
       "expiry": "2026-05-15",
       "days_to_expiry": 3.2342939814814815,
-      "iv": 0.412
+      "iv": 0.412,
+      "rv_forecast": 0.4
     }
   ],
   "score": {
-    "objective_value": 1006.5466548164538,
-    "optimal_objective_value": 1006.5466548164538,
-    "current_objective_value": 160.9136351787305,
+    "objective_value": 11.279698848945138,
+    "optimal_objective_value": 11.279698848945138,
+    "current_objective_value": 19.198495488671167,
     "components": {
-      "theta_total": 1434.0013888888889,
-      "exec_cost_total": -425.22,
+      "theta_total": 133.89977083333335,
+      "exec_cost_total": -6.420000000000004,
       "delta_ceiling_penalty": 0.0,
-      "risk_penalty": -2.2347340724351166
+      "risk_penalty": -0.06954970097365673
     }
   },
   "binding_constraints": [],
@@ -248,7 +268,7 @@
     "solver_name": "clarabel",
     "solver_status": "optimal",
     "iterations": 13,
-    "wall_clock_seconds": 0.0176,
+    "wall_clock_seconds": 0.0399,
     "problem_size": {
       "decision_variables": 12,
       "constraints": 9

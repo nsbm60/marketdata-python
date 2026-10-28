@@ -97,11 +97,13 @@ from wire_format import (
     F_GAMMA_PER_UNIT,
     F_STRIKE,
     F_IV,
+    F_RV_FORECAST,
     F_SPOT,
     F_DELTA_TARGET_PCT,
     F_DELTA_TOLERANCE_PCT,
     F_MAX_POSITIONS,
     F_TRADEABLE,
+    F_SIGMA_RV,
     F_BP_LIMIT_PCT,
     F_DELTA_CEILING_THRESHOLD,
     F_LAMBDA_DELTA_CEILING,
@@ -127,6 +129,7 @@ from wire_format import (
     F_OBJECTIVE_CONTRIBUTION,
     OC_TOTAL,
     OC_THETA,
+    OC_EDGE,
     OC_EXEC_COST,
     OC_DELTA_CEILING,
     OC_RISK,
@@ -388,6 +391,7 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
 
     n = len(dvs)
     theta = np.empty(n)
+    edge = np.empty(n)
     exec_cost = np.empty(n)
     delta = np.empty(n)
     gamma = np.empty(n)
@@ -410,6 +414,18 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         h[i] = _horizon(dv, horizon)
         closeable[i] = bool(dv.get(F_CLOSEABLE_ONLY))
         is_equity[i] = dv[F_TYPE] == TYPE_EQUITY
+        # Edge replaces theta in the maximize term (§7): edge = theta × (1 − (rv_forecast/iv)²).
+        # iv and rv_forecast are required on option records; equity has theta 0, so edge 0.
+        if dv[F_TYPE] == TYPE_OPTION:
+            if F_IV not in dv or F_RV_FORECAST not in dv:
+                raise ValueError(f"{dv[F_ID]}: option record requires {F_IV} and {F_RV_FORECAST} (§7)")
+            iv_i = float(dv[F_IV])
+            rv_i = float(dv[F_RV_FORECAST])
+            if not iv_i > 0:
+                raise ValueError(f"{dv[F_ID]}: iv must be positive, got {iv_i!r}")
+            edge[i] = theta[i] * (1.0 - (rv_i / iv_i) ** 2)
+        else:
+            edge[i] = theta[i]
 
     thr = float(policy[F_DELTA_CEILING_THRESHOLD])
     delta_pen = np.maximum(0.0, np.abs(delta / DELTA_RAW_DIVISOR) - thr)
@@ -434,18 +450,13 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
             raise ValueError(f"{u}: delta_tolerance_pct must be positive, got {pu[u][2]!r}")
         tradeable[u] = bool(rec[F_TRADEABLE])
 
-    # Interim per-underlying ATM IV σ_u for the risk term: the IV of the nearest-the-money
-    # option candidate (stands in for the per-(underlying, expiry) RV forecast, §7). A name with
-    # no option candidates has no σ_u, but its gamma is 0 so its risk is 0 regardless → σ_u = 0.
-    atm_iv = {}
-    for u, idx in groups.items():
-        opts = [i for i in idx if dvs[i][F_TYPE] == TYPE_OPTION]
-        if opts:
-            spot_u = pu[u][0]
-            nearest = min(opts, key=lambda i: abs(float(dvs[i][F_STRIKE]) - spot_u))
-            atm_iv[u] = float(dvs[nearest][F_IV])
-        else:
-            atm_iv[u] = 0.0
+    # Per-underlying risk-term vol σ_u: the 5-session HAR forecast sent on each per_underlying
+    # record (sigma_rv, §7), replacing the interim nearest-the-money option IV.
+    sigma_rv = {}
+    for u in groups:
+        if F_SIGMA_RV not in pu_map[u]:
+            raise ValueError(f"{u}: per_underlying record requires {F_SIGMA_RV} (§7)")
+        sigma_rv[u] = float(pu_map[u][F_SIGMA_RV])
 
     # Equity legs per underlying: the stock that repairs a rounding-broken band.
     # Equity delta is ±1 per share by definition (pc-optimization-spec-draft.md).
@@ -483,16 +494,16 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     # horizon slices this gives R_u = 2δσ_u⁴ Σ_k Δt_k (Σ ½γ_i S_u² q_i)² per underlying, with Δt_k
     # in years (h passed in years). Equity γ_i = 0 → c_i = 0.
     spot_vec = np.array([pu[u][0] for u in und])
-    iv_vec = np.array([atm_iv[u] for u in und])
-    risk_coef = np.sqrt(2.0 * delta_years) * (iv_vec ** 2) * 0.5 * gamma * (spot_vec ** 2)
+    sigma_vec = np.array([sigma_rv[u] for u in und])
+    risk_coef = np.sqrt(2.0 * delta_years) * (sigma_vec ** 2) * 0.5 * gamma * (spot_vec ** 2)
     h_years = h / CALENDAR_DAYS_PER_YEAR
 
     return {
-        "theta": theta, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
+        "theta": theta, "edge": edge, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
         "margin": margin, "current_qty": current_qty, "delta_pen": delta_pen,
         "h": h, "closeable": closeable, "is_equity": is_equity, "und": und,
         "und_names": und_names, "tradeable": tradeable, "equity_legs": equity_legs,
-        "pairs": pairs, "atm_iv": atm_iv,
+        "pairs": pairs, "sigma_rv": sigma_rv,
         "lam_spread": float(policy[F_LAMBDA_SPREAD]),
         "lam_delta": float(policy[F_LAMBDA_DELTA_CEILING]),
         "risk_aversion": float(policy[F_RISK_AVERSION]),
@@ -564,7 +575,7 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
 
     # Objective over the holding horizon (§3.2): theta × h, exec cost on the
     # trade (one-off), delta ceiling unscaled, gamma over overlapping horizons.
-    obj = (bundle["theta"] * bundle["h"]) @ target
+    obj = (bundle["edge"] * bundle["h"]) @ target   # edge = theta × (1 − (rv/iv)²), §7
     obj = obj - bundle["lam_spread"] * (bundle["exec_cost"] @ cp.abs(target - current))
     obj = obj - bundle["lam_delta"] * (bundle["delta_pen"] @ target)
     # Dollar P&L-variance risk term: (risk_aversion/2)·Σ_U R_U / net_liq = that scalar · ‖M′q‖²
@@ -722,17 +733,19 @@ def _compute_contributions(bundle: dict, q) -> dict:
     Recomputed from the q passed in, serving the ranking pass, the reporting pass and the current book.
     """
     q = np.asarray(q, dtype=float)
-    theta_c = bundle["theta"] * bundle["h"] * q
+    theta_c = bundle["theta"] * bundle["h"] * q   # raw theta, reported alongside edge (§7)
+    edge_c = bundle["edge"] * bundle["h"] * q      # the maximize term
     exec_c = -bundle["lam_spread"] * bundle["exec_cost"] * np.abs(q - bundle["current_qty"])
     dceil_c = -bundle["lam_delta"] * bundle["delta_pen"] * q
     m = bundle["G_risk_slices"]
     risk_c = -(bundle["risk_aversion"] / (2.0 * bundle["net_liq"])) * q * (m.T @ (m @ q))
     return {
         OC_THETA: theta_c,
+        OC_EDGE: edge_c,
         OC_EXEC_COST: exec_c,
         OC_DELTA_CEILING: dceil_c,
         OC_RISK: risk_c,
-        OC_TOTAL: theta_c + exec_c + dceil_c + risk_c,
+        OC_TOTAL: edge_c + exec_c + dceil_c + risk_c,
     }
 
 
@@ -956,6 +969,7 @@ def _build_recommendations(dvs: list, target_q: list, optimal_q: list, contribs:
             F_OBJECTIVE_CONTRIBUTION: {
                 OC_TOTAL: float(contribs[OC_TOTAL][i]),
                 OC_THETA: float(contribs[OC_THETA][i]),
+                OC_EDGE: float(contribs[OC_EDGE][i]),
                 OC_EXEC_COST: float(contribs[OC_EXEC_COST][i]),
                 OC_DELTA_CEILING: float(contribs[OC_DELTA_CEILING][i]),
                 OC_RISK: float(contribs[OC_RISK][i]),
