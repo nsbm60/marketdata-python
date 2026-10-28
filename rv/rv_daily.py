@@ -100,8 +100,9 @@ withprev AS (
     FROM merged m
     LEFT JOIN ledger_days ld ON m.symbol = ld.symbol AND m.trading_date = ld.trading_date
 ),
-div AS (
+divs AS (
     -- cash dividends to subtract from the prior close on the ex-date (USD only, regular + special).
+    -- Named `divs`, not `div` — `div` is a ClickHouse built-in (integer division).
     SELECT symbol, ex_date, sum(amount) AS div_usd
     FROM trading.dividend
     WHERE currency = 'USD'
@@ -109,12 +110,16 @@ div AS (
     GROUP BY symbol, ex_date
 ),
 withsplit AS (
-    SELECT w.*, s.ratio AS split_ratio, d.div_usd AS div_usd
+    SELECT w.symbol AS symbol, w.trading_date AS trading_date, w.n_bars AS n_bars,
+           w.expected_bars AS expected_bars, w.day_open AS day_open, w.day_close AS day_close,
+           w.grid_px AS grid_px, w.prev_close AS prev_close,
+           w.prev_complete_date AS prev_complete_date, w.prev_trading_day AS prev_trading_day,
+           s.ratio AS split_ratio, d.div_usd AS div_usd
     FROM withprev w
     LEFT JOIN (SELECT symbol, execution_date, any(ratio) AS ratio
                FROM trading.split_effective GROUP BY symbol, execution_date) s
       ON w.symbol = s.symbol AND w.trading_date = s.execution_date
-    LEFT JOIN div d ON w.symbol = d.symbol AND w.trading_date = d.ex_date
+    LEFT JOIN divs d ON w.symbol = d.symbol AND w.trading_date = d.ex_date
 )
 """
 
