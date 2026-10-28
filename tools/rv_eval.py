@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ml.shared.clickhouse import get_ch_client  # noqa: E402
 from rv import HORIZONS, MODEL_VERSION  # noqa: E402
 from rv import har  # noqa: E402
+from rv.forecast import har_set_filter  # noqa: E402
 
 
 def _qlike(realized: np.ndarray, forecast: np.ndarray) -> np.ndarray:
@@ -46,7 +47,7 @@ def main() -> None:
     # rv_daily series per name, once.
     rows = ch.query(
         "SELECT symbol, trading_date, rv_total FROM trading.rv_daily FINAL "
-        "WHERE rv_total > 0 AND isFinite(rv_total) ORDER BY symbol, trading_date"
+        f"WHERE rv_total > 0 AND isFinite(rv_total){har_set_filter(ch)} ORDER BY symbol, trading_date"
     ).result_rows
     series: dict[str, tuple[dict, dict, dict]] = {}
     acc: dict[str, list] = {}

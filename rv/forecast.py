@@ -30,11 +30,25 @@ _INSERT_COLS = [
 ]
 
 
+def har_set_filter(ch) -> str:
+    """` AND symbol IN (...)` for the latest trading.har_name_set snapshot, or '' (all names, with a
+    warning) when the set hasn't been persisted yet. The Scala bar-load job writes it daily."""
+    names = [r[0] for r in ch.query(
+        "SELECT symbol FROM trading.har_name_set FINAL "
+        "WHERE as_of_date = (SELECT max(as_of_date) FROM trading.har_name_set)"
+    ).result_rows]
+    if not names:
+        log.warning("har_name_set is empty — covering ALL rv_daily names (run the bar-load job to persist the set)")
+        return ""
+    quoted = ", ".join("'" + s.replace("'", "") + "'" for s in names)
+    return f" AND symbol IN ({quoted})"
+
+
 def load_series(ch) -> dict[str, tuple[list[dt.date], np.ndarray]]:
-    """Per name, the ordered (dates, rv_total) over complete days with positive variance."""
+    """Per name in the current HAR set, the ordered (dates, rv_total) over complete, positive days."""
     rows = ch.query(
         "SELECT symbol, trading_date, rv_total FROM trading.rv_daily FINAL "
-        "WHERE rv_total > 0 AND isFinite(rv_total) ORDER BY symbol, trading_date"
+        f"WHERE rv_total > 0 AND isFinite(rv_total){har_set_filter(ch)} ORDER BY symbol, trading_date"
     ).result_rows
     out: dict[str, tuple[list[dt.date], list[float]]] = {}
     for sym, d, rv in rows:
