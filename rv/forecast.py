@@ -34,7 +34,7 @@ def load_series(ch) -> dict[str, tuple[list[dt.date], np.ndarray]]:
     """Per name, the ordered (dates, rv_total) over complete days with positive variance."""
     rows = ch.query(
         "SELECT symbol, trading_date, rv_total FROM trading.rv_daily FINAL "
-        "WHERE rv_total > 0 ORDER BY symbol, trading_date"
+        "WHERE rv_total > 0 AND isFinite(rv_total) ORDER BY symbol, trading_date"
     ).result_rows
     out: dict[str, tuple[list[dt.date], list[float]]] = {}
     for sym, d, rv in rows:

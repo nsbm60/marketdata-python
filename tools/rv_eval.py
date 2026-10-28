@@ -46,7 +46,7 @@ def main() -> None:
     # rv_daily series per name, once.
     rows = ch.query(
         "SELECT symbol, trading_date, rv_total FROM trading.rv_daily FINAL "
-        "WHERE rv_total > 0 ORDER BY symbol, trading_date"
+        "WHERE rv_total > 0 AND isFinite(rv_total) ORDER BY symbol, trading_date"
     ).result_rows
     series: dict[str, tuple[dict, dict, dict]] = {}
     acc: dict[str, list] = {}
@@ -107,7 +107,9 @@ def main() -> None:
         p = pooled[h]
         n = len(p["har_q"])
         if n == 0:
-            print(f"{h:>7d} {0:>9d}  (no scored forecasts)")
+            # Nothing to score is a failure, not a pass — at any horizon.
+            failures.append(h)
+            print(f"{h:>7d} {0:>9d}  NO SCORED FORECASTS (gate fails)")
             continue
         hq, bq = float(np.mean(p["har_q"])), float(np.mean(p["base_q"]))
         hse, bse = float(np.mean(p["har_se"])), float(np.mean(p["base_se"]))
@@ -129,8 +131,8 @@ def main() -> None:
 
     print()
     if failures:
-        print(f"GATE FAILED: HAR does not beat the trailing-22 baseline on pooled QLIKE at horizon(s): "
-              f"{', '.join(map(str, failures))}")
+        print(f"GATE FAILED at horizon(s): {', '.join(map(str, sorted(set(failures))))} "
+              f"(HAR did not beat the trailing-22 baseline on pooled QLIKE, or nothing was scored).")
         sys.exit(1)
     print("GATE PASSED: HAR beats the trailing-22 baseline on pooled QLIKE at every horizon ≥ 5.")
 

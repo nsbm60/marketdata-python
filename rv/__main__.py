@@ -59,9 +59,13 @@ def main() -> None:
         print(f"[backfill] rv_daily {start} .. {end}")
         total = rv_daily.backfill(ch, start, end)
         dropped = rv_daily.gap_dropped_count(ch)
+        st = rv_daily.stats(ch)
         print(f"[backfill] {total:,} rv_daily rows")
         print(f"[backfill] dropped {dropped:,} complete days whose previous complete day isn't the "
               f"previous trading day (overnight would span a gap)")
+        print(f"[backfill] split_adjusted=1 on {st['split_adjusted']:,} rows "
+              f"({st['splits_in_table']:,} splits on these names since 2016)")
+        print(f"[backfill] rv_total  min={st['rv_min']:.3e}  median={st['rv_median']:.3e}  max={st['rv_max']:.3e}")
     if args.cmd in ("proof", "all"):
         _run_proof(ch)
     if args.cmd in ("forecast", "all"):

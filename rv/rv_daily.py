@@ -131,16 +131,45 @@ FROM withsplit
 WHERE trading_date >= toDate('{ms.isoformat()}')
   AND prev_close > 0                              -- a previous complete session exists
   AND prev_complete_date = prev_trading_day       -- and it is the immediately previous trading day
+SETTINGS join_use_nulls = 1
 """
         ch.command(sql)
         n = ch.query(
-            f"SELECT count() FROM trading.rv_daily WHERE trading_date >= '{ms.isoformat()}' "
+            f"SELECT count() FROM trading.rv_daily FINAL WHERE trading_date >= '{ms.isoformat()}' "
             f"AND trading_date <= '{me.isoformat()}'"
         ).result_rows[0][0]
+        # Refuse non-finite or non-positive variance — fail fast, by name and date, never persist it.
+        bad = ch.query(
+            f"SELECT symbol, toString(trading_date), rv_total FROM trading.rv_daily FINAL "
+            f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}' "
+            f"AND (NOT isFinite(rv_total) OR rv_total <= 0) ORDER BY symbol, trading_date LIMIT 100"
+        ).result_rows
+        if bad:
+            lines = "\n".join(f"    {s:8s} {d}  rv_total={rv}" for s, d, rv in bad)
+            raise RuntimeError(
+                f"rv_daily produced non-finite/non-positive rv_total for {ms}..{me} "
+                f"({len(bad)}+ rows shown):\n{lines}"
+            )
         log.info("rv_daily %s..%s: %d rows", ms, me, n)
         print(f"[rv_daily] {ms} .. {me}: {n:,} rows")
         total += n
     return total
+
+
+def stats(ch) -> dict:
+    """Post-backfill summary: split-adjusted rows vs splits on these names, and rv_total spread."""
+    row = ch.query(
+        "SELECT count(), min(rv_total), median(rv_total), max(rv_total), sum(split_adjusted) "
+        "FROM trading.rv_daily FINAL WHERE source = 'har-rv'"
+    ).result_rows[0]
+    splits = ch.query(
+        "SELECT count() FROM (SELECT DISTINCT symbol, execution_date FROM trading.split "
+        "WHERE execution_date >= '2016-01-01' AND symbol IN (SELECT DISTINCT symbol FROM trading.rv_daily))"
+    ).result_rows[0][0]
+    return {
+        "rows": row[0], "rv_min": row[1], "rv_median": row[2], "rv_max": row[3],
+        "split_adjusted": row[4], "splits_in_table": splits,
+    }
 
 
 def gap_dropped_count(ch) -> int:
