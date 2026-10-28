@@ -100,12 +100,21 @@ withprev AS (
     FROM merged m
     LEFT JOIN ledger_days ld ON m.symbol = ld.symbol AND m.trading_date = ld.trading_date
 ),
+div AS (
+    -- cash dividends to subtract from the prior close on the ex-date (USD only, regular + special).
+    SELECT symbol, ex_date, sum(amount) AS div_usd
+    FROM trading.dividend
+    WHERE currency = 'USD'
+      AND ex_date >= toDate('{lo}') AND ex_date <= toDate('{hi}'){sym}
+    GROUP BY symbol, ex_date
+),
 withsplit AS (
-    SELECT w.*, s.ratio AS split_ratio
+    SELECT w.*, s.ratio AS split_ratio, d.div_usd AS div_usd
     FROM withprev w
     LEFT JOIN (SELECT symbol, execution_date, any(ratio) AS ratio
-               FROM trading.split GROUP BY symbol, execution_date) s
+               FROM trading.split_effective GROUP BY symbol, execution_date) s
       ON w.symbol = s.symbol AND w.trading_date = s.execution_date
+    LEFT JOIN div d ON w.symbol = d.symbol AND w.trading_date = d.ex_date
 )
 """
 
@@ -132,7 +141,7 @@ INSERT INTO trading.rv_daily
 SELECT
     symbol, trading_date,
     arraySum(arrayMap(x -> x * x, arrayDifference(arrayMap(p -> log(p), grid_px)))) AS rv_intraday,
-    pow(log(day_open / (prev_close / coalesce(split_ratio, 1.0))), 2) AS rv_overnight,
+    pow(log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0))), 2) AS rv_overnight,
     rv_intraday + rv_overnight AS rv_total,
     n_bars, expected_bars,
     toUInt8(split_ratio IS NOT NULL) AS split_adjusted,
@@ -185,7 +194,7 @@ def stats(ch) -> dict:
         "FROM trading.rv_daily FINAL WHERE source = 'har-rv'"
     ).result_rows[0]
     splits = ch.query(
-        "SELECT count() FROM (SELECT DISTINCT symbol, execution_date FROM trading.split "
+        "SELECT count() FROM (SELECT DISTINCT symbol, execution_date FROM trading.split_effective "
         "WHERE execution_date >= '2016-01-01' AND symbol IN (SELECT DISTINCT symbol FROM trading.rv_daily))"
     ).result_rows[0][0]
     return {

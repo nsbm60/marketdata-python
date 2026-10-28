@@ -238,7 +238,7 @@ def _parse_tables(raw: Any) -> ArchiveTableNames:
     m = _require_mapping(raw, "tables")
     return ArchiveTableNames(
         option_trade=str(m.get("option_trade", "trading.option_trade")),
-        split=str(m.get("split", "trading.split")),
+        split=str(m.get("split", "trading.split_effective")),
         universe_ranking=str(
             m.get("universe_ranking", "trading.option_universe_ranking")
         ),
