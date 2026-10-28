@@ -147,7 +147,8 @@ def run(ch, batch_rows: int = 200_000) -> int:
                 continue
             fd = dt.date.fromordinal(model_fit_ords[j])
             per_h = models[fd]
-            rv_d, rv_w, rv_m = float(pred[t, 0]), float(pred[t, 1]), float(pred[t, 2])
+            # Store levels (not logs) to match the column names; pred holds logs, so exp them back.
+            rv_d, rv_w, rv_m = float(np.exp(pred[t, 0])), float(np.exp(pred[t, 1])), float(np.exp(pred[t, 2]))
             for h in HORIZONS:
                 mh = per_h.get(h)
                 if mh is None:

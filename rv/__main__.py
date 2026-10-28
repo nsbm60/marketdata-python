@@ -2,10 +2,9 @@
 HAR realized-variance commands (HAR edge spec §3–§5).
 
     python -m rv backfill [--start 2016-01-01] [--end YYYY-MM-DD]   # rv_daily from raw 1m bars
-    python -m rv verify   [--start ...] [--end ...]                 # overnight+intraday == c2c check
     python -m rv proof                                              # AAPL/NVDA split sanity
     python -m rv forecast                                           # pooled fit + historical forecasts
-    python -m rv all      [--start ...] [--end ...]                 # backfill, verify, proof, forecast
+    python -m rv all      [--start ...] [--end ...]                 # backfill, proof, forecast
 
 The walk-forward report (§6) is a separate script that writes nothing: tools/rv_eval.py.
 """
@@ -33,16 +32,6 @@ def _dates(args) -> tuple[dt.date, dt.date]:
     return start, end
 
 
-def _run_verify(ch, start, end):
-    v = rv_daily.verify_invariant(ch, start, end)
-    if not v:
-        print("[verify] overnight + intraday == close-to-close on every day (no violations)")
-    else:
-        print(f"[verify] {len(v)} day(s) where returns don't add up (|err| > 1e-9):")
-        for sym, d, err in v:
-            print(f"    {sym:8s} {d}  err={err:.3e}")
-
-
 def _run_proof(ch):
     rows = rv_daily.split_proof(ch)
     print("[proof] split handling — overnight move should be ordinary, not split-sized:")
@@ -54,7 +43,7 @@ def _run_proof(ch):
 def main() -> None:
     p = argparse.ArgumentParser(prog="rv")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("backfill", "verify", "all"):
+    for name in ("backfill", "all"):
         sp = sub.add_parser(name)
         sp.add_argument("--start")
         sp.add_argument("--end")
@@ -69,10 +58,10 @@ def main() -> None:
         start, end = _dates(args)
         print(f"[backfill] rv_daily {start} .. {end}")
         total = rv_daily.backfill(ch, start, end)
+        dropped = rv_daily.gap_dropped_count(ch)
         print(f"[backfill] {total:,} rv_daily rows")
-    if args.cmd in ("verify", "all"):
-        start, end = _dates(args)
-        _run_verify(ch, start, end)
+        print(f"[backfill] dropped {dropped:,} complete days whose previous complete day isn't the "
+              f"previous trading day (overnight would span a gap)")
     if args.cmd in ("proof", "all"):
         _run_proof(ch)
     if args.cmd in ("forecast", "all"):

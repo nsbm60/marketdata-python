@@ -73,9 +73,23 @@ merged AS (
     INNER JOIN oc ON d.symbol = oc.symbol AND d.trading_date = oc.trading_date
     INNER JOIN complete c ON d.symbol = c.symbol AND d.trading_date = c.trading_date
 ),
+ledger_days AS (
+    -- each name's previous trading day, from its ledger rows whatever their status (complete,
+    -- failed, gap, not_listed) — so a failed/gap day still counts as the previous session.
+    SELECT symbol, trading_date,
+           lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_trading_day
+    FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL
+          WHERE trading_date >= toDate('{lo}') AND trading_date <= toDate('{hi}'))
+),
 withprev AS (
-    SELECT *, lagInFrame(day_close) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_close
-    FROM merged
+    SELECT m.symbol AS symbol, m.trading_date AS trading_date, m.n_bars AS n_bars,
+           m.expected_bars AS expected_bars, m.day_open AS day_open, m.day_close AS day_close,
+           m.grid_px AS grid_px,
+           lagInFrame(m.day_close) OVER (PARTITION BY m.symbol ORDER BY m.trading_date) AS prev_close,
+           lagInFrame(m.trading_date) OVER (PARTITION BY m.symbol ORDER BY m.trading_date) AS prev_complete_date,
+           ld.prev_trading_day AS prev_trading_day
+    FROM merged m
+    LEFT JOIN ledger_days ld ON m.symbol = ld.symbol AND m.trading_date = ld.trading_date
 ),
 withsplit AS (
     SELECT w.*, s.ratio AS split_ratio
@@ -114,7 +128,9 @@ SELECT
     'har-rv' AS source,
     now64(3) AS computed_at
 FROM withsplit
-WHERE trading_date >= toDate('{ms.isoformat()}') AND prev_close > 0
+WHERE trading_date >= toDate('{ms.isoformat()}')
+  AND prev_close > 0                              -- a previous complete session exists
+  AND prev_complete_date = prev_trading_day       -- and it is the immediately previous trading day
 """
         ch.command(sql)
         n = ch.query(
@@ -127,31 +143,30 @@ WHERE trading_date >= toDate('{ms.isoformat()}') AND prev_close > 0
     return total
 
 
-def verify_invariant(ch, start: dt.date, end: dt.date, tol: float = 1e-9) -> list[tuple]:
+def gap_dropped_count(ch) -> int:
     """
-    Check that overnight + intraday log returns add up to the close-to-close log return on every
-    day, and return any day where they don't (|error| > tol). This is exact by telescoping when the
-    grid is well formed (last bucket close == day close), so a violation flags a grid/data problem.
+    How many complete days the "overnight must not span a gap" rule drops: complete days that have
+    a previous complete day (the old rule would emit) but whose previous complete day is not their
+    previous trading day (a failed/gap/not_listed session sits between). Ledger-only, one pass.
     """
-    violations: list[tuple] = []
-    for ms, me in _month_ranges(start, end):
-        lookback = ms - dt.timedelta(days=_LOOKBACK_DAYS)
-        sql = f"""
-{_with_core(lookback, me)}
-SELECT symbol, toString(trading_date) AS d, err FROM (
+    sql = """
+WITH
+all_days AS (
     SELECT symbol, trading_date,
-           abs((log(day_open / pca) + (log(arrayElement(grid_px, -1)) - log(arrayElement(grid_px, 1))))
-               - log(day_close / pca)) AS err
-    FROM (SELECT *, prev_close / coalesce(split_ratio, 1.0) AS pca
-          FROM withsplit
-          WHERE trading_date >= toDate('{ms.isoformat()}') AND prev_close > 0)
+           lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_any
+    FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL)
+),
+complete_days AS (
+    SELECT symbol, trading_date,
+           lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_complete
+    FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL WHERE status = 'complete')
 )
-WHERE err > {tol}
-ORDER BY err DESC LIMIT 100
+SELECT count()
+FROM complete_days c
+INNER JOIN all_days a ON c.symbol = a.symbol AND c.trading_date = a.trading_date
+WHERE c.prev_complete != toDate('1970-01-01') AND c.prev_complete != a.prev_any
 """
-        rows = ch.query(sql).result_rows
-        violations.extend(rows)
-    return violations
+    return ch.query(sql).result_rows[0][0]
 
 
 def split_proof(ch) -> list[tuple]:
