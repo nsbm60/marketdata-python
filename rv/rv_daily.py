@@ -236,16 +236,27 @@ def incremental(ch, symbols=None) -> int:
              lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_complete
            FROM (SELECT symbol, trading_date FROM trading.stock_bar_ledger FINAL
                  WHERE status = 'complete'{sym}))
-SELECT min(c.trading_date) FROM comp c
+SELECT minOrNull(c.trading_date) FROM comp c
 INNER JOIN allday a ON c.symbol = a.symbol AND c.trading_date = a.trading_date
 WHERE c.prev_complete != toDate('1970-01-01')   -- not a name's first-ever day (lagInFrame -> epoch)
   AND c.prev_complete = a.prev_any
   AND (c.symbol, c.trading_date) NOT IN
       (SELECT symbol, trading_date FROM trading.rv_daily FINAL WHERE source = 'har-rv'{sym})"""
     ).result_rows[0][0]
+    # minOrNull returns NULL (-> None) when no row matches, so an empty result never becomes a start.
+    # (Plain min() returns the Date epoch 1970-01-01 for an empty match, which walked the scan from
+    # 1970 through every empty month.) No computable missing day -> skip the rv step; forecast.daily
+    # goes straight on to the refit/forecast.
     if start is None:
-        print(f"[rv_daily] no missing computable days — current through {end}")
+        print(f"[rv_daily] no missing computable days — current through {end}; skipping to refit/forecast")
         return 0
+    # Belt and braces: an epoch (or older) date is never a real trading day. If one ever reaches here
+    # it means the missing-days query is broken — fail loudly rather than walk the scan from 1970.
+    if start <= dt.date(1970, 1, 1):
+        raise RuntimeError(
+            f"[rv_daily] start query produced a non-real date ({start}); refusing to start the scan "
+            f"from the epoch — the missing-days query is broken"
+        )
 
     print(f"[rv_daily] incremental {start} .. {end} (every complete ledger day with no rv_daily row)")
     extra = "AND has_rv IS NULL"
