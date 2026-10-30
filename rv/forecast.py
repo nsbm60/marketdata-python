@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import bisect
 import datetime as dt
+import hashlib
 import logging
 
 import numpy as np
@@ -264,4 +265,73 @@ def daily(ch) -> int:
     if buf:
         ch.insert("trading.rv_forecast", buf, column_names=_INSERT_COLS)
     print(f"[daily] wrote {len(buf)} forecast rows (as of each name's latest complete day)")
+
+    _sync_no_forecast_attention(ch, forecast_syms={row[0] for row in buf}, series=series)
     return len(buf)
+
+
+# ── attention items for har_name_set names that produced no forecast (surfaced, not only logged) ──
+
+def _har_name_set(ch) -> set[str]:
+    return {r[0] for r in ch.query(
+        "SELECT symbol FROM trading.har_name_set FINAL "
+        "WHERE as_of_date = (SELECT max(as_of_date) FROM trading.har_name_set)").result_rows}
+
+
+def _attention_raise(ch, kind: str, subject: str, symbol: str | None, detail: str) -> None:
+    """Mirror Scala AttentionItemRepository: item_id = sha1(kind|subject); never reopen a resolved
+    item; otherwise upsert an open row (now64 server-side, so the UTC epoch is correct)."""
+    item_id = hashlib.sha1(f"{kind}|{subject}".encode("utf-8")).hexdigest()
+    resolved = ch.query(
+        f"SELECT count() FROM trading.attention_item FINAL "
+        f"WHERE item_id='{item_id}' AND status='resolved'").result_rows[0][0]
+    if resolved:
+        return
+    symv = "NULL" if symbol is None else f"'{symbol}'"
+    ch.command(
+        "INSERT INTO trading.attention_item (item_id,kind,symbol,detail,raised_at,status,updated_at) "
+        f"VALUES ('{item_id}','{kind}',{symv},'{detail.replace(chr(39), chr(39) * 2)}', now64(3),'open', now64(3))")
+
+
+def _attention_resolve(ch, kind: str, subject: str, symbol: str | None) -> None:
+    """Resolve an open item (preserving its raised_at), e.g. a no_forecast item for a name that now
+    forecasts. No-op if there is no open row."""
+    item_id = hashlib.sha1(f"{kind}|{subject}".encode("utf-8")).hexdigest()
+    rows = ch.query(
+        f"SELECT detail, toUnixTimestamp64Milli(raised_at) FROM trading.attention_item FINAL "
+        f"WHERE item_id='{item_id}' AND status='open'").result_rows
+    if not rows:
+        return
+    detail, raised_ms = rows[0]
+    symv = "NULL" if symbol is None else f"'{symbol}'"
+    ch.command(
+        "INSERT INTO trading.attention_item (item_id,kind,symbol,detail,raised_at,status,updated_at) "
+        f"VALUES ('{item_id}','{kind}',{symv},'{detail.replace(chr(39), chr(39) * 2)}', "
+        f"fromUnixTimestamp64Milli({raised_ms}),'resolved', now64(3))")
+
+
+def _sync_no_forecast_attention(ch, forecast_syms: set[str], series: dict) -> None:
+    """A har_name_set name with no forecast is a data problem worth surfacing, not just logging. Raise
+    a `no_forecast` attention item for each such name (with its rv-session count — the §5 >=66 rule),
+    and resolve the item for any name that now forecasts again."""
+    try:
+        har = _har_name_set(ch)
+        sessions = {s: len(dates) for s, (dates, _) in series.items()}
+        missing = sorted(har - forecast_syms)
+        for sym in missing:
+            n = sessions.get(sym, 0)
+            detail = (f"{sym} is in har_name_set but has no rv_forecast — "
+                      + (f"only {n} rv sessions (< {MIN_SESSIONS} required)" if n > 0
+                         else "no rv_daily history (needs an rv backfill)"))
+            _attention_raise(ch, "no_forecast", f"no_forecast|{sym}", sym, detail)
+        # Self-clear: resolve the no_forecast item for any name that forecasts again.
+        open_nf = {r[0] for r in ch.query(
+            "SELECT symbol FROM trading.attention_item FINAL "
+            "WHERE kind='no_forecast' AND status='open'").result_rows}
+        for sym in open_nf & forecast_syms:
+            _attention_resolve(ch, "no_forecast", f"no_forecast|{sym}", sym)
+        if missing:
+            print(f"[daily] {len(missing)} har_name_set names have no forecast "
+                  f"(raised no_forecast attention items): {missing[:20]}")
+    except Exception as exc:  # noqa: BLE001 — attention bookkeeping must never fail the forecast job
+        log.warning("could not sync no_forecast attention items: %s", exc)
