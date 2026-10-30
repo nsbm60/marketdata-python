@@ -114,12 +114,15 @@ withsplit AS (
            w.expected_bars AS expected_bars, w.day_open AS day_open, w.day_close AS day_close,
            w.grid_px AS grid_px, w.prev_close AS prev_close,
            w.prev_complete_date AS prev_complete_date, w.prev_trading_day AS prev_trading_day,
-           s.ratio AS split_ratio, d.div_usd AS div_usd
+           s.ratio AS split_ratio, d.div_usd AS div_usd, rf.rv_floor AS rv_floor
     FROM withprev w
     LEFT JOIN (SELECT symbol, execution_date, any(ratio) AS ratio
                FROM trading.split_effective GROUP BY symbol, execution_date) s
       ON w.symbol = s.symbol AND w.trading_date = s.execution_date
     LEFT JOIN divs d ON w.symbol = d.symbol AND w.trading_date = d.ex_date
+    LEFT JOIN (SELECT symbol, max(trading_date) AS rv_floor FROM trading.rv_daily FINAL
+               WHERE source = 'har-rv'{sym} GROUP BY symbol) rf
+      ON w.symbol = rf.symbol
 )
 """
 
@@ -132,14 +135,13 @@ def _month_ranges(start: dt.date, end: dt.date):
         cur = nxt
 
 
-def backfill(ch, start: dt.date, end: dt.date, symbols=None) -> int:
-    """Compute rv_daily for every complete (symbol, day) in [start, end], one statement per month.
-    `symbols` restricts to a targeted rerun (e.g. after a cut); None means all names."""
-    sym = _symbol_filter(symbols)
-    total = 0
-    for ms, me in _month_ranges(start, end):
-        lookback = ms - dt.timedelta(days=_LOOKBACK_DAYS)
-        sql = f"""
+def _insert_month(ch, ms: dt.date, me: dt.date, sym: str, extra_where: str = "") -> int:
+    """Run one month's set-based INSERT over [ms, me] (with a `_LOOKBACK_DAYS` warm-up so the first
+    day sees its prior close), then count and sanity-check the rows in range. `extra_where` is
+    appended to the emit filter — `incremental` uses it to emit only days after each name's latest
+    rv_daily row. Returns the row count in [ms, me]."""
+    lookback = ms - dt.timedelta(days=_LOOKBACK_DAYS)
+    sql = f"""
 INSERT INTO trading.rv_daily
     (symbol, trading_date, rv_intraday, rv_overnight, rv_total, n_bars, expected_bars, split_adjusted, source, computed_at)
 {_with_core(lookback, me, sym)}
@@ -156,30 +158,99 @@ FROM withsplit
 WHERE trading_date >= toDate('{ms.isoformat()}')
   AND prev_close > 0                              -- a previous complete session exists
   AND prev_complete_date = prev_trading_day       -- and it is the immediately previous trading day
+  {extra_where}
 SETTINGS join_use_nulls = 1
 """
-        ch.command(sql)
-        n = ch.query(
-            f"SELECT count() FROM trading.rv_daily FINAL WHERE trading_date >= '{ms.isoformat()}' "
-            f"AND trading_date <= '{me.isoformat()}'{sym}"
-        ).result_rows[0][0]
-        # Refuse non-finite or negative variance — fail fast, by name and date, never persist it.
-        # Zero is a real value (a thinly-traded day where every price equalled the prior close); it
-        # is stored and excluded from the fit by load_series's rv_total > 0.
-        bad = ch.query(
-            f"SELECT symbol, toString(trading_date), rv_total FROM trading.rv_daily FINAL "
-            f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}'{sym} "
-            f"AND (NOT isFinite(rv_total) OR rv_total < 0) ORDER BY symbol, trading_date LIMIT 100"
-        ).result_rows
-        if bad:
-            lines = "\n".join(f"    {s:8s} {d}  rv_total={rv}" for s, d, rv in bad)
-            raise RuntimeError(
-                f"rv_daily produced non-finite/negative rv_total for {ms}..{me} "
-                f"({len(bad)}+ rows shown):\n{lines}"
-            )
-        log.info("rv_daily %s..%s: %d rows", ms, me, n)
-        print(f"[rv_daily] {ms} .. {me}: {n:,} rows")
-        total += n
+    ch.command(sql)
+    n = ch.query(
+        f"SELECT count() FROM trading.rv_daily FINAL WHERE trading_date >= '{ms.isoformat()}' "
+        f"AND trading_date <= '{me.isoformat()}'{sym}"
+    ).result_rows[0][0]
+    # Refuse non-finite or negative variance — fail fast, by name and date, never persist it.
+    # Zero is a real value (a thinly-traded day where every price equalled the prior close); it
+    # is stored and excluded from the fit by load_series's rv_total > 0.
+    bad = ch.query(
+        f"SELECT symbol, toString(trading_date), rv_total FROM trading.rv_daily FINAL "
+        f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}'{sym} "
+        f"AND (NOT isFinite(rv_total) OR rv_total < 0) ORDER BY symbol, trading_date LIMIT 100"
+    ).result_rows
+    if bad:
+        lines = "\n".join(f"    {s:8s} {d}  rv_total={rv}" for s, d, rv in bad)
+        raise RuntimeError(
+            f"rv_daily produced non-finite/negative rv_total for {ms}..{me} "
+            f"({len(bad)}+ rows shown):\n{lines}"
+        )
+    log.info("rv_daily %s..%s: %d rows", ms, me, n)
+    print(f"[rv_daily] {ms} .. {me}: {n:,} rows")
+    return n
+
+
+def backfill(ch, start: dt.date, end: dt.date, symbols=None) -> int:
+    """Compute rv_daily for every complete (symbol, day) in [start, end], one statement per month.
+    `symbols` restricts to a targeted rerun (e.g. after a cut); None means all names."""
+    sym = _symbol_filter(symbols)
+    total = 0
+    for ms, me in _month_ranges(start, end):
+        total += _insert_month(ch, ms, me, sym)
+    return total
+
+
+def incremental(ch, symbols=None) -> int:
+    """The daily catch-up (HAR edge spec §4), driven by the data, never the clock: for each name,
+    compute rv_daily for every complete ledger day *after* its latest rv_daily row, up to the latest
+    complete ledger day. A late run or a missed day is caught up because the floor is the stored data,
+    not "yesterday". The per-name floor (`rv_floor` in `_with_core`) keeps a current or delisted name
+    from re-emitting, and keeps a name whose history already reaches its last complete day from
+    dragging the month scan backwards. The overnight rule is unchanged (it lives in `_insert_month`).
+
+    A name with complete bars but no rv_daily row at all is a new name: it is reported, never
+    part-filled here — its full history belongs to an explicit `backfill` (new names load their whole
+    history in the bar-load job's wake, per the roadmap), so the daily job only advances names that
+    already have rv history."""
+    sym = _symbol_filter(symbols)
+
+    # The ceiling: the latest complete ledger day across the set (the Scala calendar's output).
+    end = ch.query(
+        f"SELECT max(trading_date) FROM trading.stock_bar_ledger FINAL WHERE status = 'complete'{sym}"
+    ).result_rows[0][0]
+    if end is None:
+        print("[rv_daily] no complete ledger days — nothing to compute")
+        return 0
+
+    # Report new names (complete bars, no rv_daily) rather than silently part-fill them.
+    orphans = ch.query(
+        f"SELECT symbol, count() FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL "
+        f"WHERE status = 'complete'{sym}) WHERE symbol NOT IN "
+        f"(SELECT DISTINCT symbol FROM trading.rv_daily FINAL WHERE source = 'har-rv'{sym}) "
+        f"GROUP BY symbol ORDER BY symbol"
+    ).result_rows
+    if orphans:
+        print(f"[rv_daily] {len(orphans)} name(s) have complete bars but no rv_daily rows — NOT advanced by "
+              f"the daily job; run `python -m rv backfill --symbols <names>` for their full history:")
+        for s, n in orphans:
+            print(f"    {s:8s} {n} complete days")
+
+    # The floor: the earliest date any name-with-history is behind — the min latest-rv day among
+    # names whose latest rv day is before their latest complete day. The month scan starts here; the
+    # per-name `rv_floor` filter below decides, per name, which days inside the range are emitted.
+    start = ch.query(
+        f"""SELECT min(rv_floor) FROM
+  (SELECT symbol, max(trading_date) AS rv_floor FROM trading.rv_daily FINAL
+   WHERE source = 'har-rv'{sym} GROUP BY symbol) rf
+  INNER JOIN
+  (SELECT symbol, max(trading_date) AS last_complete FROM trading.stock_bar_ledger FINAL
+   WHERE status = 'complete'{sym} GROUP BY symbol) lc ON rf.symbol = lc.symbol
+  WHERE rf.rv_floor < lc.last_complete"""
+    ).result_rows[0][0]
+    if start is None:
+        print(f"[rv_daily] all names current through {end} — no rv_daily rows to add")
+        return 0
+
+    print(f"[rv_daily] incremental {start} .. {end} (each name from the day after its latest rv_daily row)")
+    extra = "AND rv_floor IS NOT NULL AND trading_date > rv_floor"
+    total = 0
+    for ms, me in _month_ranges(start, end):
+        total += _insert_month(ch, ms, me, sym, extra)
     return total
 
 

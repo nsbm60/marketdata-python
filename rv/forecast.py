@@ -204,12 +204,16 @@ def run(ch, batch_rows: int = 200_000) -> int:
 
 
 def daily(ch) -> int:
-    """The daily-job body (HAR edge §5): append yesterday's rv_daily, refit weekly into har_fit,
-    and write each name's latest forecast from the latest stored fit. Invoked by the Scala HarJob."""
+    """The daily-job body (HAR edge §5): catch rv_daily up from the data, refit weekly into har_fit,
+    and write each name's latest forecast from the latest stored fit. Invoked by the Scala HarJob.
+
+    The rv_daily catch-up is incremental from the stored data, not the clock: each name is advanced
+    from the day after its latest rv_daily row up to the latest complete ledger day (rv_daily.py),
+    so a late run computes the day anyway and a missed day is caught up. Forecasts are written as of
+    each name's latest rv_daily day."""
     from . import rv_daily
 
-    yesterday = dt.date.today() - dt.timedelta(days=1)
-    rv_daily.backfill(ch, yesterday, yesterday)  # set-based; no-op if yesterday wasn't a complete day
+    rv_daily.incremental(ch)
 
     series = load_series(ch)
     if not series:

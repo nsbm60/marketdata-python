@@ -50,7 +50,7 @@ def main() -> None:
         sp.add_argument("--symbols", help="comma-separated names for a targeted rerun (default: all)")
     sub.add_parser("proof")
     sub.add_parser("forecast")
-    sub.add_parser("daily")  # the daily-job body: append yesterday, weekly refit, write forecasts
+    sub.add_parser("daily")  # the daily-job body: catch rv_daily up from the data, weekly refit, write forecasts
     args = p.parse_args()
 
     ch = get_ch_client()
