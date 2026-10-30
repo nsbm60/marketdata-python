@@ -222,7 +222,10 @@ def incremental(ch, symbols=None) -> int:
         return 0
 
     # Earliest missing day that is actually computable: a complete day whose previous complete day is
-    # its previous trading day (overnight-eligible) and that has no rv_daily row yet.
+    # its previous trading day (overnight-eligible) and that has no rv_daily row yet. The epoch guard
+    # drops each name's first-ever complete day — lagInFrame returns 1970-01-01 (not NULL) for a
+    # partition's first row, so without it prev_complete == prev_any == epoch would mark that
+    # never-computable day as the start and drag the scan back to 2016 on every normal daily run.
     start = ch.query(
         f"""WITH
   allday AS (SELECT symbol, trading_date,
@@ -235,7 +238,8 @@ def incremental(ch, symbols=None) -> int:
                  WHERE status = 'complete'{sym}))
 SELECT min(c.trading_date) FROM comp c
 INNER JOIN allday a ON c.symbol = a.symbol AND c.trading_date = a.trading_date
-WHERE c.prev_complete = a.prev_any
+WHERE c.prev_complete != toDate('1970-01-01')   -- not a name's first-ever day (lagInFrame -> epoch)
+  AND c.prev_complete = a.prev_any
   AND (c.symbol, c.trading_date) NOT IN
       (SELECT symbol, trading_date FROM trading.rv_daily FINAL WHERE source = 'har-rv'{sym})"""
     ).result_rows[0][0]
