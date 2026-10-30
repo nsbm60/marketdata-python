@@ -114,15 +114,18 @@ withsplit AS (
            w.expected_bars AS expected_bars, w.day_open AS day_open, w.day_close AS day_close,
            w.grid_px AS grid_px, w.prev_close AS prev_close,
            w.prev_complete_date AS prev_complete_date, w.prev_trading_day AS prev_trading_day,
-           s.ratio AS split_ratio, d.div_usd AS div_usd, rf.rv_floor AS rv_floor
+           s.ratio AS split_ratio, d.div_usd AS div_usd, hr.rvs AS has_rv
     FROM withprev w
     LEFT JOIN (SELECT symbol, execution_date, any(ratio) AS ratio
                FROM trading.split_effective GROUP BY symbol, execution_date) s
       ON w.symbol = s.symbol AND w.trading_date = s.execution_date
     LEFT JOIN divs d ON w.symbol = d.symbol AND w.trading_date = d.ex_date
-    LEFT JOIN (SELECT symbol, max(trading_date) AS rv_floor FROM trading.rv_daily FINAL
-               WHERE source = 'har-rv'{sym} GROUP BY symbol) rf
-      ON w.symbol = rf.symbol
+    -- Per-(symbol, trading_date) existence of an rv_daily row, so `incremental` can emit every
+    -- MISSING complete day (has_rv IS NULL), not just days after a name's latest rv date — history
+    -- reloaded underneath an existing name is filled too (TEVA). backfill ignores this (recomputes).
+    LEFT JOIN (SELECT DISTINCT symbol AS rvs, trading_date AS rvd FROM trading.rv_daily FINAL
+               WHERE source = 'har-rv'{sym}) hr
+      ON w.symbol = hr.rvs AND w.trading_date = hr.rvd
 )
 """
 
@@ -196,20 +199,21 @@ def backfill(ch, start: dt.date, end: dt.date, symbols=None) -> int:
 
 
 def incremental(ch, symbols=None) -> int:
-    """The daily catch-up (HAR edge spec §4), driven by the data, never the clock: for each name,
-    compute rv_daily for every complete ledger day *after* its latest rv_daily row, up to the latest
-    complete ledger day. A late run or a missed day is caught up because the floor is the stored data,
-    not "yesterday". The per-name floor (`rv_floor` in `_with_core`) keeps a current or delisted name
-    from re-emitting, and keeps a name whose history already reaches its last complete day from
-    dragging the month scan backwards. The overnight rule is unchanged (it lives in `_insert_month`).
+    """The daily catch-up (HAR edge spec §4), driven by the data, never the clock: compute rv_daily
+    for every complete ledger day that has NO rv_daily row yet (`has_rv IS NULL` in `_with_core`), up
+    to the latest complete ledger day — not just days after a name's latest rv date. So history
+    reloaded underneath an existing name (TEVA: 2,708 complete ledger days, 33 rv rows) is filled,
+    and a brand-new name is computed, not skipped. The rules are unchanged: a row is written only
+    when the previous complete day is the previous trading day (`_insert_month`), so days marked
+    `failed` (including ExcludeRvDay exclusions) stay excluded and never let the overnight span a gap.
 
-    A name with complete bars but no rv_daily row at all is a new name: it is reported, never
-    part-filled here — its full history belongs to an explicit `backfill` (new names load their whole
-    history in the bar-load job's wake, per the roadmap), so the daily job only advances names that
-    already have rv history."""
+    The month scan starts at the earliest *computable* missing day — the earliest missing complete
+    day whose previous complete day is its previous trading day. Once a full backfill has filled the
+    history, only recent days (or none) are missing, so the daily run is cheap again; the permanent
+    non-rows (each name's first complete day, and days after a `failed` block) are not treated as a
+    gap because they fail the overnight rule."""
     sym = _symbol_filter(symbols)
 
-    # The ceiling: the latest complete ledger day across the set (the Scala calendar's output).
     end = ch.query(
         f"SELECT max(trading_date) FROM trading.stock_bar_ledger FINAL WHERE status = 'complete'{sym}"
     ).result_rows[0][0]
@@ -217,37 +221,30 @@ def incremental(ch, symbols=None) -> int:
         print("[rv_daily] no complete ledger days — nothing to compute")
         return 0
 
-    # Report new names (complete bars, no rv_daily) rather than silently part-fill them.
-    orphans = ch.query(
-        f"SELECT symbol, count() FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL "
-        f"WHERE status = 'complete'{sym}) WHERE symbol NOT IN "
-        f"(SELECT DISTINCT symbol FROM trading.rv_daily FINAL WHERE source = 'har-rv'{sym}) "
-        f"GROUP BY symbol ORDER BY symbol"
-    ).result_rows
-    if orphans:
-        print(f"[rv_daily] {len(orphans)} name(s) have complete bars but no rv_daily rows — NOT advanced by "
-              f"the daily job; run `python -m rv backfill --symbols <names>` for their full history:")
-        for s, n in orphans:
-            print(f"    {s:8s} {n} complete days")
-
-    # The floor: the earliest date any name-with-history is behind — the min latest-rv day among
-    # names whose latest rv day is before their latest complete day. The month scan starts here; the
-    # per-name `rv_floor` filter below decides, per name, which days inside the range are emitted.
+    # Earliest missing day that is actually computable: a complete day whose previous complete day is
+    # its previous trading day (overnight-eligible) and that has no rv_daily row yet.
     start = ch.query(
-        f"""SELECT min(rv_floor) FROM
-  (SELECT symbol, max(trading_date) AS rv_floor FROM trading.rv_daily FINAL
-   WHERE source = 'har-rv'{sym} GROUP BY symbol) rf
-  INNER JOIN
-  (SELECT symbol, max(trading_date) AS last_complete FROM trading.stock_bar_ledger FINAL
-   WHERE status = 'complete'{sym} GROUP BY symbol) lc ON rf.symbol = lc.symbol
-  WHERE rf.rv_floor < lc.last_complete"""
+        f"""WITH
+  allday AS (SELECT symbol, trading_date,
+               lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_any
+             FROM (SELECT DISTINCT symbol, trading_date FROM trading.stock_bar_ledger FINAL
+                   WHERE 1{sym})),
+  comp AS (SELECT symbol, trading_date,
+             lagInFrame(trading_date) OVER (PARTITION BY symbol ORDER BY trading_date) AS prev_complete
+           FROM (SELECT symbol, trading_date FROM trading.stock_bar_ledger FINAL
+                 WHERE status = 'complete'{sym}))
+SELECT min(c.trading_date) FROM comp c
+INNER JOIN allday a ON c.symbol = a.symbol AND c.trading_date = a.trading_date
+WHERE c.prev_complete = a.prev_any
+  AND (c.symbol, c.trading_date) NOT IN
+      (SELECT symbol, trading_date FROM trading.rv_daily FINAL WHERE source = 'har-rv'{sym})"""
     ).result_rows[0][0]
     if start is None:
-        print(f"[rv_daily] all names current through {end} — no rv_daily rows to add")
+        print(f"[rv_daily] no missing computable days — current through {end}")
         return 0
 
-    print(f"[rv_daily] incremental {start} .. {end} (each name from the day after its latest rv_daily row)")
-    extra = "AND rv_floor IS NOT NULL AND trading_date > rv_floor"
+    print(f"[rv_daily] incremental {start} .. {end} (every complete ledger day with no rv_daily row)")
+    extra = "AND has_rv IS NULL"
     total = 0
     for ms, me in _month_ranges(start, end):
         total += _insert_month(ch, ms, me, sym, extra)
