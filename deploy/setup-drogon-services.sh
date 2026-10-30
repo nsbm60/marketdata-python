@@ -12,7 +12,7 @@
 # dirs, the venv on the pinned /usr/bin/python3.14, installs EVERY managed unit, does
 # a FIRST code install, and as its final act certifies each service. It does NOT
 # enable or start anything — matching the archive discipline (don't start before you
-# look). Idempotent — safe to re-run. Ongoing updates use deploy-services.sh.
+# look). Idempotent — safe to re-run. Ongoing updates use ./deploy-python on the Mac.
 set -euo pipefail
 
 SERVICE_USER="${SERVICE_USER:-mdapps}"
@@ -62,7 +62,7 @@ sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q --upgrade pip
 # 4. the app tree is a FROZEN PLAIN COPY of the checkout — NOT a git repo. A service
 #    must never run from modifiable source, so /opt holds only files (no .git). This
 #    bootstrap lays down the FIRST copy from the checkout this script is run from;
-#    ongoing updates use deploy-services.sh (git pull the checkout, then copy -> /opt).
+#    ongoing updates use ./deploy-python on the Mac (git archive HEAD -> /opt, no checkout).
 #    No clone into /opt, no rsync. The empty APP_DIR was created in step 2.
 tar -C "${REPO_ROOT}" \
     --exclude='./.git' --exclude='./venv' --exclude='./data' \
@@ -120,6 +120,6 @@ Next steps — each command is on its own line, copy-paste as a single line:
   4) Enable the greeks server on boot and start it now (after step 1):
      systemctl enable --now greeks-server
 
-  Ongoing updates run ON drogon from the checkout:
-     sudo ${APP_DIR}/deploy/deploy-services.sh --restart pubsub-broker
+  Ongoing updates run on the Mac from the repo (no drogon checkout):
+     ./deploy-python --restart pubsub-broker
 NEXT

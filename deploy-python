@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Ship the committed tree to drogon and restart only the named services. Run on the Mac, from the
+# repo. Mirrors ./deploy-jar in the Scala repo.
+#
+#   ./deploy-python                              # copy + reinstall + refresh units (no restart)
+#   ./deploy-python --restart pubsub-broker      # ...and restart these
+#   ./deploy-python --restart-all                # ...and restart all managed
+#
+# Packs HEAD with `git archive` — the COMMITTED tree only, never a dirty working copy — records the
+# commit, scps the pack + the remote script to ~/deploy-staging on drogon, then runs the remote
+# script there under sudo (unpack into /opt/marketdata-python/app, reinstall into the venv, refresh
+# units, write the deploy record, restart named services). The drogon home checkout is not involved.
+# The managed-service list and all deploy mechanics live in deploy/deploy-python-remote.sh — one
+# implementation, on the remote side.
+set -euo pipefail
+
+HOST=drogon
+STAGING='~/deploy-staging'
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "${HERE}"
+
+# Refuse unless HEAD is a real commit (an unborn branch / empty repo has nothing to ship).
+commit="$(git rev-parse --verify --short HEAD 2>/dev/null)" || {
+  echo "HEAD is not on a commit — nothing to deploy (commit first)" >&2; exit 1; }
+full="$(git rev-parse HEAD)"
+desc="$(git log -1 --format='%ci %s' HEAD)"
+deployed="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+pack="$(mktemp -t deploy-python-pack)"
+rec="$(mktemp -t deploy-python-rec)"
+remote="$(mktemp -t deploy-python-remote)"
+trap 'rm -f "${pack}" "${rec}" "${remote}"' EXIT
+
+git archive --format=tar.gz -o "${pack}" HEAD
+{ echo "commit ${full} (${commit})  ${desc}"; echo "deployed ${deployed} from $(hostname)"; } > "${rec}"
+cp "${HERE}/deploy/deploy-python-remote.sh" "${remote}"
+
+echo "deploying ${commit} to ${HOST}:/opt/marketdata-python/app"
+echo "  ${desc}"
+ssh "${HOST}" "mkdir -p ${STAGING}"
+scp -q "${pack}" "${HOST}:${STAGING}/app.tar.gz"
+scp -q "${rec}" "${HOST}:${STAGING}/deploy-record"
+scp -q "${remote}" "${HOST}:${STAGING}/deploy-python-remote.sh"
+ssh -t "${HOST}" "sudo bash ${STAGING}/deploy-python-remote.sh ${STAGING} $*"
