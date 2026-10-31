@@ -41,6 +41,19 @@ def watchlist_underlyings(
     return tuple(str(r[0]).upper() for r in result.result_rows)
 
 
+def har_name_set_underlyings(ch: Client, *, table: str) -> tuple[str, ...]:
+    """Distinct underlyings to archive, from the latest ``trading.har_name_set``
+    snapshot (the rows at its max ``as_of_date``) — the trading universe, including
+    IB holdings. Same shape as ``watchlist_underlyings``: distinct, upper-cased,
+    sorted. Mirrors the rv code's reader (rv/forecast.py)."""
+    result = ch.query(
+        f"SELECT DISTINCT symbol FROM {table} FINAL "
+        f"WHERE as_of_date = (SELECT max(as_of_date) FROM {table}) "
+        f"ORDER BY symbol"
+    )
+    return tuple(str(r[0]).upper() for r in result.result_rows)
+
+
 def era_for(work_date: date, *, now: date, cfg: ArchiveConfig) -> Era:
     """PERISHABLE for the oldest ~year of retained data (closest to the assumed
     roll-off edge, and unrecoverable once gone); ROUTINE otherwise."""

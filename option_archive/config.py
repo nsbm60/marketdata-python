@@ -94,7 +94,8 @@ class ArchiveTableNames:
     dividend: str  # existing table, reused
     option_contract: str  # existing table, cross-check
     option_contract_asof: str  # weekly as-of contract reference (self-describing archive)
-    watchlist: str  # existing table, seed source (watchlist-first)
+    watchlist: str  # existing table (legacy seed source — no longer the ticker source)
+    har_name_set: str  # trading universe snapshot — the ticker source (latest as_of_date)
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,7 @@ def _parse_tables(raw: Any) -> ArchiveTableNames:
             m.get("option_contract_asof", "trading.option_contract_asof")
         ),
         watchlist=str(m.get("watchlist", "trading.watchlist")),
+        har_name_set=str(m.get("har_name_set", "trading.har_name_set")),
     )
 
 

@@ -75,7 +75,7 @@ from option_archive.reference import (
     _fetch_daily_raw_closes,
     _week_anchor,
     era_for,
-    watchlist_underlyings,
+    har_name_set_underlyings,
 )
 from option_archive.retry import reset_retry_count, retry_count, with_retry
 
@@ -471,11 +471,11 @@ def run(cfg: ArchiveConfig, ch: Client, alpaca: object, s3: object) -> int:
     if start > yesterday:
         log.info("nothing to do: resume start %s is after yesterday %s", start, yesterday)
         return 0
-    unders = watchlist_underlyings(ch, table=cfg.tables.watchlist)
+    unders = har_name_set_underlyings(ch, table=cfg.tables.har_name_set)
     if not unders:
-        log.error("watchlist %s is empty — nothing to archive", cfg.tables.watchlist)
+        log.error("har_name_set %s is empty — nothing to archive", cfg.tables.har_name_set)
         return 0
-    log.info("resume from %s; watchlist=%d names; loading daily bars…", start, len(unders))
+    log.info("resume from %s; har_name_set=%d names; loading daily bars…", start, len(unders))
     spots = _load_spots(alpaca, unders, start, yesterday)
     done = _done_sessions(ch, cfg)
     days = [d for d in _trading_days(spots, start, yesterday) if d not in done]

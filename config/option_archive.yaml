@@ -84,4 +84,5 @@ tables:
   dividend: "trading.dividend"
   option_contract: "trading.option_contract"
   option_contract_asof: "trading.option_contract_asof"   # weekly as-of contract reference
-  watchlist: "trading.watchlist"
+  watchlist: "trading.watchlist"                          # legacy — no longer the ticker source
+  har_name_set: "trading.har_name_set"                    # trading universe (latest as_of_date) — the ticker source

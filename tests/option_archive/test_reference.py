@@ -57,6 +57,13 @@ def test_watchlist_underlyings_distinct_upper() -> None:
     assert "FINAL" in ch.last_sql
 
 
+def test_har_name_set_underlyings_latest_snapshot() -> None:
+    ch = _FakeCH([("nvda",), ("MU",)])
+    assert reference.har_name_set_underlyings(ch, table="trading.har_name_set") == ("NVDA", "MU")
+    assert "FINAL" in ch.last_sql
+    assert "max(as_of_date)" in ch.last_sql
+
+
 def test_week_anchor_is_monday() -> None:
     assert reference._week_anchor(date(2026, 9, 23)) == date(2026, 9, 21)  # Wed -> Mon
     assert reference._week_anchor(date(2026, 9, 21)) == date(2026, 9, 21)  # Mon -> Mon
