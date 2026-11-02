@@ -16,11 +16,11 @@ request's hard constraints for infeasible, and is an empty list for
 optimal/timeout (dual-based detection is a deferred future enhancement).
 
 RUN-LOOP AMENDMENTS (optimizer-run-loop-spec-draft.md §3, 2026-10-21):
-  - execution cost on the trade: exec_cost_per_unit · |target − current|;
+  - execution cost on the trade: exec_cost_per_unit · |target − current|, at full dollar value;
   - interim holding horizon h = min(days_to_expiry, horizon_days): theta × h,
-    delta ceiling unscaled, and a dollar P&L-variance risk term (pc-objective-function
-    §4, amendment 2026-10-23) over each pair's overlapping horizon min(h_i, h_j), built
-    as time slices (interim, like the horizon itself);
+    and a dollar P&L-variance risk term (pc-objective-function §4, amendment 2026-10-23)
+    over each pair's overlapping horizon min(h_i, h_j), built as time slices (interim,
+    like the horizon itself);
   - an instrument's long and short legs are netted (the split is degenerate);
   - rounding: floor every quantity that consumes buying power, nearest otherwise;
     then stock repairs any delta band the rounding broke, by the fewest shares that
@@ -101,14 +101,10 @@ from wire_format import (
     F_SPOT,
     F_DELTA_TARGET_PCT,
     F_DELTA_TOLERANCE_PCT,
-    F_MAX_POSITIONS,
     F_TRADEABLE,
     F_SIGMA_RV,
     F_BP_LIMIT_PCT,
-    F_DELTA_CEILING_THRESHOLD,
-    F_LAMBDA_DELTA_CEILING,
     F_RISK_AVERSION,
-    F_LAMBDA_SPREAD,
     F_MIN_IMPROVEMENT,
     F_NET_LIQ,
     F_REQUEST_TIMESTAMP,
@@ -131,7 +127,6 @@ from wire_format import (
     OC_THETA,
     OC_EDGE,
     OC_EXEC_COST,
-    OC_DELTA_CEILING,
     OC_RISK,
     SC_OBJECTIVE_VALUE,
     SC_OPTIMAL_OBJECTIVE_VALUE,
@@ -139,7 +134,6 @@ from wire_format import (
     SC_COMPONENTS,
     SC_THETA_TOTAL,
     SC_EXEC_COST_TOTAL,
-    SC_DELTA_CEILING_PENALTY,
     SC_RISK_PENALTY,
     SM_SOLVER_NAME,
     SM_SOLVER_STATUS,
@@ -189,9 +183,6 @@ try:
     SOLVE_TIME_LIMIT_SEC = float(os.environ.get(ENV_TIME_LIMIT, str(DEFAULT_TIME_LIMIT_SEC)))
 except ValueError:
     sys.exit(f"[Solver] Fatal: {ENV_TIME_LIMIT}='{os.environ[ENV_TIME_LIMIT]}' is not a valid float.")
-
-# Recovers the raw 0..1 delta from share-equivalent delta_per_unit (× multiplier).
-DELTA_RAW_DIVISOR = 100.0
 
 # Risk term (pc-objective-function-draft.md §4; amendment 2026-10-23): dollar P&L variance,
 # R_U = 2·δ·σ_U⁴·Σ_k Δt_k (Σ ½·γ_i·S_U²·q_i)², penalty (A/2)·Σ_U R_U / net_liq.
@@ -427,9 +418,6 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         else:
             edge[i] = theta[i]
 
-    thr = float(policy[F_DELTA_CEILING_THRESHOLD])
-    delta_pen = np.maximum(0.0, np.abs(delta / DELTA_RAW_DIVISOR) - thr)
-
     net_liq = float(capital[F_NET_LIQ])
     if not net_liq > 0:
         raise ValueError(f"net_liq must be positive (the delta band is a % of it), got {net_liq!r}")
@@ -442,7 +430,6 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
             float(rec[F_SPOT]),
             float(rec[F_DELTA_TARGET_PCT]),
             float(rec[F_DELTA_TOLERANCE_PCT]),
-            int(rec[F_MAX_POSITIONS]),
         )
         if not pu[u][0] > 0:
             raise ValueError(f"{u}: spot must be positive, got {pu[u][0]!r}")
@@ -500,12 +487,10 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
 
     return {
         "theta": theta, "edge": edge, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
-        "margin": margin, "current_qty": current_qty, "delta_pen": delta_pen,
+        "margin": margin, "current_qty": current_qty,
         "h": h, "closeable": closeable, "is_equity": is_equity, "und": und,
         "und_names": und_names, "tradeable": tradeable, "equity_legs": equity_legs,
         "pairs": pairs, "sigma_rv": sigma_rv,
-        "lam_spread": float(policy[F_LAMBDA_SPREAD]),
-        "lam_delta": float(policy[F_LAMBDA_DELTA_CEILING]),
         "risk_aversion": float(policy[F_RISK_AVERSION]),
         "min_improvement": float(policy[F_MIN_IMPROVEMENT]),
         "bp_limit": float(policy[F_BP_LIMIT_PCT]) / 100.0 * net_liq,
@@ -542,14 +527,13 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
     """Build the QP from the pre-extracted bundle and solve. No field access or
     float conversion happens here — all of that is done in _extract_inputs.
 
-    Maximize  (theta∘h)·q − λ_spread·exec·|q − current| − λ_delta·delta_pen·q
+    Maximize  (theta∘h)·q − exec·|q − current|
               − (risk_aversion/2)/net_liq·‖M_risk_slices · q‖²   (dollar P&L-variance risk term)
     s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
               per underlying: lo ≤ G_δ q ≤ hi (the dollar band in shares).
 
-    `fixed` (index → value) pins those variables with an equality constraint — the
-    re-solve after cardinality fixes the dropped contracts so it, not the stock repair,
-    sets the hedge, BP and band around the kept book.
+    The delta band is the only delta mechanism; execution cost is counted at its full
+    dollar value. `fixed` (index → value) pins those variables with an equality constraint.
     """
     target = cp.Variable(n, nonneg=True)  # lower bound 0
     current = bundle["current_qty"]
@@ -574,10 +558,9 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
     constraints.append(net_delta <= bundle["u_hi"])
 
     # Objective over the holding horizon (§3.2): theta × h, exec cost on the
-    # trade (one-off), delta ceiling unscaled, gamma over overlapping horizons.
+    # trade (one-off, full dollar value), gamma over overlapping horizons.
     obj = (bundle["edge"] * bundle["h"]) @ target   # edge = theta × (1 − (rv/iv)²), §7
-    obj = obj - bundle["lam_spread"] * (bundle["exec_cost"] @ cp.abs(target - current))
-    obj = obj - bundle["lam_delta"] * (bundle["delta_pen"] @ target)
+    obj = obj - bundle["exec_cost"] @ cp.abs(target - current)
     # Dollar P&L-variance risk term: (risk_aversion/2)·Σ_U R_U / net_liq = that scalar · ‖M′q‖²
     # (G_risk_slices already carries √(2δ)·σ_u²·½γS² per record, so ‖·‖² = Σ_U R_U).
     obj = obj - (bundle["risk_aversion"] / (2.0 * bundle["net_liq"])) * cp.sum_squares(
@@ -706,7 +689,7 @@ def _breached_constraints(bundle: dict, q) -> list:
     net_delta = bundle["G_delta"] @ q
     for k, u in enumerate(bundle["und_names"]):
         if not (bundle["u_lo"][k] - eps <= net_delta[k] <= bundle["u_hi"][k] + eps):
-            spot, dt, tol, _maxpos = bundle["pu"][u]
+            spot, dt, tol = bundle["pu"][u]
             value_pct = float(spot * net_delta[k] / bundle["net_liq"] * 100.0)
             out.append({BC_TYPE: BCT_DELTA_TARGET, BC_UNDERLYING: u, BC_TARGET_PCT: dt,
                         BC_TOLERANCE_PCT: tol, BC_VALUE_PCT: value_pct})
@@ -730,47 +713,21 @@ def _compute_contributions(bundle: dict, q) -> dict:
 
     where c_i is the record's dollar-gamma-vol coefficient and S_k the underlying's Σ c q over the
     positions held in slice k. These sum across positions to −κ·‖Mq‖², the score's risk_penalty.
-    Recomputed from the q passed in, serving the ranking pass, the reporting pass and the current book.
+    Recomputed from the q passed in, serving the reporting pass and the current book.
     """
     q = np.asarray(q, dtype=float)
     theta_c = bundle["theta"] * bundle["h"] * q   # raw theta, reported alongside edge (§7)
     edge_c = bundle["edge"] * bundle["h"] * q      # the maximize term
-    exec_c = -bundle["lam_spread"] * bundle["exec_cost"] * np.abs(q - bundle["current_qty"])
-    dceil_c = -bundle["lam_delta"] * bundle["delta_pen"] * q
+    exec_c = -bundle["exec_cost"] * np.abs(q - bundle["current_qty"])  # full dollar value
     m = bundle["G_risk_slices"]
     risk_c = -(bundle["risk_aversion"] / (2.0 * bundle["net_liq"])) * q * (m.T @ (m @ q))
     return {
         OC_THETA: theta_c,
         OC_EDGE: edge_c,
         OC_EXEC_COST: exec_c,
-        OC_DELTA_CEILING: dceil_c,
         OC_RISK: risk_c,
-        OC_TOTAL: edge_c + exec_c + dceil_c + risk_c,
+        OC_TOTAL: edge_c + exec_c + risk_c,
     }
-
-
-def _cardinality_filter(groups: dict, q: list, bundle: dict, ranking_contribs: dict) -> tuple:
-    """Keep the top max_positions nonzero OPTION positions per underlying, zero the rest.
-    Ranking uses contributions against the full pre-cardinality composition. Equity is the
-    hedge, not a position: it is excluded from the count (the cap is options-only per the
-    spec). Returns (q, dropped) — dropped is the list of indices the cap zeroed, which the
-    re-solve then fixes."""
-    q = list(q)
-    totals = ranking_contribs[OC_TOTAL]
-    is_equity = bundle["is_equity"]
-    dropped = []
-    for u, idx in groups.items():
-        max_pos = bundle["pu"][u][3]
-        nonzero = [i for i in idx if q[i] > 0 and not is_equity[i]]
-        if len(nonzero) <= max_pos:
-            continue
-        nonzero.sort(key=lambda i: totals[i], reverse=True)
-        for i in nonzero[max_pos:]:
-            q[i] = 0
-            dropped.append(i)
-        log.info("[Solver] cardinality: underlying %s had %d option positions, kept top %d",
-                 u, len(nonzero), max_pos)
-    return q, dropped
 
 
 def _book_meets_constraints(bundle: dict, q) -> bool:
@@ -795,49 +752,21 @@ def _post_solve_pipeline(target_value, bundle: dict, groups: dict) -> dict:
     response path and the diagnostics (pipeline_trace) run the identical steps with no
     drift. Insertion order (dict, py3.7+) is the step order; the final stage is optimal_q.
 
-    Stages: solve, netting, rounding, cap, then — when the cap dropped contracts — resolve,
-    resolve_round, and finally repair. The re-solve is the stability fix: the cardinality
-    cap is a discontinuous step (a dropped hedge swings net delta), and leaving the band to
-    the stock repair let a tiny input change flip the book between feasible and over-BP.
-    Instead, after the cap we re-solve the continuous problem with the dropped contracts
-    fixed — at 0, or at current when they are held and close-only (we freeze a holding, we
-    do not force-close it). The re-solve, respecting BP and the band, sets the hedge; the
-    stock repair is then left with only rounding error."""
+    Stages: solve, netting, rounding, repair. The solver's continuous answer is netted and
+    rounded, then the stock repair fixes any delta band the rounding broke, by the fewest
+    shares; a remaining breach is reported by the caller's re-check. There is no position
+    cap — the solver's answer is returned as solved."""
     n = len(bundle["margin"])
     cont = [0.0] * n if target_value is None else list(np.maximum(np.asarray(target_value, dtype=float), 0.0))
     netted = _net_pairs(target_value, bundle)
     rounded = _extract_targets(netted, bundle)
-    ranking_contribs = _compute_contributions(bundle, rounded)
-    carded, dropped = _cardinality_filter(groups, rounded, bundle, ranking_contribs)
-
-    stages = {
+    repaired, _repaired_names = _repair_band_with_stock(rounded, bundle)
+    return {
         "solve": cont,
         "netting": cont if netted is None else list(netted),
         "rounding": rounded,
-        "cap": carded,
+        "repair": repaired,
     }
-
-    base = carded
-    if dropped:
-        fixed = {}
-        for i in dropped:
-            held_close = bundle["current_qty"][i] > 0 and bundle["closeable"][i]
-            fixed[i] = float(bundle["current_qty"][i]) if held_close else 0.0
-        target2, _problem2, _ = _build_and_solve(n, bundle, fixed=fixed)
-        if target2.value is not None:
-            netted2 = _net_pairs(target2.value, bundle)
-            resolve_round = _extract_targets(netted2, bundle)
-            stages["resolve"] = list(np.maximum(np.asarray(target2.value, dtype=float), 0.0))
-            stages["resolve_round"] = resolve_round
-            base = resolve_round
-        else:
-            # The frozen held book is itself infeasible (e.g. already over BP): keep the
-            # capped book; the BP-capped repair and the re-check report what cannot be fixed.
-            log.info("[Solver] re-solve after cardinality infeasible; keeping capped book")
-
-    repaired, _repaired_names = _repair_band_with_stock(base, bundle)
-    stages["repair"] = repaired
-    return stages
 
 
 def pipeline_trace(payload: dict) -> dict:
@@ -971,7 +900,6 @@ def _build_recommendations(dvs: list, target_q: list, optimal_q: list, contribs:
                 OC_THETA: float(contribs[OC_THETA][i]),
                 OC_EDGE: float(contribs[OC_EDGE][i]),
                 OC_EXEC_COST: float(contribs[OC_EXEC_COST][i]),
-                OC_DELTA_CEILING: float(contribs[OC_DELTA_CEILING][i]),
                 OC_RISK: float(contribs[OC_RISK][i]),
             },
         }
@@ -993,7 +921,6 @@ def _build_score(contribs: dict, optimal_obj: float, current_obj: float) -> dict
         SC_COMPONENTS: {
             SC_THETA_TOTAL: float(contribs[OC_THETA].sum()),
             SC_EXEC_COST_TOTAL: float(contribs[OC_EXEC_COST].sum()),
-            SC_DELTA_CEILING_PENALTY: float(contribs[OC_DELTA_CEILING].sum()),
             SC_RISK_PENALTY: float(contribs[OC_RISK].sum()),
         },
     }
@@ -1010,7 +937,7 @@ def _request_constraints(bundle: dict, groups: dict) -> list:
         BC_VALUE_AT_SOLUTION: None,
     }]
     for u in groups:
-        _spot, dt, tol, _maxpos = bundle["pu"][u]
+        _spot, dt, tol = bundle["pu"][u]
         records.append({
             BC_TYPE: BCT_DELTA_TARGET,
             BC_UNDERLYING: u,

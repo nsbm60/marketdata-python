@@ -63,16 +63,12 @@ TYPE_EQUITY = "equity"
 F_SPOT = "spot"
 F_DELTA_TARGET_PCT = "delta_target_pct"        # dollar delta as % of net liq
 F_DELTA_TOLERANCE_PCT = "delta_tolerance_pct"  # band half-width, same unit
-F_MAX_POSITIONS = "max_positions"
 F_TRADEABLE = "tradeable"
 F_SIGMA_RV = "sigma_rv"  # 5-session HAR forecast σ per underlying — the risk term's vol (§7)
 
 # Policy field names
 F_BP_LIMIT_PCT = "bp_limit_pct"
-F_DELTA_CEILING_THRESHOLD = "delta_ceiling_threshold"
-F_LAMBDA_DELTA_CEILING = "lambda_delta_ceiling"
 F_RISK_AVERSION = "risk_aversion"  # replaces lambda_gamma (2026-10-23): dollar-variance risk term
-F_LAMBDA_SPREAD = "lambda_spread"
 F_MIN_IMPROVEMENT = "min_improvement"
 
 # Capital field names

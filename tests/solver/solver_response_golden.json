@@ -20,7 +20,6 @@
         "theta": -0.0,
         "edge": -0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": 0.0
       },
       "strike": 215,
@@ -42,7 +41,6 @@
         "theta": 80.85734953703704,
         "edge": 9.345066262174058,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.039436644159370406
       },
       "strike": 215,
@@ -64,7 +62,6 @@
         "theta": -0.0,
         "edge": -0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       },
       "strike": 120,
@@ -86,7 +83,6 @@
         "theta": 0.0,
         "edge": 0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       },
       "strike": 120,
@@ -108,7 +104,6 @@
         "theta": -0.0,
         "edge": -0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       },
       "strike": 125,
@@ -130,7 +125,6 @@
         "theta": 0.0,
         "edge": 0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       },
       "strike": 125,
@@ -152,7 +146,6 @@
         "theta": 0.0,
         "edge": 0.0,
         "exec_cost": -1.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       }
     },
@@ -169,7 +162,6 @@
         "theta": 0.0,
         "edge": 0.0,
         "exec_cost": -0.42,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       }
     },
@@ -186,7 +178,6 @@
         "theta": 0.0,
         "edge": 0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       }
     },
@@ -203,7 +194,6 @@
         "theta": 0.0,
         "edge": 0.0,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.0
       }
     },
@@ -220,7 +210,6 @@
         "theta": 25.874351851851852,
         "edge": 6.864623960695385,
         "exec_cost": -0.0,
-        "delta_ceiling": -0.0,
         "risk": -0.009859161039842601
       },
       "strike": 200,
@@ -242,7 +231,6 @@
         "theta": 27.168069444444445,
         "edge": 1.559558327049355,
         "exec_cost": -5.000000000000004,
-        "delta_ceiling": -0.0,
         "risk": -0.020253895774443725
       },
       "strike": 250,
@@ -259,7 +247,6 @@
     "components": {
       "theta_total": 133.89977083333335,
       "exec_cost_total": -6.420000000000004,
-      "delta_ceiling_penalty": 0.0,
       "risk_penalty": -0.06954970097365673
     }
   },

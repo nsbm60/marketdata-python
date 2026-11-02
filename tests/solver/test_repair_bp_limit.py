@@ -1,17 +1,11 @@
-"""The cardinality cap must not turn a hedged book into a BP breach.
+"""No post-solve step exceeds the BP limit, and the held hedge is returned intact.
 
 `solver_request_repair_bp.json` is a WWW strangle — short put (+45 delta) and short call
-(-45 delta), both held 10 and close-only — with max_positions_per_underlying = 1 and
-bp_limit = 11,000. The continuous optimum holds both legs at the BP limit with net delta 0.
-The cardinality cap keeps one leg and drops the other, throwing WWW net delta to +450 shares
-(+45% of net liq, far outside the ±5% band).
-
-Before the fix the stock repair then shorted 400 shares to drag the band back — adding 20,000
-of margin with no BP check, a 25,500 book over the 11,000 limit (the run-87e615b0 mechanism).
-Now the cap drop triggers a re-solve with the dropped contract fixed: it is held and
-close-only, so it is frozen at its current quantity (we keep the holding, we do not
-force-close it), and the re-solve re-hedges within BP and the band. The book stays within
-bp_limit, the hedge is preserved, and the stock repair is left with only rounding error.
+(-45 delta), both held 10 and close-only — with bp_limit = 11,000. The continuous optimum
+holds both legs at the BP limit with net delta 0. With the position cap removed (a leftover
+from the raw-theta objective), nothing drops a hedge leg: the solver returns both legs, the
+book stays within bp_limit through every post-solve step, and the stock repair is left with
+only rounding error. (max_positions_per_underlying is still in the fixture and is ignored.)
 """
 from __future__ import annotations
 
@@ -33,18 +27,17 @@ def _request() -> dict:
 
 
 def test_no_post_solve_step_exceeds_bp_limit() -> None:
-    """Every stage — solve, netting, rounding, cap, resolve, repair — stays within bp_limit.
-    The cap and the stock repair are the steps that used to break it."""
+    """Every stage — solve, netting, rounding, repair — stays within bp_limit. The stock
+    repair is the step that used to break it."""
     tr = optimizer.pipeline_trace(_request())
     for step in tr["steps"]:
         assert step["bp_used"] <= tr["bp_limit"] + 1e-6, \
             f"{step['step']} uses {step['bp_used']:.2f} > bp_limit {tr['bp_limit']:.2f}"
 
 
-def test_cardinality_drop_preserves_the_held_hedge_feasibly() -> None:
-    """The dropped leg is held and close-only: the re-solve freezes it at its current
-    quantity rather than closing it, so both legs remain and the book is feasible — not a
-    fabricated infeasibility, not a BP breach."""
+def test_held_balanced_hedge_is_returned_intact_and_feasible() -> None:
+    """Both legs are held and close-only; with no position cap to drop one, the continuous
+    solve holds both at net delta 0, and the book is feasible — within BP and the band."""
     resp = optimizer.handle_optimize(copy.deepcopy(_request()))
     assert resp["status"] == optimizer.STATUS_OPTIMAL, resp.get("error")
     assert not resp["binding_constraints"], resp["binding_constraints"]
@@ -55,7 +48,7 @@ def test_cardinality_drop_preserves_the_held_hedge_feasibly() -> None:
                   if dv["type"] == "option" and dv.get("closeable_only") and dv["current_quantity"] > 0]
     kept = [dv for dv in held_close if recs[dv["id"]]["optimal_quantity"] > 0]
     assert len(kept) == len(held_close), \
-        "a held close-only hedge leg was closed by the cardinality cap instead of frozen"
+        "a held close-only hedge leg was not returned"
 
     # Within BP and inside the band, computed from the recommended book.
     net_liq = req["capital"]["net_liq"]

@@ -41,8 +41,7 @@ CAPTURES = ROOT / "tools" / "captured_requests"
 _EPS = 1e-6
 
 # A contract's multiplier: per-unit greeks in the request are share-equivalent (raw greek ×
-# this), matching optimizer.DELTA_RAW_DIVISOR. One place, so the perturbation recompute and
-# the solver agree on the unit.
+# this). One place, so the perturbation recompute and the solver agree on the unit.
 _MULTIPLIER = 100.0
 
 
