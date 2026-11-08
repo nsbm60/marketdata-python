@@ -84,6 +84,26 @@ class SessionCache:
             return s
         return None
 
+    def session_on_or_before(self, t_utc: datetime) -> Optional[Session]:
+        """The session containing ``t_utc``, or the most recent one before it when ``t_utc`` is
+        outside every session (so compute_greeks off-hours prices as of the last close). The
+        forward-leaning cache may hold no prior session (a start on a non-trading day), so when it
+        doesn't, fetch a backward window from MDS and take the latest session on or before the day.
+        """
+        if t_utc.tzinfo is None:
+            raise ValueError("t_utc must be timezone-aware")
+        here = self.session_at(t_utc)
+        if here is not None:
+            return here
+        d = t_utc.astimezone(ET).date()
+        with self._lock:
+            prior = [sd for sd in self._sessions if sd <= d]
+            if prior:
+                return self._sessions[max(prior)]
+        sessions = self._fetch(d - timedelta(days=HORIZON_DAYS), d)
+        before = [s for s in sessions if s.date <= d]
+        return max(before, key=lambda s: s.date) if before else None
+
     def _refresh(self, d: date) -> None:
         covered = self._covered_from <= d <= self._covered_to
         now = self._mono()

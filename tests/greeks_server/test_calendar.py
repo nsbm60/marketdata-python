@@ -67,6 +67,23 @@ def test_session_bounds() -> None:
     assert cal.session_at(_et(date(2026, 10, 24), 12, 0)) is None  # Saturday: MDS sent none
 
 
+def test_session_on_or_before() -> None:
+    mds = FakeMds()
+    cal = SessionCache(mds, TUE)
+    # In session -> that session.
+    assert cal.session_on_or_before(_et(TUE, 12, 0)).date == TUE  # type: ignore[union-attr]
+    # After the close -> the same day's session (most recent on/before), from the cache.
+    assert cal.session_on_or_before(_et(TUE, 17, 0)).date == TUE  # type: ignore[union-attr]
+    # A weekend -> the prior Friday, from the cache.
+    sat = date(2026, 10, 24)
+    assert cal.session_on_or_before(_et(sat, 12, 0)).date == date(2026, 10, 23)  # type: ignore[union-attr]
+    # A day earlier than the forward cache, with no prior session cached -> a backward MDS fetch.
+    mon = TUE - timedelta(days=1)  # 2026-10-19, a Monday
+    s = cal.session_on_or_before(_et(mon, 12, 0))
+    assert s is not None and s.date == mon
+    assert mds.calls[-1] == (mon - timedelta(days=7), mon)
+
+
 def test_reads_cache_then_refreshes_with_two_days_left() -> None:
     mds = FakeMds()
     cal = SessionCache(mds, TUE)

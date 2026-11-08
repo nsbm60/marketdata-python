@@ -125,12 +125,18 @@ def test_no_spot_publishes_failure() -> None:
     assert h.published[-1][1]["reason"] == "missing_spot"
 
 
-def test_close_clears_state() -> None:
+def test_close_pass_then_clears_state() -> None:
     h = Harness()
+    h.quote("md.equity.quote.NVDA", "NVDA", 181.0, 181.02)
     h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
+    before = len(h.published)
     h.in_session = False
     h.idle()
+    # One final close pass over the whole book, at the session's close, then the book is cleared.
+    assert len(h.published) == before + 1
+    assert h.published[-1][1]["computed_at"] == int(SESS.close_utc.timestamp() * 1000)
     assert h.loop.session is None and not h.loop.book.contracts
+    # Nothing more off-session.
     n = len(h.published)
     h.clock.advance(30)
     h.idle()

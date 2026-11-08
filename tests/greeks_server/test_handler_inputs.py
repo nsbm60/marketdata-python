@@ -11,59 +11,78 @@ from greeks.config import load_config
 from greeks_server.handler import make_handler, parse_request
 from greeks_server.inputs import InputsHolder, SessionInputs, validate_sofr
 
-from gs_helpers import NOW, NOW_MS, SESSION, sofr_flat
+from gs_helpers import CLOSE_MS, NOW_MS, SESSION, SESSION_OBJ, sofr_flat
 
 
 def _item(**over: Any) -> dict[str, Any]:
+    # Raw facts: a two-sided option quote (mid 9.1) and an underlying last trade. An absent side
+    # (here opt_trade and und_quote) is simply omitted. select_price picks mid for the option and
+    # last for the spot, matching the pre-selected (9.1 mid, 181 last) the old request sent.
     d: dict[str, Any] = {
-        "osi": "NVDA261120C00180000", "price": 9.1, "price_kind": "mid", "price_ts": NOW_MS,
-        "spot": 181.0, "spot_kind": "last", "spot_ts": NOW_MS,
+        "osi": "NVDA261120C00180000",
+        "opt_quote": {"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS},
+        "und_trade": {"last": 181.0, "trade_ts": NOW_MS},
     }
     d.update(over)
     return d
+
+
+def _req(contracts: list[dict[str, Any]], as_of: int = NOW_MS) -> dict[str, Any]:
+    return {"op": "compute_greeks", "as_of": as_of, "contracts": contracts}
 
 
 def _handler(loads: list[date]) -> Any:
     def loader(d: date) -> SessionInputs:
         loads.append(d)
         return SessionInputs(session_date=d, sofr=sofr_flat(), dividends={})
-    return make_handler(load_config(), InputsHolder(loader), lambda t: object(), now=lambda: NOW)  # type: ignore[arg-type,return-value]
+    return make_handler(load_config(), InputsHolder(loader), lambda t: SESSION_OBJ)
 
 
 def test_results_in_input_order() -> None:
     loads: list[date] = []
     h = _handler(loads)
-    out = h({"op": "compute_greeks", "contracts": [_item(), _item(osi="NVDA261120C00100000", price=1.0)]})
+    deep_itm = _item(osi="NVDA261120C00100000", opt_quote={"bid": 0.9, "ask": 1.1, "quote_ts": NOW_MS})
+    out = h(_req([_item(), deep_itm]))
     res = out["results"]
     assert [r["osi"] for r in res] == ["NVDA261120C00180000", "NVDA261120C00100000"]
     assert res[0]["status"] == "success" and res[1]["reason"] == "below_intrinsic"
-    assert res[0]["spot_kind"] == "last"
-    h({"op": "compute_greeks", "contracts": [_item()]})
-    # NOW is in session but nothing loaded the session: each request loads fresh, uncached,
+    assert res[0]["spot_kind"] == "last" and res[0]["price_kind"] == "mid"  # server ran the §4 rule
+    h(_req([_item()]))
+    # as_of is in session but nothing loaded the session: each request loads fresh, uncached,
     # so the open can't inherit a pre-08:45 load.
     assert loads == [SESSION, SESSION]
 
 
+def test_off_session_prices_at_close() -> None:
+    # as_of after the close: the server prices at the session's close, so computed_at is the close.
+    loads: list[date] = []
+    out = _handler(loads)(_req([_item()], as_of=CLOSE_MS + 3_600_000))
+    res = out["results"]
+    assert res[0]["computed_at"] == CLOSE_MS
+    assert loads == [SESSION]  # off-session request loads fresh, uncached
+
+
 def test_empty_list_is_fine() -> None:
-    assert _handler([])({"op": "compute_greeks", "contracts": []}) == {"results": []}
+    assert _handler([])(_req([])) == {"results": []}
 
 
 @pytest.mark.parametrize(
     "bad, msg",
     [
-        ({"contracts": "x"}, "'contracts' must be a list"),
-        ({"contracts": [_item(osi="NVDA1261120C00180000")]}, "not a standard OSI"),
-        ({"contracts": [_item(price=0)]}, "price must be a positive number"),
-        ({"contracts": [_item(spot=float("inf"))]}, "spot must be a positive number"),
-        ({"contracts": [_item(price_kind="bid")]}, "price_kind must be 'mid' or 'last'"),
-        ({"contracts": [_item(spot_ts=1.5)]}, "spot_ts must be epoch millis"),
-        ({"contracts": [{k: v for k, v in _item().items() if k != "spot_kind"}]}, "missing field(s): spot_kind"),
-        ({"contracts": [_item(extra=1)]}, "unknown field(s): extra"),
+        (_req("x"), "'contracts' must be a list"),  # type: ignore[arg-type]
+        ({"op": "compute_greeks", "contracts": [_item()]}, "'as_of' must be epoch millis"),
+        (_req([_item(osi="NVDA1261120C00180000")]), "not a standard OSI"),
+        (_req([_item(opt_trade={"last": 0, "trade_ts": NOW_MS})]), "opt_trade.last must be positive"),
+        (_req([_item(und_quote={"bid": float("inf"), "ask": 1.0, "quote_ts": NOW_MS})]), "und_quote.bid must be a finite number"),
+        (_req([_item(opt_quote={"bid": 9.0, "quote_ts": NOW_MS})]), "missing field(s): ask"),
+        (_req([_item(opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": 1.5})]), "opt_quote.quote_ts must be epoch millis"),
+        (_req([_item(extra=1)]), "unknown field(s): extra"),
+        (_req([_item(opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS, "x": 1})]), "unknown field(s): x"),
     ],
 )
 def test_rejects_whole_request(bad: dict[str, Any], msg: str) -> None:
     with pytest.raises(ValueError) as e:
-        parse_request({"op": "compute_greeks", **bad})
+        parse_request(bad)
     assert msg in str(e.value)
 
 

@@ -143,6 +143,10 @@ class ComputeLoop(threading.Thread):
             self._last_tick = self._mono()
             log.info("session open %s (opened %s): computing", s.date, s.open_utc.isoformat())
         elif s is None and self.session is not None:
+            # Close pass: one final pass over the whole book at this session's close, so every
+            # contract's last published greeks are as of the close (last-session prices, time to
+            # the close), then clear the book.
+            self._close_pass()
             log.info("session %s closed: %s contracts this session", self.session.date, len(self.book.contracts))
             self.session = None
             self._session_inputs = None
@@ -177,6 +181,20 @@ class ComputeLoop(threading.Thread):
             self._publish(greeks_topic(self._prefix, c), msg.to_wire())
             ok += msg.reason is None
         self._stats.record(len(contracts), ok, time.perf_counter() - t0)
+
+    def _close_pass(self) -> None:
+        """Price every contract in the book at the session's close and publish, so off-session
+        consumers hold greeks as of the close. Session prices still select relative to the open."""
+        assert self.session is not None and self._session_inputs is not None
+        open_ms = self.session.open_ms
+        close = self.session.close_utc
+        inputs = self._session_inputs
+        b = self.book
+        for c in b.contracts.values():
+            spot_px = select_price(b.equity_quotes.get(c.underlying), b.equity_trades.get(c.underlying), open_ms)
+            opt_px = select_price(b.option_quotes.get(c.osi), b.option_trades.get(c.osi), open_ms)
+            msg = compute_or_fail(c, opt_px, spot_px, inputs, close, self._m)
+            self._publish(greeks_topic(self._prefix, c), msg.to_wire())
 
 
 class _Stats:

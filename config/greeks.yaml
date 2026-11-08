@@ -49,4 +49,4 @@ server:
   router_port: 6110            # block above the bus (6100/6101); 6000-6092 are taken
   clock_tick_s: 5              # the time input: mark every contract dirty this often
   min_pass_interval_ms: 250    # coalescing: at most one pricing pass per interval
-  topic_prefix: "shadow."      # Phase 1 shadow; "" at cutover (spec §10)
+  topic_prefix: ""             # cutover: publish on md.option.greeks.* (spec §10)
