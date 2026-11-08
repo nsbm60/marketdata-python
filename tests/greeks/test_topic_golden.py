@@ -39,6 +39,7 @@ def test_python_builder_reproduces_golden(row: dict[str, str]) -> None:
     assert TopicBuilder.for_option_quote(underlying, expiry, side, strike) == row["quote"]
     assert TopicBuilder.for_option_trade(underlying, expiry, side, strike) == row["trade"]
     assert TopicBuilder.for_option_greeks(underlying, expiry, side, strike) == row["greeks"]
+    assert TopicBuilder.for_option_ref(underlying, expiry, side, strike) == row["ref"]
 
 
 def test_fixture_is_nonempty() -> None:

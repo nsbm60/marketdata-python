@@ -36,6 +36,7 @@ class TopicBuilder:
     PART_TRADE = "trade"
     PART_QUOTE = "quote"
     PART_GREEKS = "greeks"
+    PART_REF = "ref"
     PART_BAR = "bar"
     PART_INDICATOR = "indicator"
     PART_EMA = "ema"
@@ -113,6 +114,10 @@ class TopicBuilder:
         return f"{TopicBuilder.DOMAIN_MARKET}.{TopicBuilder.CAT_OPTION}.{TopicBuilder.PART_GREEKS}."
 
     @staticmethod
+    def prefix_option_ref() -> str:
+        return f"{TopicBuilder.DOMAIN_MARKET}.{TopicBuilder.CAT_OPTION}.{TopicBuilder.PART_REF}."
+
+    @staticmethod
     def prefix_option_trades_for(underlying: str) -> str:
         return f"{TopicBuilder.prefix_option_trades()}{underlying.upper()}."
 
@@ -135,6 +140,13 @@ class TopicBuilder:
     @staticmethod
     def for_option_greeks(underlying: str, expiry: date, side: str, strike: Decimal | str | int | float) -> str:
         return f"{TopicBuilder.prefix_option_greeks()}{TopicBuilder._option_suffix(underlying, expiry, side, strike)}"
+
+    @staticmethod
+    def for_option_ref(underlying: str, expiry: date, side: str, strike: Decimal | str | int | float) -> str:
+        # md.option.ref.* — daily reference data (open interest, prev close), one owner: MDS's lease
+        # bootstrap. The greeks server neither publishes nor consumes it; kept here in lockstep with
+        # Scala TopicBuilder.forOptionRef (the topic golden test enforces parity).
+        return f"{TopicBuilder.prefix_option_ref()}{TopicBuilder._option_suffix(underlying, expiry, side, strike)}"
 
     # ── CalcServer reports (underlying lowercase, matching Scala forOptionsReport) ──
     @staticmethod
