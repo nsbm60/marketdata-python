@@ -19,11 +19,12 @@ def _sess(d: date) -> Session:
 
 
 class FakeMds:
-    """Weekdays only, as MDS would answer (holidays are MDS's business, not ours)."""
+    """Weekdays only (minus any holidays), as MDS would answer — MDS owns the holiday rules."""
 
-    def __init__(self) -> None:
+    def __init__(self, holidays: "set[date] | None" = None) -> None:
         self.calls: list[tuple[date, date]] = []
         self.down = False
+        self.holidays = holidays or set()
 
     def __call__(self, start: date, end: date) -> Sequence[Session]:
         self.calls.append((start, end))
@@ -31,7 +32,7 @@ class FakeMds:
             raise RuntimeError("MDS timeout for get_trading_sessions")
         out, d = [], start
         while d <= end:
-            if d.weekday() < 5:
+            if d.weekday() < 5 and d not in self.holidays:
                 out.append(_sess(d))
             d += timedelta(days=1)
         return out
@@ -67,21 +68,38 @@ def test_session_bounds() -> None:
     assert cal.session_at(_et(date(2026, 10, 24), 12, 0)) is None  # Saturday: MDS sent none
 
 
-def test_session_on_or_before() -> None:
-    mds = FakeMds()
-    cal = SessionCache(mds, TUE)
+def test_session_on_or_before_in_or_after_session() -> None:
+    cal = SessionCache(FakeMds(), TUE)
     # In session -> that session.
     assert cal.session_on_or_before(_et(TUE, 12, 0)).date == TUE  # type: ignore[union-attr]
-    # After the close -> the same day's session (most recent on/before), from the cache.
+    # After the close -> the same day's session (it has closed).
     assert cal.session_on_or_before(_et(TUE, 17, 0)).date == TUE  # type: ignore[union-attr]
-    # A weekend -> the prior Friday, from the cache.
-    sat = date(2026, 10, 24)
-    assert cal.session_on_or_before(_et(sat, 12, 0)).date == date(2026, 10, 23)  # type: ignore[union-attr]
-    # A day earlier than the forward cache, with no prior session cached -> a backward MDS fetch.
-    mon = TUE - timedelta(days=1)  # 2026-10-19, a Monday
-    s = cal.session_on_or_before(_et(mon, 12, 0))
-    assert s is not None and s.date == mon
-    assert mds.calls[-1] == (mon - timedelta(days=7), mon)
+    # A weekend -> the prior Friday.
+    assert cal.session_on_or_before(_et(date(2026, 10, 24), 12, 0)).date == date(2026, 10, 23)  # type: ignore[union-attr]
+
+
+# 2026-11-09 is a Monday; the Friday before is 2026-11-06.
+MON = date(2026, 11, 9)
+FRI_BEFORE = date(2026, 11, 6)
+
+
+def test_before_the_open_returns_the_prior_close_not_todays_unopened_session() -> None:
+    # The bug: between midnight and 09:30 ET on a trading day, selecting by DATE returned today's
+    # session, which has not opened. Selecting by close must return Friday.
+    cal = SessionCache(FakeMds(), MON)  # forward cache: Mon..Mon+7 (no prior Friday cached)
+    assert cal.session_on_or_before(_et(MON, 0, 30)).date == FRI_BEFORE   # type: ignore[union-attr]
+    assert cal.session_on_or_before(_et(MON, 8, 0)).date == FRI_BEFORE    # type: ignore[union-attr]
+    # After the open, it is in Monday's session.
+    assert cal.session_on_or_before(_et(MON, 10, 0)).date == MON          # type: ignore[union-attr]
+
+
+def test_day_after_a_holiday_returns_the_last_trading_day_before_it() -> None:
+    holiday = date(2026, 11, 26)        # a Thursday, say
+    day_after = date(2026, 11, 27)      # Friday
+    last_before = date(2026, 11, 25)    # Wednesday — Thursday was a holiday
+    cal = SessionCache(FakeMds(holidays={holiday}), day_after)
+    # Before Friday's open, the last closed session skips the Thursday holiday.
+    assert cal.session_on_or_before(_et(day_after, 8, 0)).date == last_before  # type: ignore[union-attr]
 
 
 def test_reads_cache_then_refreshes_with_two_days_left() -> None:

@@ -85,24 +85,27 @@ class SessionCache:
         return None
 
     def session_on_or_before(self, t_utc: datetime) -> Optional[Session]:
-        """The session containing ``t_utc``, or the most recent one before it when ``t_utc`` is
-        outside every session (so compute_greeks off-hours prices as of the last close). The
-        forward-leaning cache may hold no prior session (a start on a non-trading day), so when it
-        doesn't, fetch a backward window from MDS and take the latest session on or before the day.
+        """The session containing ``t_utc``, or — when ``t_utc`` is outside every session — the
+        session with the latest ``close_utc`` at or before it (so compute_greeks off-hours prices as
+        of the last *closed* session). Selecting by close, not by date, matters between midnight and
+        09:30 ET on a trading day: today's session has not opened, so the answer is the prior day's
+        close, not today's unopened window. The forward-leaning cache may hold no such session (a
+        start on a non-trading day, or before today's open), so when it doesn't, fetch a backward
+        window from MDS and take the latest session closed at or before ``t_utc``.
         """
         if t_utc.tzinfo is None:
             raise ValueError("t_utc must be timezone-aware")
         here = self.session_at(t_utc)
         if here is not None:
             return here
-        d = t_utc.astimezone(ET).date()
         with self._lock:
-            prior = [sd for sd in self._sessions if sd <= d]
-            if prior:
-                return self._sessions[max(prior)]
+            closed = [s for s in self._sessions.values() if s.close_utc <= t_utc]
+            if closed:
+                return max(closed, key=lambda s: s.close_utc)
+        d = t_utc.astimezone(ET).date()
         sessions = self._fetch(d - timedelta(days=HORIZON_DAYS), d)
-        before = [s for s in sessions if s.date <= d]
-        return max(before, key=lambda s: s.date) if before else None
+        closed = [s for s in sessions if s.close_utc <= t_utc]
+        return max(closed, key=lambda s: s.close_utc) if closed else None
 
     def _refresh(self, d: date) -> None:
         covered = self._covered_from <= d <= self._covered_to
