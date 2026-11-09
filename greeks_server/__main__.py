@@ -57,7 +57,7 @@ def main() -> int:
         inputs.load_session(session.date)
 
     service = Service(name=ControlService.GREEKS, router_port=s.router_port)
-    service.register_handler(OP, make_handler(cfg, inputs, calendar.session_on_or_before))
+    service.register_handler(OP, make_handler(cfg, inputs, calendar.session_as_of))
 
     fatal: list[BaseException] = []
 

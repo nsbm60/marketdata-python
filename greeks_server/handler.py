@@ -127,8 +127,9 @@ def make_handler(
     inputs: InputsHolder,
     session_pick: Callable[[datetime], Optional[Session]],
 ) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
-    """`session_pick` is SessionCache.session_on_or_before: the session for an as-of time, or the
-    last before it. The handler reads no clock — as_of comes in the request."""
+    """`session_pick` is SessionCache.session_as_of: the latest session whose open is at or before
+    as_of. The handler reads no clock — as_of comes in the request — and prices at
+    min(as_of, session.close), one rule for in-session and off-session alike."""
     m = methodology(cfg)
 
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -136,12 +137,15 @@ def make_handler(
         as_of = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc)
         session = session_pick(as_of)
         if session is None:
-            raise ValueError(f"no trading session on or before as_of {as_of.isoformat()}")
-        in_session = session.contains(as_of)
-        price_time = as_of if in_session else session.close_utc
+            raise ValueError(f"no trading session open at or before as_of {as_of.isoformat()}")
+        # One rule: price at as_of while the session is open, else at its close (as_of >= open always,
+        # since the session is the latest opened at or before as_of).
+        price_time = min(as_of, session.close_utc)
         open_ms = session.open_ms
         price_time_ms = int(price_time.timestamp() * 1000)
-        session_inputs = inputs.for_request(session.date, in_session=in_session)
+        # Reuse the loop's loaded inputs only when as_of is inside this session (the live session);
+        # otherwise load SOFR/dividends fresh for the session's date.
+        session_inputs = inputs.for_request(session.date, in_session=session.contains(as_of))
         results = []
         for contract, oq, ot, uq, ut, uc in items:
             opt_px = select_price(oq, ot, open_ms, price_time_ms)

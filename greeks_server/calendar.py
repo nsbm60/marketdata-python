@@ -4,11 +4,13 @@ The calendar is Scala's alone: Python never re-implements holiday or session rul
 from MDS's get_trading_sessions op (it wraps USMarketCalendar.sessionFor) through the existing
 client, ml.shared.mds_client.get_trading_sessions.
 
-Cache: fetched at startup for today through today + 7 days, and again when fewer than two days
-remain. session_at() reads the cache, so an MDS outage mid-session doesn't affect gating. A
-failed refresh is logged and retried at most once a minute while the cache still covers today;
-a date the cache doesn't cover and can't fetch raises (the server exits and restarts waiting for
-MDS — it doesn't run without a calendar).
+Cache: fetched at startup for 10 days back through today + 7 days, and again when fewer than two
+days remain. The lookback lets session_as_of answer a pre-open or post-weekend as-of (the latest
+session opened at or before it) straight from the cache, without a backward fetch. session_at()
+and session_as_of() read the cache, so an MDS outage mid-session doesn't affect gating. A failed
+refresh is logged and retried at most once a minute while the cache still covers the date; a date
+the cache doesn't cover and can't fetch raises (the server exits and restarts waiting for MDS — it
+doesn't run without a calendar).
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 HORIZON_DAYS = 7
+# Past window: session_as_of needs the last closed session even on a long weekend / after holidays,
+# and before today's open it is a prior day's session — 10 days back covers those gaps.
+LOOKBACK_DAYS = 10
 REFRESH_WHEN_DAYS_LEFT = 2
 RETRY_S = 60.0
 
@@ -61,8 +66,9 @@ class SessionCache:
         self._last_try = float("-inf")
         self._load(today)  # startup: raises if MDS can't answer
 
-    def _load(self, start: date) -> None:
-        end = start + timedelta(days=HORIZON_DAYS)
+    def _load(self, anchor: date) -> None:
+        start = anchor - timedelta(days=LOOKBACK_DAYS)
+        end = anchor + timedelta(days=HORIZON_DAYS)
         sessions = self._fetch(start, end)
         for s in sessions:
             if not start <= s.date <= end or s.open_utc.tzinfo is None or not s.open_utc < s.close_utc:
@@ -84,28 +90,21 @@ class SessionCache:
             return s
         return None
 
-    def session_on_or_before(self, t_utc: datetime) -> Optional[Session]:
-        """The session containing ``t_utc``, or — when ``t_utc`` is outside every session — the
-        session with the latest ``close_utc`` at or before it (so compute_greeks off-hours prices as
-        of the last *closed* session). Selecting by close, not by date, matters between midnight and
-        09:30 ET on a trading day: today's session has not opened, so the answer is the prior day's
-        close, not today's unopened window. The forward-leaning cache may hold no such session (a
-        start on a non-trading day, or before today's open), so when it doesn't, fetch a backward
-        window from MDS and take the latest session closed at or before ``t_utc``.
-        """
-        if t_utc.tzinfo is None:
-            raise ValueError("t_utc must be timezone-aware")
-        here = self.session_at(t_utc)
-        if here is not None:
-            return here
+    def session_as_of(self, as_of: datetime) -> Optional[Session]:
+        """The one session rule for compute_greeks: the latest session whose ``open_utc`` is at or
+        before ``as_of``. In session that is today's session; before today's open it is the prior
+        day's (today's has not opened — the midnight-to-open bug); after the close it is still that
+        day's. The caller prices at ``min(as_of, session.close_utc)``. The cache holds 10 days back,
+        so a long weekend or a holiday is covered without a separate fetch. None only if no session
+        in the window opened at or before ``as_of`` (not reachable for an as-of near now)."""
+        if as_of.tzinfo is None:
+            raise ValueError("as_of must be timezone-aware")
+        d = as_of.astimezone(ET).date()
         with self._lock:
-            closed = [s for s in self._sessions.values() if s.close_utc <= t_utc]
-            if closed:
-                return max(closed, key=lambda s: s.close_utc)
-        d = t_utc.astimezone(ET).date()
-        sessions = self._fetch(d - timedelta(days=HORIZON_DAYS), d)
-        closed = [s for s in sessions if s.close_utc <= t_utc]
-        return max(closed, key=lambda s: s.close_utc) if closed else None
+            if (self._covered_to - d).days < REFRESH_WHEN_DAYS_LEFT:
+                self._refresh(d)
+            opened = [s for s in self._sessions.values() if s.open_utc <= as_of]
+        return max(opened, key=lambda s: s.open_utc) if opened else None
 
     def _refresh(self, d: date) -> None:
         covered = self._covered_from <= d <= self._covered_to

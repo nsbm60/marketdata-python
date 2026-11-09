@@ -45,10 +45,10 @@ def _et(d: date, h: int, m: int) -> datetime:
 TUE = date(2026, 10, 20)
 
 
-def test_startup_fetches_a_week() -> None:
+def test_startup_fetches_lookback_through_horizon() -> None:
     mds = FakeMds()
     SessionCache(mds, TUE)
-    assert mds.calls == [(TUE, TUE + timedelta(days=7))]
+    assert mds.calls == [(TUE - timedelta(days=10), TUE + timedelta(days=7))]
 
 
 def test_startup_without_mds_raises() -> None:
@@ -68,29 +68,29 @@ def test_session_bounds() -> None:
     assert cal.session_at(_et(date(2026, 10, 24), 12, 0)) is None  # Saturday: MDS sent none
 
 
-def test_session_on_or_before_in_or_after_session() -> None:
-    cal = SessionCache(FakeMds(), TUE)
-    # In session -> that session.
-    assert cal.session_on_or_before(_et(TUE, 12, 0)).date == TUE  # type: ignore[union-attr]
-    # After the close -> the same day's session (it has closed).
-    assert cal.session_on_or_before(_et(TUE, 17, 0)).date == TUE  # type: ignore[union-attr]
-    # A weekend -> the prior Friday.
-    assert cal.session_on_or_before(_et(date(2026, 10, 24), 12, 0)).date == date(2026, 10, 23)  # type: ignore[union-attr]
-
-
 # 2026-11-09 is a Monday; the Friday before is 2026-11-06.
 MON = date(2026, 11, 9)
 FRI_BEFORE = date(2026, 11, 6)
 
 
-def test_before_the_open_returns_the_prior_close_not_todays_unopened_session() -> None:
-    # The bug: between midnight and 09:30 ET on a trading day, selecting by DATE returned today's
-    # session, which has not opened. Selecting by close must return Friday.
-    cal = SessionCache(FakeMds(), MON)  # forward cache: Mon..Mon+7 (no prior Friday cached)
-    assert cal.session_on_or_before(_et(MON, 0, 30)).date == FRI_BEFORE   # type: ignore[union-attr]
-    assert cal.session_on_or_before(_et(MON, 8, 0)).date == FRI_BEFORE    # type: ignore[union-attr]
-    # After the open, it is in Monday's session.
-    assert cal.session_on_or_before(_et(MON, 10, 0)).date == MON          # type: ignore[union-attr]
+def _pick(cal: SessionCache, dt: datetime) -> "tuple[date, datetime]":
+    """The one rule the handler applies: the session, and the price time min(as_of, close)."""
+    s = cal.session_as_of(dt)
+    assert s is not None
+    return s.date, min(dt, s.close_utc)
+
+
+def test_session_as_of_is_latest_open_at_or_before() -> None:
+    # The cache holds the prior Friday (10-day lookback), so no backward fetch is needed.
+    cal = SessionCache(FakeMds(), MON)
+    fri_close = _et(FRI_BEFORE, 16, 0)
+    # Monday 00:30 and 08:00 ET: before Monday's open -> Friday's session, priced at Friday 16:00.
+    assert _pick(cal, _et(MON, 0, 30)) == (FRI_BEFORE, fri_close)
+    assert _pick(cal, _et(MON, 8, 0)) == (FRI_BEFORE, fri_close)
+    # Monday 10:00 ET: in session -> Monday, priced at 10:00.
+    assert _pick(cal, _et(MON, 10, 0)) == (MON, _et(MON, 10, 0))
+    # Monday 17:00 ET: after the close -> Monday, priced at 16:00.
+    assert _pick(cal, _et(MON, 17, 0)) == (MON, _et(MON, 16, 0))
 
 
 def test_day_after_a_holiday_returns_the_last_trading_day_before_it() -> None:
@@ -98,8 +98,9 @@ def test_day_after_a_holiday_returns_the_last_trading_day_before_it() -> None:
     day_after = date(2026, 11, 27)      # Friday
     last_before = date(2026, 11, 25)    # Wednesday — Thursday was a holiday
     cal = SessionCache(FakeMds(holidays={holiday}), day_after)
-    # Before Friday's open, the last closed session skips the Thursday holiday.
-    assert cal.session_on_or_before(_et(day_after, 8, 0)).date == last_before  # type: ignore[union-attr]
+    # Before Friday's open, the latest opened session skips the Thursday holiday.
+    s = cal.session_as_of(_et(day_after, 8, 0))
+    assert s is not None and s.date == last_before
 
 
 def test_reads_cache_then_refreshes_with_two_days_left() -> None:
@@ -109,7 +110,7 @@ def test_reads_cache_then_refreshes_with_two_days_left() -> None:
     assert len(mds.calls) == 1
     later = TUE + timedelta(days=6)                        # 1 day left: refresh from that day
     assert cal.session_at(_et(later, 12, 0)) is not None
-    assert mds.calls[-1] == (later, later + timedelta(days=7))
+    assert mds.calls[-1] == (later - timedelta(days=10), later + timedelta(days=7))
 
 
 def test_mds_outage_mid_session_does_not_affect_gating() -> None:
