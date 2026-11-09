@@ -28,16 +28,17 @@ from greeks_server.calendar import Session
 from greeks_server.compute import Contract, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
-from greeks_server.price import select_price
+from greeks_server.price import select_price, select_spot
 from greeks_server.wire import Quote, Trade
 
 OP = "compute_greeks"
-_CONTRACT_FIELDS = ("osi", "opt_quote", "opt_trade", "und_quote", "und_trade")
+_CONTRACT_FIELDS = ("osi", "opt_quote", "opt_trade", "und_quote", "und_trade", "und_close")
 _QUOTE_FIELDS = ("bid", "ask", "quote_ts")
 _TRADE_FIELDS = ("last", "trade_ts")
 
-# One request input: the contract and the raw facts for it (each side present or absent).
-ParsedItem = tuple[Contract, Optional[Quote], Optional[Trade], Optional[Quote], Optional[Trade]]
+# One request input: the contract and the raw facts for it (each side present or absent). und_close
+# is the underlying's last regular-session trade — a spot candidate under the same window bounds.
+ParsedItem = tuple[Contract, Optional[Quote], Optional[Trade], Optional[Quote], Optional[Trade], Optional[Trade]]
 
 
 def _finite(where: str, v: Any) -> float:
@@ -116,6 +117,7 @@ def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[ParsedItem]]:
             _trade(f"contracts[{i}].opt_trade", item.get("opt_trade")),
             _quote(f"contracts[{i}].und_quote", item.get("und_quote")),
             _trade(f"contracts[{i}].und_trade", item.get("und_trade")),
+            _trade(f"contracts[{i}].und_close", item.get("und_close")),
         ))
     return as_of, out
 
@@ -138,11 +140,12 @@ def make_handler(
         in_session = session.contains(as_of)
         price_time = as_of if in_session else session.close_utc
         open_ms = session.open_ms
+        price_time_ms = int(price_time.timestamp() * 1000)
         session_inputs = inputs.for_request(session.date, in_session=in_session)
         results = []
-        for contract, oq, ot, uq, ut in items:
-            opt_px = select_price(oq, ot, open_ms)
-            spot_px = select_price(uq, ut, open_ms)
+        for contract, oq, ot, uq, ut, uc in items:
+            opt_px = select_price(oq, ot, open_ms, price_time_ms)
+            spot_px = select_spot(uq, (ut, uc), open_ms, price_time_ms)
             results.append(compute_or_fail(contract, opt_px, spot_px, session_inputs, price_time, m).to_wire())
         return {"results": results}
 

@@ -62,6 +62,21 @@ def test_off_session_prices_at_close() -> None:
     assert loads == [SESSION]  # off-session request loads fresh, uncached
 
 
+def test_off_session_uses_und_close_over_after_hours_trade() -> None:
+    # The off-hours bug: the underlying's latest trade is a 20:00 after-hours print (188.70), after
+    # the close — it must be rejected. und_close (186.64, the 16:00 close) is used for the spot.
+    item = _item(
+        osi="NVDA261120C00180000",
+        opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": CLOSE_MS - 60_000},
+        und_trade={"last": 188.70, "trade_ts": CLOSE_MS + 60_000},   # after close → rejected
+        und_close={"last": 186.64, "trade_ts": CLOSE_MS - 60_000},   # the regular-session close
+    )
+    out = _handler([])(_req([item], as_of=CLOSE_MS + 3_600_000))
+    res = out["results"]
+    assert res[0]["status"] == "success"
+    assert res[0]["spot"] == 186.64 and res[0]["spot_kind"] == "last"  # the close, not 188.70
+
+
 def test_empty_list_is_fine() -> None:
     assert _handler([])(_req([])) == {"results": []}
 

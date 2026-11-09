@@ -174,9 +174,10 @@ class ComputeLoop(threading.Thread):
         t0 = time.perf_counter()
         ok = 0
         contracts = b.take_dirty()
+        price_time_ms = int(now.timestamp() * 1000)  # in session: price at or before now
         for c in contracts:
-            spot_px = select_price(b.equity_quotes.get(c.underlying), b.equity_trades.get(c.underlying), open_ms)
-            opt_px = select_price(b.option_quotes.get(c.osi), b.option_trades.get(c.osi), open_ms)
+            spot_px = select_price(b.equity_quotes.get(c.underlying), b.equity_trades.get(c.underlying), open_ms, price_time_ms)
+            opt_px = select_price(b.option_quotes.get(c.osi), b.option_trades.get(c.osi), open_ms, price_time_ms)
             msg = compute_or_fail(c, opt_px, spot_px, inputs, now, self._m)
             self._publish(greeks_topic(self._prefix, c), msg.to_wire())
             ok += msg.reason is None
@@ -188,11 +189,12 @@ class ComputeLoop(threading.Thread):
         assert self.session is not None and self._session_inputs is not None
         open_ms = self.session.open_ms
         close = self.session.close_utc
+        close_ms = int(close.timestamp() * 1000)  # off-session: price at or before the close
         inputs = self._session_inputs
         b = self.book
         for c in b.contracts.values():
-            spot_px = select_price(b.equity_quotes.get(c.underlying), b.equity_trades.get(c.underlying), open_ms)
-            opt_px = select_price(b.option_quotes.get(c.osi), b.option_trades.get(c.osi), open_ms)
+            spot_px = select_price(b.equity_quotes.get(c.underlying), b.equity_trades.get(c.underlying), open_ms, close_ms)
+            opt_px = select_price(b.option_quotes.get(c.osi), b.option_trades.get(c.osi), open_ms, close_ms)
             msg = compute_or_fail(c, opt_px, spot_px, inputs, close, self._m)
             self._publish(greeks_topic(self._prefix, c), msg.to_wire())
 
