@@ -1,6 +1,7 @@
-"""ComputeLoop.step(): session gating, coalescing, clock tick, publish topics, fatal loads.
+"""ComputeLoop.step(): the three triggers, book ordering, expiry drop, get_greeks + cold path.
 
-Driven directly through step() with a fake clock and calendar — no sockets, no threads.
+Driven directly through step() — no sockets, no threads. There is no session and no clock: every T
+comes from the data, so the tests assert priced_as_of against the timestamps they feed in.
 """
 
 from __future__ import annotations
@@ -8,49 +9,48 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from greeks.config import load_config
-from greeks.domain import RowStatus
-from greeks_server.calendar import Session
+from greeks.topic_builder import TopicBuilder
+from greeks_server.coldpath import ColdPath
+from greeks_server.compute import Methodology
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.loop import ComputeLoop
 
-from gs_helpers import SESSION, sofr_flat
+ET = ZoneInfo("America/New_York")
+DAY = date(2026, 11, 13)  # a Friday, well before the 2026-11-20 expiry; EST (UTC-5)
+NVDA_C = "NVDA261120C00180000"
+NVDA_P = "NVDA261120P00170000"
+OPT_C = "md.option.quote.NVDA.2026-11-20.C.180_00"
+OPT_P = "md.option.quote.NVDA.2026-11-20.P.170_00"
 
-OPEN = datetime(2026, 10, 20, 13, 30, tzinfo=timezone.utc)
-SESS = Session(SESSION, OPEN, OPEN + timedelta(hours=6, minutes=30))
-OPT_TOPIC = "md.option.quote.NVDA.2026-11-20.C.180_00"
+
+def et_ms(h: int, m: int, s: int = 0, day: date = DAY) -> int:
+    return int(datetime.combine(day, time(h, m, s), tzinfo=ET).astimezone(timezone.utc).timestamp() * 1000)
 
 
-class Clock:
-    def __init__(self) -> None:
-        self.t = OPEN + timedelta(hours=1)
-        self.mono = 1000.0
-
-    def advance(self, s: float) -> None:
-        self.t += timedelta(seconds=s)
-        self.mono += s
+def _sofr(d: date) -> dict[date, float]:
+    return {d - timedelta(days=i): 0.043 for i in range(1, 20)}
 
 
 class Harness:
-    def __init__(self, in_session: bool = True, loader_fails: bool = False) -> None:
-        self.cfg = load_config()
-        self.cfg = replace(self.cfg, server=replace(self.cfg.server, topic_prefix="shadow."))
-        self.clock = Clock()
-        self.in_session = in_session
+    def __init__(self, cold: Any = None, loader_fails: bool = False) -> None:
+        self.cfg = replace(load_config(), server=replace(load_config().server, topic_prefix="shadow."))
         self.published: list[tuple[str, dict[str, Any]]] = []
         self.loads: list[date] = []
         self.fatal: list[BaseException] = []
+        self.now_dt = datetime(2026, 11, 13, 23, 59, tzinfo=timezone.utc)  # late enough: no tick is "future"
 
         def loader(d: date) -> SessionInputs:
             self.loads.append(d)
             if loader_fails:
                 raise ValueError("no SOFR")
-            return SessionInputs(session_date=d, sofr=sofr_flat(), dividends={})
+            return SessionInputs(session_date=d, sofr=_sofr(d), dividends={})
 
         self.loop = ComputeLoop(
             self.cfg,
@@ -58,102 +58,173 @@ class Harness:
             publish=lambda t, p: self.published.append((t, p)),
             publisher_ready=threading.Event(),
             inputs=InputsHolder(loader),
+            cold=cold if cold is not None else FakeCold(),
             on_fatal=self.fatal.append,
-            now=lambda: self.clock.t,
-            monotonic=lambda: self.clock.mono,
-            session_fn=self._session,
+            now=lambda: self.now_dt,
         )
 
-    def _session(self, t: datetime) -> Optional[Session]:
-        return SESS if self.in_session else None
+    def opt_quote(self, topic: str, osi: str, bid: float, ask: float, ts: int) -> None:
+        self.loop.step(topic, json.dumps({"type": "quote", "symbol": osi, "bid": bid, "ask": ask, "timestamp": ts}))
 
-    def quote(self, topic: str, symbol: str, bid: float, ask: float) -> None:
-        ts = int(self.clock.t.timestamp() * 1000)
-        self.loop.step(topic, json.dumps({"type": "quote", "symbol": symbol, "bid": bid, "ask": ask, "timestamp": str(ts)}))
+    def opt_trade(self, topic: str, osi: str, price: float, ts: int) -> None:
+        self.loop.step(topic, json.dumps({"type": "trade", "symbol": osi, "price": price, "timestamp": ts}))
 
-    def idle(self) -> None:
-        self.loop.step("", "")
+    def eq_quote(self, sym: str, bid: float, ask: float, ts: int) -> None:
+        self.loop.step(f"md.equity.quote.{sym}", json.dumps({"type": "quote", "symbol": sym, "bid": bid, "ask": ask, "timestamp": ts}))
+
+    def eq_trade(self, sym: str, price: float, ts: int) -> None:
+        self.loop.step(f"md.equity.trade.{sym}", json.dumps({"type": "trade", "symbol": sym, "price": price, "timestamp": ts}))
+
+    def time_tick(self, ts: int) -> None:
+        self.loop.step(TopicBuilder.for_options_time(), json.dumps({"type": "time", "ts": ts}))
+
+    def last(self) -> dict[str, Any]:
+        return self.published[-1][1]
 
 
-def test_off_session_drops_ticks_and_loads_nothing() -> None:
-    h = Harness(in_session=False)
-    h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
-    assert not h.loop.book.contracts and not h.published and not h.loads
+class FakeCold:
+    """Stands in for ColdPath. Returns a pre-seeded ColdResult per requested osi, in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.by_osi: dict[str, Any] = {}
+
+    def price(self, osis: list[str]) -> list[Any]:
+        self.calls.append(list(osis))
+        return [self.by_osi[o] for o in osis]
 
 
-def test_open_loads_inputs_once_and_publishes_with_prefix() -> None:
+def test_option_tick_prices_as_of_its_timestamp_from_the_stock_history() -> None:
     h = Harness()
-    h.quote("md.equity.quote.NVDA", "NVDA", 181.0, 181.02)
-    h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
-    assert h.loads == [SESSION]
-    topics = [t for t, _ in h.published]
-    assert topics == ["shadow.md.option.greeks.NVDA.2026-11-20.C.180_00"]
-    msg = h.published[0][1]
-    assert msg["status"] == RowStatus.SUCCESS.value and msg["price_kind"] == "mid"
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))          # history only
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 5))    # reprices now, as of its own ts
+    assert [t for t, _ in h.published] == ["shadow.md.option.greeks.NVDA.2026-11-20.C.180_00"]
+    msg = h.last()
+    assert msg["status"] == "success"
+    assert msg["priced_as_of"] == et_ms(11, 0, 5)            # the option quote's timestamp
+    assert msg["spot"] == pytest.approx(181.01)              # the stock mid from history, at or before T
+    assert msg["spot_ts"] == et_ms(11, 0)
 
 
-def test_coalescing_one_pass_per_interval() -> None:
+def test_a_stock_tick_does_not_reprice() -> None:
     h = Harness()
-    h.quote("md.equity.quote.NVDA", "NVDA", 181.0, 181.02)
-    h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 5))
     n = len(h.published)
-    for i in range(10):  # ten underlying ticks inside 100 ms
-        h.clock.advance(0.01)
-        h.quote("md.equity.quote.NVDA", "NVDA", 181.0 + i * 0.01, 181.02 + i * 0.01)
-    assert len(h.published) == n  # still inside min_pass_interval (250 ms)
-    h.clock.advance(0.2)
-    h.idle()
-    assert len(h.published) == n + 1  # one pass for all of them
-
-
-def test_clock_tick_reprices_everything() -> None:
-    h = Harness()
-    h.quote("md.equity.quote.NVDA", "NVDA", 181.0, 181.02)
-    h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
-    h.quote("md.option.quote.NVDA.2026-11-20.P.170_00", "NVDA261120P00170000", 3.0, 3.1)
-    h.clock.advance(1.0)
-    h.idle()
-    before = len(h.published)
-    h.clock.advance(h.cfg.server.clock_tick_s)
-    h.idle()
-    assert len(h.published) == before + 2
-
-
-def test_no_spot_publishes_failure() -> None:
-    h = Harness()
-    h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
-    assert h.published[-1][1]["reason"] == "missing_spot"
-
-
-def test_close_pass_then_clears_state() -> None:
-    h = Harness()
-    h.quote("md.equity.quote.NVDA", "NVDA", 181.0, 181.02)
-    h.quote(OPT_TOPIC, "NVDA261120C00180000", 9.0, 9.2)
-    before = len(h.published)
-    h.in_session = False
-    h.idle()
-    # One final close pass over the whole book, at the session's close, then the book is cleared.
-    assert len(h.published) == before + 1
-    assert h.published[-1][1]["computed_at"] == int(SESS.close_utc.timestamp() * 1000)
-    assert h.loop.session is None and not h.loop.book.contracts
-    # Nothing more off-session.
-    n = len(h.published)
-    h.clock.advance(30)
-    h.idle()
+    h.eq_quote("NVDA", 181.5, 181.52, et_ms(11, 0, 10))      # later stock: history only, no publish
+    h.eq_trade("NVDA", 181.7, et_ms(11, 0, 11))
     assert len(h.published) == n
 
 
-def test_failed_load_is_fatal_through_run() -> None:
+def test_time_event_reprices_every_contract() -> None:
+    h = Harness()
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
+    h.opt_quote(OPT_P, NVDA_P, 3.0, 3.2, et_ms(11, 0, 1))
+    h.published.clear()
+    h.eq_quote("NVDA", 182.0, 182.02, et_ms(11, 0, 4))       # moves the stock, does not reprice
+    h.time_tick(et_ms(11, 0, 5))                             # one full pass as of 11:00:05
+    topics = sorted(t for t, _ in h.published)
+    assert topics == [
+        "shadow.md.option.greeks.NVDA.2026-11-20.C.180_00",
+        "shadow.md.option.greeks.NVDA.2026-11-20.P.170_00",
+    ]
+    for _, msg in h.published:
+        assert msg["priced_as_of"] == et_ms(11, 0, 5)
+        assert msg["spot"] == pytest.approx(182.01)          # the 11:00:04 stock, now reflected
+
+
+def test_an_older_result_never_replaces_a_newer_one() -> None:
+    h = Harness()
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
+    h.time_tick(et_ms(12, 0))                                # newest result priced as of 12:00
+    h.published.clear()
+    h.time_tick(et_ms(11, 30))                               # older: rejected, nothing published
+    assert h.published == []
+
+
+def test_missing_stock_is_a_published_failure() -> None:
+    h = Harness()
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0))       # no stock history yet
+    assert h.last()["reason"] == "missing_spot"
+
+
+def test_expired_contract_dropped_and_its_history_pruned() -> None:
+    h = Harness()
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
+    assert NVDA_C in h.loop.book.contracts
+    # A time tick after the 2026-11-20 16:00 ET close: the contract is dropped before the pass and
+    # its underlying's history is pruned (nothing left in the book references NVDA).
+    h.time_tick(et_ms(16, 1, 0, day=date(2026, 11, 20)))
+    assert NVDA_C not in h.loop.book.contracts
+    assert h.loop.stock.at("NVDA", et_ms(16, 1, 0, day=date(2026, 11, 20))) is None
+
+
+def test_get_greeks_answers_from_book_then_cold_path() -> None:
+    # Real ColdPath with a fake MDS transport: the second contract is not in the book, so it is
+    # priced through MDS and the stock is asked for at the option quote's own timestamp.
+    requests: list[dict[str, Any]] = []
+    qts = et_ms(11, 0, 0)
+
+    def transport(req: dict[str, Any]) -> dict[str, Any]:
+        requests.append(req)
+        if req["op"] == "get_option_snapshots":
+            snaps = {NVDA_P: {"osi": NVDA_P, "quote": {"bid": 3.0, "ask": 3.2, "at": qts}}}
+            return {"ok": True, "data": {"snapshots": snaps, "count": 1}}
+        return {"ok": True, "data": {"prices": [{"symbol": "NVDA", "as_of": qts, "last": 181.0, "trade_ts": qts - 1000}]}}
+
+    h = Harness()
+    cold = ColdPath(transport, h.loop._inputs, Methodology("v2", 15.0, "16:00"))
+    h.loop._cold = cold  # type: ignore[assignment]
+
+    # Seed the book with one contract via a live tick.
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
+    h.published.clear()
+
+    out = h.loop.get_greeks([NVDA_C, NVDA_P])
+    assert [m.osi for m in out] == [NVDA_C, NVDA_P]
+    assert out[0].priced_as_of == et_ms(11, 0, 1)            # from the book
+    assert out[1].status.value == "success" and out[1].priced_as_of == qts  # cold-path, as of the quote
+    # The stock was asked for at the quote's own timestamp.
+    eq_req = next(r for r in requests if r["op"] == "get_equity_prices_at")
+    assert eq_req["symbols_at"] == [{"symbol": "NVDA", "ts": qts}]
+    # The cold-path result was added to the book and published.
+    assert NVDA_P in h.loop.book.contracts
+    assert any(t.endswith("P.170_00") for t, _ in h.published)
+
+
+def test_friday_curb_quote_priced_against_the_stock_at_that_time() -> None:
+    h = Harness()
+    h.now_dt = datetime(2026, 11, 13, 22, 0, tzinfo=timezone.utc)  # ~17:00 ET, after the curb
+    h.eq_trade("NVDA", 186.64, et_ms(16, 0))                 # the 16:00 close
+    h.eq_trade("NVDA", 186.90, et_ms(16, 5))                 # a 16:05 curb print
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(16, 5))       # re-quoted at 16:05
+    msg = h.last()
+    assert msg["status"] == "success"
+    assert msg["priced_as_of"] == et_ms(16, 5)
+    assert msg["spot"] == pytest.approx(186.90) and msg["spot_ts"] == et_ms(16, 5)
+
+
+def test_failed_input_load_is_fatal_through_run() -> None:
     h = Harness(loader_fails=True)
     with pytest.raises(ValueError):
-        h.idle()  # step() raises; run() turns that into on_fatal
+        h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0))   # for_date raises before the lock
 
 
 def test_run_reports_fatal_and_returns() -> None:
     h = Harness(loader_fails=True)
 
     class Sub:
+        def __init__(self) -> None:
+            self._sent = False
+
         def recv(self) -> tuple[str, str]:
+            if not self._sent:
+                self._sent = True
+                return OPT_C, json.dumps({"type": "quote", "symbol": NVDA_C, "bid": 9.0, "ask": 9.2, "timestamp": et_ms(11, 0)})
             return "", ""
 
         def stop(self) -> None: ...
@@ -169,7 +240,6 @@ def test_run_reports_fatal_and_returns() -> None:
 
 
 def test_thread_start_stop_join() -> None:
-    """The loop is a real Thread: stop() then join() returns (no shadowing of Thread internals)."""
     h = Harness()
     h.loop.start()
     h.loop.stop()

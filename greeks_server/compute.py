@@ -77,7 +77,7 @@ def iv_for(
 def _failure(
     contract: Contract,
     reason: FailureReason,
-    now_ms: int,
+    priced_as_of_ms: int,
     m: Methodology,
     option_px: Optional[SelectedPrice],
     spot_px: Optional[SelectedPrice],
@@ -89,7 +89,7 @@ def _failure(
         osi=contract.osi,
         status=RowStatus.FAILURE,
         reason=reason,
-        computed_at=now_ms,
+        priced_as_of=priced_as_of_ms,
         methodology_version=m.methodology_version,
         price=None if option_px is None else option_px.value,
         price_kind=None if option_px is None else option_px.kind,
@@ -108,36 +108,38 @@ def compute(
     option_px: Optional[SelectedPrice],
     spot_px: Optional[SelectedPrice],
     inputs: SessionInputs,
-    now_utc: datetime,
+    as_of: datetime,
     m: Methodology,
 ) -> OptionGreeksMessage:
-    now_ms = int(now_utc.timestamp() * 1000)
+    """Price one contract as of the moment ``as_of`` (= T). Time to expiry runs from as_of; the
+    rate and dividends come from inputs loaded for as_of's date."""
+    priced_as_of_ms = int(as_of.timestamp() * 1000)
     if spot_px is None:
-        return _failure(contract, FailureReason.MISSING_SPOT, now_ms, m, option_px, None)
+        return _failure(contract, FailureReason.MISSING_SPOT, priced_as_of_ms, m, option_px, None)
     if option_px is None:
-        return _failure(contract, FailureReason.NO_SESSION_PRICE, now_ms, m, None, spot_px)
+        return _failure(contract, FailureReason.NO_SESSION_PRICE, priced_as_of_ms, m, None, spot_px)
 
     if contract.expiry < inputs.session_date:
-        # Expired before this session: there is no rate for a negative term. The solver's floor
+        # Expired before as_of's date: there is no rate for a negative term. The solver's floor
         # (t_below_floor) is the reason it would give; the floor itself stays the solver's.
-        return _failure(contract, FailureReason.T_BELOW_FLOOR, now_ms, m, option_px, spot_px)
+        return _failure(contract, FailureReason.T_BELOW_FLOOR, priced_as_of_ms, m, option_px, spot_px)
 
     r = inputs.rate_for(contract.expiry)
     c = carry(
-        spot_px.value, r, now_utc, contract.expiry,
+        spot_px.value, r, as_of, contract.expiry,
         inputs.dividends_for(contract.underlying), expiry_time_et=m.expiry_time_et,
     )
     res = iv_for(contract, option_px.value, c.forward, c.discount, c.time_to_expiry, spot_px.value, m)
     if res.status is not RowStatus.SUCCESS:
         assert res.reason_code is not None  # SolverResult invariant
         return _failure(
-            contract, res.reason_code, now_ms, m, option_px, spot_px,
+            contract, res.reason_code, priced_as_of_ms, m, option_px, spot_px,
             forward=c.forward, discount=c.discount, t=c.time_to_expiry,
         )
     return OptionGreeksMessage(
         osi=contract.osi,
         status=RowStatus.SUCCESS,
-        computed_at=now_ms,
+        priced_as_of=priced_as_of_ms,
         methodology_version=m.methodology_version,
         theta_limited=res.theta_interpretively_limited,
         iv=res.iv,
@@ -163,15 +165,15 @@ def compute_or_fail(
     option_px: Optional[SelectedPrice],
     spot_px: Optional[SelectedPrice],
     inputs: SessionInputs,
-    now_utc: datetime,
+    as_of: datetime,
     m: Methodology,
 ) -> OptionGreeksMessage:
     """compute(), but one contract can't take the server down: an unexpected error (bad dividend
     row, a non-finite greek from the library) is published as solver_failed for that contract."""
     try:
-        return compute(contract, option_px, spot_px, inputs, now_utc, m)
+        return compute(contract, option_px, spot_px, inputs, as_of, m)
     except Exception as e:  # noqa: BLE001 — per-contract isolation, logged
         log.warning("%s: compute raised %s: %s — publishing solver_failed", contract.osi, type(e).__name__, e)
         return _failure(
-            contract, FailureReason.SOLVER_FAILED, int(now_utc.timestamp() * 1000), m, option_px, spot_px
+            contract, FailureReason.SOLVER_FAILED, int(as_of.timestamp() * 1000), m, option_px, spot_px
         )

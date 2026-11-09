@@ -30,7 +30,11 @@ _GREEKS = ("iv", "delta", "gamma", "theta", "vega", "rho")
 class OptionGreeksMessage:
     osi: str
     status: RowStatus
-    computed_at: int
+    # The one moment T these greeks are priced as of (epoch ms) — the tick's own timestamp, the
+    # time event's ts, or a cold-path quote's timestamp. It is the book's ordering key: a result
+    # replaces the held one only if its priced_as_of is later (or equal, a success over a failure).
+    # There is no separate wall-clock "computed_at": the server reads no clock.
+    priced_as_of: int
     methodology_version: str
     theta_limited: bool = False
     reason: Optional[FailureReason] = None
@@ -108,17 +112,17 @@ class OptionGreeksMessage:
             v = d.get(key)
             return None if v is None else PriceKind(v)
 
-        for req in ("osi", "status", "computed_at", "methodology_version", "theta_limited"):
+        for req in ("osi", "status", "priced_as_of", "methodology_version", "theta_limited"):
             if req not in d:
                 raise ValueError(f"missing field: {req}")
-        computed_at = integer("computed_at")
-        assert computed_at is not None
+        priced_as_of = integer("priced_as_of")
+        assert priced_as_of is not None
         if not isinstance(d["theta_limited"], bool):
             raise ValueError("theta_limited must be a bool")
         return OptionGreeksMessage(
             osi=str(d["osi"]),
             status=RowStatus(d["status"]),
-            computed_at=computed_at,
+            priced_as_of=priced_as_of,
             methodology_version=str(d["methodology_version"]),
             theta_limited=d["theta_limited"],
             reason=None if d.get("reason") is None else FailureReason(d["reason"]),

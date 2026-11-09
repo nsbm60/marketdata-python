@@ -1,56 +1,86 @@
-"""Book: newer-only updates, dirty marking, underlying fan-out, non-OSI drop."""
+"""Book: register on first sight, newer-only held prices, result ordering, drop, non-OSI reject."""
 
 from __future__ import annotations
 
+from greeks.domain import FailureReason, RowStatus
 from greeks_server.book import Book
-from greeks_server.wire import Quote, Tick, Trade
+from greeks_server.message import OptionGreeksMessage
+from greeks_server.price import PriceKind
+from greeks_server.wire import Quote, Trade
 
 A = "NVDA261120C00180000"
 B = "NVDA261120P00170000"
 M = "MU261120C00200000"
 
 
-def test_contracts_enter_on_first_tick_and_go_dirty() -> None:
+def _ok(osi: str, priced_as_of: int) -> OptionGreeksMessage:
+    return OptionGreeksMessage(
+        osi=osi, status=RowStatus.SUCCESS, priced_as_of=priced_as_of, methodology_version="v2",
+        iv=0.4, delta=0.5, gamma=0.01, theta=-0.1, vega=0.2, rho=-0.01,
+        price=9.0, price_kind=PriceKind.MID, price_ts=priced_as_of,
+        spot=181.0, spot_kind=PriceKind.MID, spot_ts=priced_as_of,
+        forward=181.0, discount=0.99, t_years=0.08,
+    )
+
+
+def _fail(osi: str, priced_as_of: int) -> OptionGreeksMessage:
+    return OptionGreeksMessage(
+        osi=osi, status=RowStatus.FAILURE, reason=FailureReason.MISSING_SPOT,
+        priced_as_of=priced_as_of, methodology_version="v2",
+    )
+
+
+def test_ensure_registers_once_and_indexes_by_underlying() -> None:
     b = Book()
-    b.on_option(Tick(A, quote=Quote(1.0, 1.1, 10)))
-    b.on_option(Tick(M, trade=Trade(2.0, 10)))
+    assert b.ensure(A) is not None
+    assert b.ensure(A) is b.ensure(A)       # same object, registered once
+    b.ensure(M)
     assert set(b.contracts) == {A, M}
     assert b.by_underlying == {"NVDA": {A}, "MU": {M}}
-    assert {c.osi for c in b.take_dirty()} == {A, M}
-    assert not b.dirty
+    assert b.underlyings() == {"NVDA", "MU"}
 
 
-def test_older_quote_is_ignored_and_not_dirty() -> None:
+def test_non_standard_osi_rejected_and_not_reparsed() -> None:
     b = Book()
-    b.on_option(Tick(A, quote=Quote(1.0, 1.1, 20)))
-    b.take_dirty()
-    b.on_option(Tick(A, quote=Quote(9.0, 9.1, 10)))
+    assert b.ensure("NVDA1261120C00180000") is None
+    assert b.ensure("NVDA1261120C00180000") is None
+    assert not b.contracts
+
+
+def test_held_quote_is_newer_only() -> None:
+    b = Book()
+    b.ensure(A)
+    assert b.on_option_quote(A, Quote(1.0, 1.1, 20)) is True
+    assert b.on_option_quote(A, Quote(9.0, 9.1, 10)) is False   # older: ignored
     assert b.option_quotes[A] == Quote(1.0, 1.1, 20)
-    assert not b.dirty
+    assert b.on_option_trade(A, Trade(2.0, 30)) is True
 
 
-def test_underlying_tick_dirties_its_contracts_only() -> None:
+def test_accept_takes_a_later_priced_as_of_only() -> None:
     b = Book()
-    for osi in (A, B, M):
-        b.on_option(Tick(osi, trade=Trade(1.0, 5)))
-    b.take_dirty()
-    b.on_equity(Tick("NVDA", quote=Quote(180.0, 180.1, 7)))
-    assert b.dirty == {A, B}
-    b.on_equity(Tick("TSLA", trade=Trade(250.0, 7)))  # no contracts: stored, nothing dirty
-    assert b.dirty == {A, B} and "TSLA" in b.equity_trades
+    assert b.accept(_ok(A, 100)) is True
+    assert b.accept(_ok(A, 90)) is False     # earlier: rejected
+    assert b.accept(_ok(A, 100)) is False    # same time, success over success: no promotion
+    assert b.accept(_ok(A, 110)) is True
+    assert b.results[A].priced_as_of == 110
 
 
-def test_mark_all_dirty() -> None:
+def test_equal_time_success_replaces_a_failure() -> None:
     b = Book()
-    for osi in (A, M):
-        b.on_option(Tick(osi, trade=Trade(1.0, 5)))
-    b.take_dirty()
-    b.mark_all_dirty()
-    assert b.dirty == {A, M}
+    assert b.accept(_fail(A, 100)) is True
+    assert b.accept(_ok(A, 100)) is True                 # same time, promotes failure -> success
+    assert b.results[A].status is RowStatus.SUCCESS
+    assert b.accept(_fail(A, 100)) is False              # does not demote at equal time
 
 
-def test_non_standard_osi_dropped() -> None:
+def test_drop_forgets_everything() -> None:
     b = Book()
-    b.on_option(Tick("NVDA1261120C00180000", quote=Quote(1.0, 1.1, 1)))
-    b.on_option(Tick("NVDA1261120C00180000", quote=Quote(1.0, 1.1, 2)))
-    assert not b.contracts and not b.dirty
+    b.ensure(A)
+    b.ensure(B)
+    b.on_option_quote(A, Quote(1.0, 1.1, 5))
+    b.accept(_ok(A, 5))
+    b.drop(A)
+    assert A not in b.contracts and A not in b.option_quotes and A not in b.results
+    assert b.by_underlying == {"NVDA": {B}}
+    b.drop(B)
+    assert b.by_underlying == {} and b.underlyings() == set()

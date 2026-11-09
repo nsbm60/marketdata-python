@@ -59,11 +59,12 @@ class ServerSettings:
 
     topic_prefix is prepended to every md.option.greeks topic the server publishes:
     "shadow." while MDS's vendor greeks still own md.option.greeks, "" at cutover.
+
+    There is no pass-interval or clock-tick knob: the server is driven by data (option ticks reprice
+    at once) and by MDS's cal.options.time tick (one full pass per 5 s). Nothing batches.
     """
 
     router_port: int
-    clock_tick_s: float
-    min_pass_interval_ms: int
     topic_prefix: str
 
 
@@ -150,29 +151,18 @@ def _parse_tables(raw: Mapping[str, Any], sofr_table: str) -> TableNames:
 
 def _parse_server(raw: Any) -> ServerSettings:
     m = _require_mapping(raw, "server")
-    for key in ("router_port", "clock_tick_s", "min_pass_interval_ms", "topic_prefix"):
+    for key in ("router_port", "topic_prefix"):
         if key not in m:
             raise ValueError(f"server.{key} is required")
     router_port = m["router_port"]
-    clock_tick_s = m["clock_tick_s"]
-    min_pass = m["min_pass_interval_ms"]
     prefix = m["topic_prefix"]
     if not isinstance(router_port, int) or isinstance(router_port, bool) or not 0 < router_port < 65536:
         raise ValueError(f"server.router_port must be a port number, got {router_port!r}")
-    if not isinstance(clock_tick_s, (int, float)) or isinstance(clock_tick_s, bool) or clock_tick_s <= 0:
-        raise ValueError(f"server.clock_tick_s must be > 0, got {clock_tick_s!r}")
-    if not isinstance(min_pass, int) or isinstance(min_pass, bool) or min_pass <= 0:
-        raise ValueError(f"server.min_pass_interval_ms must be a positive int, got {min_pass!r}")
     if not isinstance(prefix, str):
         raise ValueError(f"server.topic_prefix must be a string, got {prefix!r}")
     if prefix and not prefix.endswith("."):
         raise ValueError(f"server.topic_prefix must be empty or end with '.', got {prefix!r}")
-    return ServerSettings(
-        router_port=router_port,
-        clock_tick_s=float(clock_tick_s),
-        min_pass_interval_ms=min_pass,
-        topic_prefix=prefix,
-    )
+    return ServerSettings(router_port=router_port, topic_prefix=prefix)
 
 
 def _clickhouse_from_env() -> ClickHouseSettings:

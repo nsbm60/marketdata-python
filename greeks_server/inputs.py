@@ -1,9 +1,9 @@
-"""Session inputs: SOFR series and upcoming dividends (greeks-server-spec.md §3, §5.3, §9).
+"""Per-date inputs: SOFR series and upcoming dividends (greeks-server-spec.md §3, §5.3, §9).
 
-Loaded at each session open (and on demand for compute_greeks outside a session). Immutable once
-built; the holder swaps the whole value atomically, so the compute thread and the router thread
-never see a half-updated set. A load that can't produce usable inputs raises: the server exits and
-systemd restarts it through the normal startup path.
+A set of greeks priced as of T needs the rate and dividends for T's date. There is no session: the
+holder loads once per date and caches the immutable result, so the compute thread and the router
+thread (cold path, get_greeks) can both ask for any date and share the answer. A load that can't
+produce usable inputs raises at the point of use.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping
 
 from greeks.domain import Dividend
 from greeks.forwards.sofr import continuous_rate_from_sofr
@@ -28,6 +28,7 @@ SOFR_SOURCE = "nyfed"
 
 @dataclass(frozen=True)
 class SessionInputs:
+    # session_date is the date these inputs are for — the ET date of the moment T being priced.
     session_date: date
     sofr: Mapping[date, float]
     dividends: Mapping[str, tuple[Dividend, ...]]
@@ -98,36 +99,25 @@ def clickhouse_loader(get_client: Callable[[], object]) -> Loader:
 
 
 class InputsHolder:
-    """The session's SessionInputs, swapped whole.
+    """SessionInputs cached by date, loaded on first use for that date.
 
-    Only a session load fills it: startup inside a session, or the compute loop at the open.
-    An off-session compute_greeks loads fresh and does not cache, so an early-morning request
-    can't leave the open running on inputs loaded before the 08:45 SOFR job.
+    Both the compute thread and the router thread ask for arbitrary dates and share the result.
+    The SOFR fix for a date is stable once published, so caching it is safe; a restart (roughly
+    daily) clears the cache. The loader has its own lock, so it is called outside this one.
     """
 
     def __init__(self, loader: Loader) -> None:
         self._loader = loader
-        self._current: Optional[SessionInputs] = None
+        self._lock = threading.Lock()
+        self._by_date: dict[date, SessionInputs] = {}
 
-    def current(self) -> Optional[SessionInputs]:
-        return self._current
-
-    def load_session(self, session_date: date) -> SessionInputs:
-        """Load for a session that is open now, and keep it."""
-        inputs = self._loader(session_date)
-        self._current = inputs
-        return inputs
-
-    def session_inputs(self, session_date: date) -> SessionInputs:
-        """The open's inputs: reuse a load already made inside this session (startup), else load."""
-        cur = self._current
-        if cur is not None and cur.session_date == session_date:
+    def for_date(self, d: date) -> SessionInputs:
+        """The inputs for date ``d``: the cached load if present, else a fresh one (cached). Raises
+        if the load can't produce usable inputs (e.g. no recent SOFR fix)."""
+        with self._lock:
+            cur = self._by_date.get(d)
+        if cur is not None:
             return cur
-        return self.load_session(session_date)
-
-    def for_request(self, session_date: date, in_session: bool) -> SessionInputs:
-        """compute_greeks: the session's inputs while it is open, a fresh uncached load otherwise."""
-        cur = self._current
-        if in_session and cur is not None and cur.session_date == session_date:
-            return cur
-        return self._loader(session_date)
+        inputs = self._loader(d)
+        with self._lock:
+            return self._by_date.setdefault(d, inputs)

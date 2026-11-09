@@ -47,7 +47,7 @@ def test_success_matches_the_solver_directly() -> None:
     )
     assert (msg.forward, msg.discount, msg.t_years) == (cr.forward, cr.discount, cr.time_to_expiry)
     assert (msg.price, msg.price_kind, msg.price_ts) == (px.value, PriceKind.MID, px.ts_ms)
-    assert msg.computed_at == NOW_MS and msg.methodology_version == "v2"
+    assert msg.priced_as_of == NOW_MS and msg.methodology_version == "v2"
 
 
 def test_dividend_inside_life_lowers_the_forward() -> None:

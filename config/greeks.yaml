@@ -47,6 +47,6 @@ tables:
 # Live greeks server (greeks_server/, greeks-server-spec.md §9). All fields required.
 server:
   router_port: 6110            # block above the bus (6100/6101); 6000-6092 are taken
-  clock_tick_s: 5              # the time input: mark every contract dirty this often
-  min_pass_interval_ms: 250    # coalescing: at most one pricing pass per interval
   topic_prefix: ""             # cutover: publish on md.option.greeks.* (spec §10)
+  # No clock_tick_s / min_pass_interval_ms: the server is driven by option ticks and MDS's
+  # cal.options.time 5-second pass (greeks-server-spec.md §3-§5). Nothing batches.

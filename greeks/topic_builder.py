@@ -29,6 +29,7 @@ class TopicBuilder:
     DOMAIN_SERVICE = "service"   # discovery bus
     DOMAIN_IB = "ib"
     DOMAIN_REPORT = "report"     # pre-computed reports from CalcServer
+    DOMAIN_CALENDAR = "cal"      # market calendar signals (open/close/time ticks)
 
     CAT_EQUITY = "equity"
     CAT_OPTION = "option"
@@ -147,6 +148,13 @@ class TopicBuilder:
         # bootstrap. The greeks server neither publishes nor consumes it; kept here in lockstep with
         # Scala TopicBuilder.forOptionRef (the topic golden test enforces parity).
         return f"{TopicBuilder.prefix_option_ref()}{TopicBuilder._option_suffix(underlying, expiry, side, strike)}"
+
+    # ── market calendar (mirror Scala forOptionsTime) ─────────────────────────────
+    @staticmethod
+    def for_options_time() -> str:
+        """`cal.options.time` — MDS's 5-second time tick while the options session is open. The
+        greeks server subscribes to it to run one full repricing pass per tick."""
+        return f"{TopicBuilder.DOMAIN_CALENDAR}.{TopicBuilder.PART_OPTIONS}.time"
 
     # ── CalcServer reports (underlying lowercase, matching Scala forOptionsReport) ──
     @staticmethod

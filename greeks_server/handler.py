@@ -1,20 +1,26 @@
-"""compute_greeks — the on-demand batch op (greeks-server-spec.md §4, §6).
+"""The two control ops (greeks-server-spec.md §4, §6).
 
-Request:  {"op": "compute_greeks", "as_of": <epoch ms>,
-           "contracts": [{"osi",
-                          "opt_quote": {"bid","ask","quote_ts"}?,  "opt_trade": {"last","trade_ts"}?,
-                          "und_quote": {"bid","ask","quote_ts"}?,  "und_trade": {"last","trade_ts"}?}, …]}
-Response: {"results": [<OptionGreeksMessage wire dict>, …]}  — one per input, input order.
+compute_greeks — raw-facts, pure. Prices each contract from the facts in the request and returns
+the results; it never touches the book or publishes. Used by tools/Tradeability.scala.
 
-The caller sends raw facts, not a chosen price: the latest option quote/trade and the underlying's
-latest quote/trade, each side omitted when absent (never 0), plus the as-of time. The server owns the
-session and the price rule: it picks the session containing as_of (or the last before it when as_of
-is outside every session), applies select_price (§4) relative to that session's open for the option
-and the spot, prices at as_of in session or at that session's close otherwise, and loads SOFR and
-dividends for that session's date. The handler never reads the clock.
+  Request:  {"op": "compute_greeks", "as_of": <epoch ms>,
+             "contracts": [{"osi",
+                            "opt_quote": {"bid","ask","quote_ts"}?,  "opt_trade": {"last","trade_ts"}?,
+                            "und_quote": {"bid","ask","quote_ts"}?,  "und_trade": {"last","trade_ts"}?}, …]}
+  Response: {"results": [<OptionGreeksMessage wire dict>, …]}  — one per input, input order.
 
-Validation is at the edge: a malformed request is rejected whole with a specific error (the Router
-turns the exception into {ok: false, error}). Nothing is defaulted.
+  as_of is an upper bound: for each contract T is the option price's own timestamp at or before
+  as_of (mid first, else last), the spot is the newest fact at or before T, and the rate and
+  dividends are for T's date. No session, no clock.
+
+get_greeks — the live book op. Answers each contract from the book, prices any the book has never
+seen through the cold path (which asks MDS), and publishes those.
+
+  Request:  {"op": "get_greeks", "contracts": [<osi>, …]}
+  Response: {"results": [<OptionGreeksMessage wire dict>, …]}  — one per contract, input order.
+
+Validation is at the edge: a malformed request is rejected whole with a specific error. Nothing is
+defaulted.
 """
 
 from __future__ import annotations
@@ -22,23 +28,25 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from greeks.config import GreeksConfig
-from greeks_server.calendar import Session
 from greeks_server.compute import Contract, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
+from greeks_server.message import OptionGreeksMessage
 from greeks_server.price import select_price, select_spot
 from greeks_server.wire import Quote, Trade
 
 OP = "compute_greeks"
-_CONTRACT_FIELDS = ("osi", "opt_quote", "opt_trade", "und_quote", "und_trade", "und_close")
+OP_GET = "get_greeks"
+ET = ZoneInfo("America/New_York")
+_CONTRACT_FIELDS = ("osi", "opt_quote", "opt_trade", "und_quote", "und_trade")
 _QUOTE_FIELDS = ("bid", "ask", "quote_ts")
 _TRADE_FIELDS = ("last", "trade_ts")
 
-# One request input: the contract and the raw facts for it (each side present or absent). und_close
-# is the underlying's last regular-session trade — a spot candidate under the same window bounds.
-ParsedItem = tuple[Contract, Optional[Quote], Optional[Trade], Optional[Quote], Optional[Trade], Optional[Trade]]
+# One compute_greeks input: the contract and the raw facts for it (each side present or absent).
+ParsedItem = tuple[Contract, Optional[Quote], Optional[Trade], Optional[Quote], Optional[Trade]]
 
 
 def _finite(where: str, v: Any) -> float:
@@ -117,40 +125,52 @@ def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[ParsedItem]]:
             _trade(f"contracts[{i}].opt_trade", item.get("opt_trade")),
             _quote(f"contracts[{i}].und_quote", item.get("und_quote")),
             _trade(f"contracts[{i}].und_trade", item.get("und_trade")),
-            _trade(f"contracts[{i}].und_close", item.get("und_close")),
         ))
     return as_of, out
 
 
-def make_handler(
-    cfg: GreeksConfig,
-    inputs: InputsHolder,
-    session_pick: Callable[[datetime], Optional[Session]],
-) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
-    """`session_pick` is SessionCache.session_as_of: the latest session whose open is at or before
-    as_of. The handler reads no clock — as_of comes in the request — and prices at
-    min(as_of, session.close), one rule for in-session and off-session alike."""
+def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    """compute_greeks: pure, raw-facts. No book, no publish, no clock."""
     m = methodology(cfg)
 
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         as_of_ms, items = parse_request(payload)  # validate everything before any work
-        as_of = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc)
-        session = session_pick(as_of)
-        if session is None:
-            raise ValueError(f"no trading session open at or before as_of {as_of.isoformat()}")
-        # One rule: price at as_of while the session is open, else at its close (as_of >= open always,
-        # since the session is the latest opened at or before as_of).
-        price_time = min(as_of, session.close_utc)
-        open_ms = session.open_ms
-        price_time_ms = int(price_time.timestamp() * 1000)
-        # Reuse the loop's loaded inputs only when as_of is inside this session (the live session);
-        # otherwise load SOFR/dividends fresh for the session's date.
-        session_inputs = inputs.for_request(session.date, in_session=session.contains(as_of))
         results = []
-        for contract, oq, ot, uq, ut, uc in items:
-            opt_px = select_price(oq, ot, open_ms, price_time_ms)
-            spot_px = select_spot(uq, (ut, uc), open_ms, price_time_ms)
-            results.append(compute_or_fail(contract, opt_px, spot_px, session_inputs, price_time, m).to_wire())
+        for contract, oq, ot, uq, ut in items:
+            opt_px = select_price(oq, ot, as_of_ms)
+            t_ms = opt_px.ts_ms if opt_px is not None else as_of_ms
+            spot_px = select_spot(uq, (ut,), t_ms)
+            as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
+            day_inputs = inputs.for_date(as_of.astimezone(ET).date())
+            results.append(compute_or_fail(contract, opt_px, spot_px, day_inputs, as_of, m).to_wire())
         return {"results": results}
+
+    return handle
+
+
+def parse_get_request(payload: Mapping[str, Any]) -> list[str]:
+    contracts = payload.get("contracts")
+    if not isinstance(contracts, list):
+        raise ValueError("'contracts' must be a list")
+    osis: list[str] = []
+    for i, osi in enumerate(contracts):
+        if not isinstance(osi, str):
+            raise ValueError(f"contracts[{i}] must be a string osi, got {osi!r}")
+        try:
+            Contract.parse(osi)  # reject a non-standard OSI at the edge
+        except ValueError:
+            raise ValueError(f"contracts[{i}] is not a standard OSI symbol: {osi!r}") from None
+        osis.append(osi)
+    return osis
+
+
+def make_get_handler(
+    get_greeks: Callable[[list[str]], list[OptionGreeksMessage]],
+) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    """get_greeks: book first, cold path for the rest. ``get_greeks`` is ComputeLoop.get_greeks."""
+
+    def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
+        osis = parse_get_request(payload)
+        return {"results": [m.to_wire() for m in get_greeks(osis)]}
 
     return handle
