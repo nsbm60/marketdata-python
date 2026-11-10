@@ -89,6 +89,15 @@ class Book:
     def underlyings(self) -> set[str]:
         return set(self.by_underlying)
 
+    def clear(self) -> None:
+        """Forget every contract, held price and result — the session open is a restart. The
+        rejected-OSI set is kept (a non-standard OSI stays non-standard across sessions)."""
+        self.contracts.clear()
+        self.by_underlying.clear()
+        self.option_quotes.clear()
+        self.option_trades.clear()
+        self.results.clear()
+
 
 _T = TypeVar("_T", Quote, Trade)
 

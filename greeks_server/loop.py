@@ -1,18 +1,20 @@
-"""The compute loop: one thread, one subscriber, driven by data (greeks-server-spec.md §3-§6).
+"""The compute loop: one thread, one subscriber, driven by live data (greeks-server-spec.md §3-§6).
 
-There is no session and no clock in the pricing. Each message off the bus does one thing:
+The live bus carries live ticks only, so pairing needs no session or clock. Each message does one
+thing:
 
-  - an option quote or trade  -> reprice that one contract as of the tick's own timestamp, now;
-  - an equity quote or trade  -> add the price to the underlying's history, nothing else. Off-hours
-    the stock moves while option quotes stand still, so a stock tick must not pair a stale option
-    quote with a later stock price; in session, repricing every strike on every stock tick is heavy
-    and mostly recomputes greeks that barely moved. The 5-second pass brings quiet strikes up to
-    date instead;
-  - a cal.options.time tick (ts) -> one full pass: reprice every contract in the book as of ts, from
-    its held option price and the stock at or before ts. One steady pass per 5 seconds.
+  - an option quote or trade  -> price that contract as of the tick's own timestamp, with the
+    held live stock for its underlying. If no stock is held, hand it to the resolver to fetch the
+    stock from MDS off this thread (a blocking RPC must not stall repricing) — never a failure for
+    a gap in our own state;
+  - an equity quote or trade  -> update the held live stock for that underlying, nothing else
+    (off-hours the stock moves while option quotes stand still; in session the 5-second pass brings
+    quiet strikes up to date, not every stock tick);
+  - a cal.options.time tick (ts, session_open_ts) -> one full pass over the book as of ts. A new
+    session_open_ts clears the book and held stock first: the open is a restart, so nothing from a
+    prior session is paired with today's prices.
 
-The book and the stock history are shared with get_greeks (served on the router thread), so a lock
-guards them. The book is never cleared; a contract is dropped once its expiry's close has passed.
+The book and held stock are shared with get_greeks (run on a control worker), so a lock guards them.
 
 A failure to load the rate/dividends for a date is fatal: on_fatal stops the service and systemd
 restarts it. Per-contract solver errors are isolated (compute_or_fail) and published as failures.
@@ -35,9 +37,9 @@ from greeks_server.book import Book
 from greeks_server.coldpath import ColdPath
 from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder
+from greeks_server.held_stock import HeldStock
 from greeks_server.message import OptionGreeksMessage
 from greeks_server.price import SelectedPrice, select_price
-from greeks_server.stock_history import StockHistory
 from greeks_server.wire import Tick, decode_tick
 
 log = logging.getLogger(__name__)
@@ -97,12 +99,13 @@ class ComputeLoop(threading.Thread):
 
         self._lock = threading.Lock()
         self.book = Book()
-        self.stock = StockHistory()
+        self.stock = HeldStock()
+        self._session_open: Optional[int] = None  # the session_open_ts the book/held-stock belong to
         self._stats = _Stats()
         self._time_topic = TopicBuilder.for_options_time()
-        # Option ticks whose underlying has no stock history at T: the stock is fetched from MDS off
-        # the compute thread (a blocking RPC must not stall repricing) by this resolver, which
-        # coalesces a burst (a chain's lease bootstrap) into one batched get_equity_prices_at.
+        # Option ticks whose underlying has no held stock: the stock is fetched from MDS off the
+        # compute thread (a blocking RPC must not stall repricing) by this resolver, which coalesces
+        # a burst (a chain's lease bootstrap) into one batched get_equity_prices_at.
         self._cold_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._resolver: Optional[threading.Thread] = None
 
@@ -139,9 +142,10 @@ class ComputeLoop(threading.Thread):
     def step(self, topic: str, payload: str) -> None:
         if topic:
             if topic == self._time_topic:
-                ts = _time_ts(payload)
-                if ts is not None:
-                    self._on_time(ts)
+                parsed = _time_tick(payload)
+                if parsed is not None:
+                    ts, session_open = parsed
+                    self._on_time(ts, session_open)
                 else:
                     self._stats.bad_ticks += 1
             elif topic.startswith(TopicBuilder.prefix_option_quotes()) or topic.startswith(
@@ -175,12 +179,11 @@ class ComputeLoop(threading.Thread):
             if not changed:
                 return  # an older or duplicate tick: the held price and its result stand
             opt_px = select_price(self.book.option_quotes.get(osi), self.book.option_trades.get(osi), t_ms)
-            spot_px = self.stock.at(contract.underlying, t_ms)
+            spot_px = self.stock.price(contract.underlying)
             if opt_px is not None and spot_px is None:
-                # The stock history doesn't reach back to T (a cold start, or off-hours when the
-                # underlying isn't ticking). Don't publish a missing_spot failure — hand it to the
-                # resolver to fetch the stock from MDS, off this thread. The held result stands
-                # until then.
+                # No live stock held for this underlying (a cold start, or off-hours). Don't publish
+                # a missing_spot failure for a gap in our own state — hand it to the resolver to
+                # fetch the stock from MDS, off this thread. The held result stands until then.
                 self._cold_queue.put(osi)
                 return
             msg = compute_or_fail(contract, opt_px, spot_px, inputs, as_of, self._m)
@@ -196,23 +199,33 @@ class ComputeLoop(threading.Thread):
             return
         with self._lock:
             if tick.quote is not None:
-                self.stock.add_quote(tick.symbol, tick.quote.ts_ms, tick.quote.bid, tick.quote.ask)
+                self.stock.on_quote(tick.symbol, tick.quote)
             if tick.trade is not None:
-                self.stock.add_trade(tick.symbol, tick.trade.ts_ms, tick.trade.price)
+                self.stock.on_trade(tick.symbol, tick.trade)
 
-    def _on_time(self, ts_ms: int) -> None:
+    def _on_time(self, ts_ms: int, session_open: Optional[int]) -> None:
         as_of = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
         inputs = self._inputs.for_date(as_of.astimezone(ET).date())  # outside the lock; raises -> fatal
         t0 = time.perf_counter()
         published: list[tuple[str, dict[str, Any]]] = []
         ok = 0
         with self._lock:
+            # The open is a restart: a new session_open_ts clears the book and held stock, so nothing
+            # from the previous session is priced against today's prices. The first tick after
+            # startup only records the open (what accumulated this session is kept) — a change from
+            # an already-recorded open is what clears.
+            if session_open is not None and session_open != self._session_open:
+                if self._session_open is not None:
+                    log.info("session open changed (%s -> %s): clearing %d contract(s)",
+                             self._session_open, session_open, len(self.book.contracts))
+                    self.book.clear()
+                    self.stock.clear()
+                self._session_open = session_open
             self._drop_expired(ts_ms)
-            self.stock.drop_symbols(self.book.underlyings())
             contracts = list(self.book.contracts.values())
             for c in contracts:
                 opt_px = select_price(self.book.option_quotes.get(c.osi), self.book.option_trades.get(c.osi), ts_ms)
-                spot_px = self.stock.at(c.underlying, ts_ms)
+                spot_px = self.stock.price(c.underlying)
                 msg = compute_or_fail(c, opt_px, spot_px, inputs, as_of, self._m)
                 if self.book.accept(msg):
                     published.append((greeks_topic(self._prefix, c), msg.to_wire()))
@@ -237,39 +250,32 @@ class ComputeLoop(threading.Thread):
     # ── get_greeks (router thread) ──────────────────────────────────────────────────────────────
 
     def get_greeks(self, osis: list[str]) -> list[OptionGreeksMessage]:
-        """One message per osi, in order. A held success is returned from the book. A held failure
-        or a contract never seen is a miss: a never-seen contract goes through the full cold path
-        (option snapshot + stock from MDS); a held failure is re-priced from its held option price
-        and the stock from MDS. Both add to the book and publish."""
+        """One message per osi, in order. A held success is returned from the book; everything else
+        (a held failure, or a contract never seen) goes through the cold path — option snapshot +
+        stock from MDS — is added to the book and published. Run on a control worker, so a slow
+        cold path doesn't block pings or other requests (see Router concurrent dispatch)."""
         results: dict[str, OptionGreeksMessage] = {}
-        never_seen: list[str] = []
-        held_failures: list[str] = []
+        misses: list[str] = []
         with self._lock:
             for osi in osis:
                 held = self.book.results.get(osi)
                 if held is not None and held.reason is None:
                     results[osi] = held
-                elif osi in self.book.contracts:
-                    held_failures.append(osi)
                 else:
-                    never_seen.append(osi)
+                    misses.append(osi)
 
-        for m in self._price_with_mds_stock(held_failures):
-            results[m.osi] = m
-        if never_seen:
-            for m in self._run_cold(never_seen):
+        if misses:
+            for m in self._run_cold(misses):
                 results[m.osi] = m
 
-        from_book = len(osis) - len(never_seen) - len(held_failures)
         out = _nonnull([results.get(osi) for osi in osis], osis)
-        log.info("get_greeks: requested=%d from_book=%d cold=%d%s", len(osis), from_book,
-                 len(never_seen) + len(held_failures), _by_reason(out))
+        log.info("get_greeks: requested=%d from_book=%d cold=%d%s",
+                 len(osis), len(osis) - len(misses), len(misses), _by_reason(out))
         return out
 
     def _run_cold(self, osis: list[str]) -> list[OptionGreeksMessage]:
-        """Full cold path for contracts the book has never seen: option snapshot + stock from MDS,
-        add to the book, publish."""
-        cold = self._cold.price(osis, self._history_stock_at)  # MDS I/O, no lock
+        """Cold path: option snapshot + stock from MDS, add to the book, publish."""
+        cold = self._cold.price(osis)  # MDS I/O, no lock
         publish: list[tuple[str, dict[str, Any]]] = []
         with self._lock:
             for cr in cold:
@@ -287,12 +293,13 @@ class ComputeLoop(threading.Thread):
         return [cr.message for cr in cold]
 
     def _price_with_mds_stock(self, osis: list[str]) -> list[OptionGreeksMessage]:
-        """Price contracts already in the book from their held option price and the stock at T —
-        from the history if it reaches back, else MDS get_equity_prices_at (one batched call).
-        Accepts and publishes. A failure is published only if MDS itself has no print."""
+        """The stream resolver's work: price contracts in the book from their held option price and
+        the stock at T — the held live stock if one arrived since the tick, else MDS
+        get_equity_prices_at (one batched call). Accepts and publishes. A failure is published only
+        if MDS itself has no print."""
         if not osis:
             return []
-        plans: list[tuple[Contract, Optional[SelectedPrice], int]] = []
+        plans: list[tuple[Contract, Optional[SelectedPrice], int, Optional[SelectedPrice]]] = []
         wanted: set[tuple[str, int]] = set()
         with self._lock:
             for osi in osis:
@@ -301,18 +308,19 @@ class ComputeLoop(threading.Thread):
                     continue
                 opt_px = select_price(self.book.option_quotes.get(osi), self.book.option_trades.get(osi), _LATEST)
                 t_ms = opt_px.ts_ms if opt_px is not None else _held_ts(self.book, osi)
-                plans.append((contract, opt_px, t_ms))
-                if opt_px is not None and self.stock.at(contract.underlying, t_ms) is None:
+                held_stock = self.stock.price(contract.underlying) if opt_px is not None else None
+                plans.append((contract, opt_px, t_ms, held_stock))
+                if opt_px is not None and held_stock is None:
                     wanted.add((contract.underlying, t_ms))
         stock_mds = self._cold.stock_prices(sorted(wanted)) if wanted else {}
 
         out: list[OptionGreeksMessage] = []
         publish: list[tuple[str, dict[str, Any]]] = []
-        for contract, opt_px, t_ms in plans:
+        for contract, opt_px, t_ms, held_stock in plans:
             as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
             inputs = self._inputs.for_date(as_of.astimezone(ET).date())  # off lock; raises -> propagates to caller
             with self._lock:
-                spot_px = self.stock.at(contract.underlying, t_ms) or stock_mds.get((contract.underlying, t_ms))
+                spot_px = held_stock or stock_mds.get((contract.underlying, t_ms))
                 msg = compute_or_fail(contract, opt_px, spot_px, inputs, as_of, self._m)
                 accepted = self.book.accept(msg)
                 topic = greeks_topic(self._prefix, contract)
@@ -346,12 +354,6 @@ class ComputeLoop(threading.Thread):
                 log.exception("cold resolver failed: %s", e)
                 self._on_fatal(e)
                 return
-
-    def _history_stock_at(self, symbol: str, t_ms: int) -> Optional["SelectedPrice"]:
-        """The stock history's price at or before t_ms (thread-safe) — the cold path's first stop, so
-        a contract whose underlying is already ticking skips the MDS round-trip."""
-        with self._lock:
-            return self.stock.at(symbol, t_ms)
 
     # ── helpers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -397,8 +399,10 @@ def _tick_ts(tick: Tick) -> int:
     return tick.trade.ts_ms
 
 
-def _time_ts(payload: str) -> Optional[int]:
-    """The ts of a cal.options.time tick: {"type":"time","ts":<epoch ms>}. None if malformed."""
+def _time_tick(payload: str) -> "Optional[tuple[int, Optional[int]]]":
+    """A cal.options.time tick: {"type":"time","ts":<ms>,"session_open_ts":<ms>?}. Returns
+    (ts, session_open_ts) — session_open_ts is None when absent (an older MDS), which never clears
+    the book. None if the tick is malformed."""
     try:
         d = json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -408,7 +412,9 @@ def _time_ts(payload: str) -> Optional[int]:
     ts = d.get("ts")
     if isinstance(ts, bool) or not isinstance(ts, int) or ts <= 0:
         return None
-    return ts
+    so = d.get("session_open_ts")
+    session_open = so if (isinstance(so, int) and not isinstance(so, bool) and so > 0) else None
+    return ts, session_open
 
 
 class _Stats:

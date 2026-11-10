@@ -71,7 +71,9 @@ def main() -> int:
 
     cold = ColdPath(cold_transport, inputs, methodology(cfg))
 
-    service = Service(name=ControlService.GREEKS, router_port=s.router_port)
+    # Concurrent dispatch: a re-lease cold path can take seconds; running ops on a worker pool keeps
+    # the main loop answering pings and other requests meanwhile (greeks-server-spec.md §6.1, §9).
+    service = Service(name=ControlService.GREEKS, router_port=s.router_port, request_workers=4)
 
     fatal: list[BaseException] = []
 
