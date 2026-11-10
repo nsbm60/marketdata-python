@@ -45,6 +45,7 @@ class Service:
         heartbeat_interval_sec: int = HEARTBEAT_INTERVAL_SEC,
         self_ping_interval_sec: int = SELF_PING_INTERVAL_SEC,
         self_ping_max_missed: int = SELF_PING_MAX_MISSED,
+        request_workers: int = 0,
     ):
         if not isinstance(name, ControlService):
             raise TypeError(f"Service(name=...) takes a ControlService, got {name!r}")
@@ -69,7 +70,9 @@ class Service:
         self.publisher_ready = threading.Event()
         self._shutdown_hooks: list = []
 
-        self._router = Router(self._name, router_port)
+        # request_workers > 0 opts into concurrent dispatch (a slow op runs on a worker, not the
+        # main loop) — see Router. Default 0 keeps the single-threaded behaviour.
+        self._router = Router(self._name, router_port, request_workers=request_workers)
         self._advertiser: Advertiser | None = None
         self._heartbeat: HeartbeatPublisher | None = None
         self._self_ping: SelfPingMonitor | None = None
