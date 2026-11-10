@@ -62,16 +62,20 @@ def test_priced_as_of_is_the_option_price_timestamp_not_as_of() -> None:
     assert res[0]["priced_as_of"] == NOW_MS - 5_000
 
 
-def test_as_of_is_an_upper_bound() -> None:
-    # A quote stamped after as_of is rejected; the option price falls to the trade at or before it.
-    item = _item(
-        opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS + 60_000},   # after as_of → rejected
-        opt_trade={"last": 9.05, "trade_ts": NOW_MS - 1_000},
-        und_trade={"last": 181.0, "trade_ts": NOW_MS - 1_000},
-    )
+def test_no_trade_fallback() -> None:
+    # Only a trade, no two-sided quote: no_current_quote (the trade fallback is gone).
+    item = {"osi": "NVDA261120C00180000",
+            "opt_trade": {"last": 9.05, "trade_ts": NOW_MS},
+            "und_trade": {"last": 181.0, "trade_ts": NOW_MS}}
     res = _handler([])(_req([item], as_of=NOW_MS))["results"]
-    assert res[0]["status"] == "success"
-    assert res[0]["price_kind"] == "last" and res[0]["price_ts"] == NOW_MS - 1_000
+    assert res[0]["status"] == "failure" and res[0]["reason"] == "no_current_quote"
+
+
+def test_a_quote_after_as_of_is_not_current() -> None:
+    # The option quote is the only price; stamped after as_of it is rejected -> no_current_quote.
+    item = _item(opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS + 60_000})
+    res = _handler([])(_req([item], as_of=NOW_MS))["results"]
+    assert res[0]["status"] == "failure" and res[0]["reason"] == "no_current_quote"
 
 
 def test_empty_list_is_fine() -> None:

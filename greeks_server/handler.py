@@ -35,7 +35,7 @@ from greeks_server.compute import Contract, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import select_price, select_spot
+from greeks_server.price import quote_mid, select_spot
 from greeks_server.wire import Quote, Trade
 
 OP = "compute_greeks"
@@ -136,8 +136,11 @@ def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[s
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         as_of_ms, items = parse_request(payload)  # validate everything before any work
         results = []
-        for contract, oq, ot, uq, ut in items:
-            opt_px = select_price(oq, ot, as_of_ms)
+        for contract, oq, _ot, uq, ut in items:  # _ot: opt_trade is no longer used (quote mid only)
+            # The option price is the quote mid only (no trade fallback), at or before as_of; a
+            # contract with no such quote is a no_current_quote failure.
+            mid = quote_mid(oq)
+            opt_px = mid if (mid is not None and mid.ts_ms <= as_of_ms) else None
             t_ms = opt_px.ts_ms if opt_px is not None else as_of_ms
             spot_px = select_spot(uq, (ut,), t_ms)
             as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)

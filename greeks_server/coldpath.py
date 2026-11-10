@@ -1,16 +1,14 @@
 """The cold path: price a contract the book has never seen, by asking MDS (greeks-server-spec.md §6).
 
-get_greeks answers from the book. A contract not in the book has no held quote or stock history, so
-the server asks MDS for the two facts it needs and prices from them — it never relays a price a
-client sent. For each contract:
+get_greeks answers from the book. A contract not in the book has no held quote or held stock, so the
+server asks MDS and prices from that — it never relays a price a client sent. For each contract:
 
-  - get_option_snapshots gives the contract's latest quote and trade; the option price (mid first,
-    else last) fixes T, its own timestamp;
-  - get_equity_prices_at gives the stock's newest clean print at or before T.
+  - get_option_snapshots gives the contract's latest quote and the session open; the option price is
+    the quote mid, used only if the quote is current (at or after the session open) — else a
+    no_current_quote failure, with no stock lookup. T is the quote's own timestamp;
+  - get_equity_prices_at gives the stock's newest clean print at or before T, for current quotes.
 
-Then it prices as of T, exactly as a live tick would. Batched: one get_option_snapshots for the
-whole request, one get_equity_prices_at for every (underlying, T) in it. An MDS failure raises — the
-caller turns it into a failure result naming the reason, never a default.
+An MDS failure raises — the caller turns it into a failure result naming the reason, never a default.
 """
 
 from __future__ import annotations
@@ -24,13 +22,12 @@ from zoneinfo import ZoneInfo
 from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import PriceKind, SelectedPrice, select_price
-from greeks_server.wire import Quote, Trade
+from greeks_server.price import PriceKind, SelectedPrice, quote_mid
+from greeks_server.wire import Quote
 
 log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
-_LATEST = 2**62  # "at or before" bound that admits every held timestamp (pick the newest usable)
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
 
 # A control transport: send a request dict, get the parsed reply dict. Raises on timeout/transport.
@@ -39,11 +36,10 @@ Transport = Callable[[dict[str, Any]], dict[str, Any]]
 
 @dataclass(frozen=True)
 class ColdResult:
-    """One priced contract and the raw facts it was priced from, so the book can hold them for the
+    """One priced contract and the quote it was priced from, so the book can hold the quote for the
     next time-event pass."""
     osi: str
     quote: Optional[Quote]
-    trade: Optional[Trade]
     message: OptionGreeksMessage
 
 
@@ -54,39 +50,39 @@ class ColdPath:
         self._m = m
 
     def price(self, osis: Sequence[str]) -> list[ColdResult]:
-        """Price each osi from MDS: the option's latest quote/trade (`get_option_snapshots`) fixes T,
-        then the stock at T (`get_equity_prices_at`, one batched call). Used for contracts the live
-        bus has not given the server — so it never pairs with held live stock, which is "now", not T."""
+        """Price each osi from MDS. `get_option_snapshots` gives the latest quote and the session
+        open; the option price is the quote mid, and only if the quote is *current* (at or after the
+        session open) — a stale or one-sided quote is a no_current_quote failure, with no stock
+        lookup. Current quotes' stock comes from `get_equity_prices_at` at each quote's T."""
         contracts = {osi: Contract.parse(osi) for osi in osis}  # raises on a non-standard OSI
-        snaps = self._option_snapshots(list(osis))
+        snaps, session_open_ms = self._option_snapshots(list(osis))
 
-        # T per contract: the option price's own timestamp (mid first). Gather the (underlying, T)
-        # pairs to ask the stock for in one call.
-        plans: list[tuple[str, Optional[Quote], Optional[Trade], Optional[SelectedPrice], Optional[int]]] = []
+        # Current quotes only; gather their (underlying, T) to ask the stock for.
+        plans: list[tuple[str, Optional[Quote], Optional[SelectedPrice], Optional[int]]] = []
         wanted: set[tuple[str, int]] = set()
         for osi in osis:
-            q, t = snaps.get(osi, (None, None))
-            opt_px = select_price(q, t, _LATEST)
-            t_ms = opt_px.ts_ms if opt_px is not None else _latest_ts(q, t)
-            plans.append((osi, q, t, opt_px, t_ms))
-            if t_ms is not None:
-                wanted.add((contracts[osi].underlying, t_ms))
+            q, _trade = snaps.get(osi, (None, None))
+            opt_px = quote_mid(q)
+            if opt_px is not None and opt_px.ts_ms >= session_open_ms:
+                wanted.add((contracts[osi].underlying, opt_px.ts_ms))
+                plans.append((osi, q, opt_px, opt_px.ts_ms))
+            else:
+                plans.append((osi, q, None, None))  # no current quote -> no_current_quote, no stock
         stock = self._equity_prices_at(sorted(wanted))
 
         results: list[ColdResult] = []
-        for osi, q, t, opt_px, t_ms in plans:
+        for osi, q, opt_px, t_ms in plans:
             contract = contracts[osi]
             if t_ms is None:
-                # No quote and no trade from MDS: nothing to price as of. Report the absence.
-                log.warning("cold path: no option quote or trade for %s", osi)
+                # No current two-sided quote: compute() returns no_current_quote; no spot is needed.
                 msg = compute_or_fail(contract, None, None, _no_inputs(), _EPOCH, self._m)
-                results.append(ColdResult(osi, q, t, msg))
+                results.append(ColdResult(osi, q, msg))
                 continue
             as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
             spot_px = stock.get((contract.underlying, t_ms))
             inputs = self._inputs.for_date(as_of.astimezone(ET).date())
             msg = compute_or_fail(contract, opt_px, spot_px, inputs, as_of, self._m)
-            results.append(ColdResult(osi, q, t, msg))
+            results.append(ColdResult(osi, q, msg))
         return results
 
     def stock_prices(self, pairs: Sequence[tuple[str, int]]) -> dict[tuple[str, int], SelectedPrice]:
@@ -97,17 +93,21 @@ class ColdPath:
 
     # ── MDS calls ──────────────────────────────────────────────────────────────────────────────
 
-    def _option_snapshots(self, osis: list[str]) -> dict[str, tuple[Optional[Quote], Optional[Trade]]]:
+    def _option_snapshots(self, osis: list[str]) -> tuple[dict[str, tuple[Optional[Quote], None]], int]:
+        """Returns (per-osi (quote, None), session_open_ts). The option trade is not read — greeks
+        price from the quote mid only. session_open_ts gates whether a quote is current (§4); it is
+        0 only if an older MDS omitted it (no gate — the pre-change behaviour)."""
         data = self._data({"op": "get_option_snapshots", "symbols": osis}, "get_option_snapshots")
         snaps = data.get("snapshots")
         if not isinstance(snaps, dict):
             raise RuntimeError("get_option_snapshots reply has no snapshots object")
-        out: dict[str, tuple[Optional[Quote], Optional[Trade]]] = {}
+        so = data.get("session_open_ts")
+        session_open_ms = so if isinstance(so, int) and not isinstance(so, bool) else 0
+        out: dict[str, tuple[Optional[Quote], None]] = {}
         for osi, state in snaps.items():
-            if not isinstance(state, dict):
-                continue
-            out[osi] = (_quote_of(state.get("quote")), _trade_of(state.get("trade")))
-        return out
+            if isinstance(state, dict):
+                out[osi] = (_quote_of(state.get("quote")), None)
+        return out, session_open_ms
 
     def _equity_prices_at(self, pairs: list[tuple[str, int]]) -> dict[tuple[str, int], SelectedPrice]:
         if not pairs:
@@ -136,11 +136,6 @@ class ColdPath:
         return data
 
 
-def _latest_ts(q: Optional[Quote], t: Optional[Trade]) -> Optional[int]:
-    stamps = [x.ts_ms for x in (q, t) if x is not None]
-    return max(stamps) if stamps else None
-
-
 def _quote_of(v: Any) -> Optional[Quote]:
     if not isinstance(v, dict):
         return None
@@ -152,16 +147,7 @@ def _quote_of(v: Any) -> Optional[Quote]:
                  float(ask) if isinstance(ask, (int, float)) else None, at)
 
 
-def _trade_of(v: Any) -> Optional[Trade]:
-    if not isinstance(v, dict):
-        return None
-    price, at = v.get("price"), v.get("at")
-    if isinstance(price, (int, float)) and price > 0 and isinstance(at, int):
-        return Trade(float(price), at)
-    return None
-
-
-# A pricing where no fact arrived: compute() returns missing_spot before it reads inputs, so the
-# value is never used — but the signature needs one.
+# A pricing where no current quote arrived: compute() returns no_current_quote before it reads
+# inputs, so the value is never used — but the signature needs one.
 def _no_inputs() -> SessionInputs:
     return SessionInputs(session_date=_EPOCH.date(), sofr={}, dividends={})

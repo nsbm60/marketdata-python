@@ -39,14 +39,13 @@ from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.held_stock import HeldStock
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import SelectedPrice, select_price
+from greeks_server.price import SelectedPrice, quote_mid
 from greeks_server.wire import Tick, decode_tick
 
 log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 STATS_INTERVAL_S = 60.0
-_LATEST = 2**62  # "at or before" bound that admits every held timestamp (pick the newest held)
 
 
 class Subscriber(Protocol):
@@ -162,28 +161,23 @@ class ComputeLoop(threading.Thread):
 
     def _on_option(self, payload: str) -> None:
         tick = self._decode(payload)
-        if tick is None:
-            return
-        osi, t_ms = tick.symbol, _tick_ts(tick)
+        if tick is None or tick.quote is None:
+            return  # only quotes price greeks now — there is no trade fallback
+        osi, t_ms = tick.symbol, tick.quote.ts_ms
         as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
         inputs = self._inputs.for_date(as_of.astimezone(ET).date())  # outside the lock; raises -> fatal
         with self._lock:
             contract = self.book.ensure(osi)
             if contract is None:
                 return
-            changed = False
-            if tick.quote is not None:
-                changed = self.book.on_option_quote(osi, tick.quote)
-            if tick.trade is not None:
-                changed = self.book.on_option_trade(osi, tick.trade) or changed
-            if not changed:
-                return  # an older or duplicate tick: the held price and its result stand
-            opt_px = select_price(self.book.option_quotes.get(osi), self.book.option_trades.get(osi), t_ms)
+            if not self.book.on_option_quote(osi, tick.quote):
+                return  # an older or duplicate quote: the held price and its result stand
+            opt_px = self._current_option_px(osi)
             spot_px = self.stock.price(contract.underlying)
             if opt_px is not None and spot_px is None:
-                # No live stock held for this underlying (a cold start, or off-hours). Don't publish
-                # a missing_spot failure for a gap in our own state — hand it to the resolver to
-                # fetch the stock from MDS, off this thread. The held result stands until then.
+                # Current quote but no live stock held for this underlying (a cold start, or
+                # off-hours). Don't publish a failure for a gap in our own state — hand it to the
+                # resolver to fetch the stock from MDS, off this thread. The held result stands.
                 self._cold_queue.put(osi)
                 return
             msg = compute_or_fail(contract, opt_px, spot_px, inputs, as_of, self._m)
@@ -192,6 +186,17 @@ class ComputeLoop(threading.Thread):
         if accepted:
             self._publish(topic, msg.to_wire())
             self._stats.reprices += 1
+
+    def _current_option_px(self, osi: str) -> Optional[SelectedPrice]:
+        """The option price for greeks: the held two-sided quote's mid, but only if the quote is
+        current — timestamped at or after the session open. Held under the lock. No trade fallback;
+        a stale or one-sided quote yields None (a no_current_quote failure downstream)."""
+        px = quote_mid(self.book.option_quotes.get(osi))
+        if px is None:
+            return None
+        if self._session_open is not None and px.ts_ms < self._session_open:
+            return None
+        return px
 
     def _on_equity(self, payload: str) -> None:
         tick = self._decode(payload)
@@ -223,8 +228,12 @@ class ComputeLoop(threading.Thread):
                 self._session_open = session_open
             self._drop_expired(ts_ms)
             contracts = list(self.book.contracts.values())
+            repriced = 0
             for c in contracts:
-                opt_px = select_price(self.book.option_quotes.get(c.osi), self.book.option_trades.get(c.osi), ts_ms)
+                opt_px = self._current_option_px(c.osi)
+                if opt_px is None:
+                    continue  # reprice only contracts whose held quote is current
+                repriced += 1
                 spot_px = self.stock.price(c.underlying)
                 msg = compute_or_fail(c, opt_px, spot_px, inputs, as_of, self._m)
                 if self.book.accept(msg):
@@ -232,7 +241,7 @@ class ComputeLoop(threading.Thread):
                     ok += msg.reason is None
         for topic, wire in published:
             self._publish(topic, wire)
-        self._stats.record(len(contracts), ok, time.perf_counter() - t0)
+        self._stats.record(repriced, ok, time.perf_counter() - t0)
 
     def _drop_expired(self, now_ms: int) -> None:
         """Drop any contract whose expiry date's close is already behind ``now_ms`` (held under lock)."""
@@ -284,8 +293,6 @@ class ComputeLoop(threading.Thread):
                     continue
                 if cr.quote is not None:
                     self.book.on_option_quote(cr.osi, cr.quote)
-                if cr.trade is not None:
-                    self.book.on_option_trade(cr.osi, cr.trade)
                 if self.book.accept(cr.message):
                     publish.append((greeks_topic(self._prefix, contract), cr.message.to_wire()))
         for topic, wire in publish:
@@ -306,7 +313,7 @@ class ComputeLoop(threading.Thread):
                 contract = self.book.contracts.get(osi)
                 if contract is None:
                     continue
-                opt_px = select_price(self.book.option_quotes.get(osi), self.book.option_trades.get(osi), _LATEST)
+                opt_px = self._current_option_px(osi)
                 t_ms = opt_px.ts_ms if opt_px is not None else _held_ts(self.book, osi)
                 held_stock = self.stock.price(contract.underlying) if opt_px is not None else None
                 plans.append((contract, opt_px, t_ms, held_stock))
@@ -389,14 +396,6 @@ def _nonnull(results: list[Optional[OptionGreeksMessage]], osis: list[str]) -> l
             raise RuntimeError(f"get_greeks produced no result for {osi}")
         out.append(r)
     return out
-
-
-def _tick_ts(tick: Tick) -> int:
-    # A decoded tick carries exactly one of quote/trade; T is that side's own timestamp.
-    if tick.quote is not None:
-        return tick.quote.ts_ms
-    assert tick.trade is not None
-    return tick.trade.ts_ms
 
 
 def _time_tick(payload: str) -> "Optional[tuple[int, Optional[int]]]":

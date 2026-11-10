@@ -114,10 +114,12 @@ def compute(
     """Price one contract as of the moment ``as_of`` (= T). Time to expiry runs from as_of; the
     rate and dividends come from inputs loaded for as_of's date."""
     priced_as_of_ms = int(as_of.timestamp() * 1000)
+    # Option first: with no current two-sided quote there is no market to price, and no stock is
+    # needed (the cold path doesn't even look one up).
+    if option_px is None:
+        return _failure(contract, FailureReason.NO_CURRENT_QUOTE, priced_as_of_ms, m, None, spot_px)
     if spot_px is None:
         return _failure(contract, FailureReason.MISSING_SPOT, priced_as_of_ms, m, option_px, None)
-    if option_px is None:
-        return _failure(contract, FailureReason.NO_SESSION_PRICE, priced_as_of_ms, m, None, spot_px)
 
     if contract.expiry < inputs.session_date:
         # Expired before as_of's date: there is no rate for a negative term. The solver's floor

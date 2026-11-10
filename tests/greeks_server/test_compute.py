@@ -67,11 +67,18 @@ def test_missing_spot_first() -> None:
     assert msg.price == 9.0 and msg.spot is None and msg.forward is None
 
 
-def test_no_session_price() -> None:
+def test_no_current_quote() -> None:
+    # No option price (no current two-sided quote): no_current_quote, checked before the spot.
     msg = compute(C, None, SPOT, inputs(), NOW, M)
-    assert msg.reason is FailureReason.NO_SESSION_PRICE
+    assert msg.reason is FailureReason.NO_CURRENT_QUOTE
     assert msg.price is None and msg.spot == SPOT.value
     assert "price" not in msg.to_wire() and "iv" not in msg.to_wire()
+
+
+def test_no_current_quote_precedes_missing_spot() -> None:
+    # With neither an option price nor a spot, the reason is no_current_quote (option first).
+    msg = compute(C, None, None, inputs(), NOW, M)
+    assert msg.reason is FailureReason.NO_CURRENT_QUOTE
 
 
 def test_solver_failure_carries_carry_inputs() -> None:

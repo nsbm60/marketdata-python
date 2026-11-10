@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from greeks_server.price import SelectedPrice, select_price
+from greeks_server.price import SelectedPrice, select_spot
 from greeks_server.wire import Quote, Trade
 
-_LATEST = 2**62  # select_price's "at or before" bound, admitting the newest held tick
+_LATEST = 2**62  # select_spot's "at or before" bound, admitting the newest held tick
 
 
 class HeldStock:
@@ -34,7 +34,7 @@ class HeldStock:
 
     def price(self, symbol: str) -> Optional[SelectedPrice]:
         """The current live stock for ``symbol`` (mid first, else last), or None if none is held."""
-        return select_price(self._quotes.get(symbol), self._trades.get(symbol), _LATEST)
+        return select_spot(self._quotes.get(symbol), [self._trades.get(symbol)], _LATEST)
 
     def has(self, symbol: str) -> bool:
         return symbol in self._quotes or symbol in self._trades

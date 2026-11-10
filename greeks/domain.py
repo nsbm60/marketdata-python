@@ -31,6 +31,10 @@ class FailureReason(str, Enum):
     MISSING_SPOT = "missing_spot"
     # Live server: no two-sided quote and no last trade from the current session.
     NO_SESSION_PRICE = "no_session_price"
+    # Live server: no current two-sided quote (none at all, or last quoted before this session's
+    # open). Greeks are priced from the quote mid only — a contract with no current quote has no
+    # market to trade, so it is of no interest. Replaces the trade fallback.
+    NO_CURRENT_QUOTE = "no_current_quote"
     MISSING_FORWARD_INPUTS = "missing_forward_inputs"
     EXCLUDED_DATE = "excluded_date"
     # Diagnostic: --price mid requires a two-sided vendor quote at join; not a solver fault.

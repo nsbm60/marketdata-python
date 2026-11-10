@@ -128,14 +128,14 @@ class FakeCold:
 # A transport (for the real ColdPath) that serves get_option_snapshots and get_equity_prices_at from
 # seeded dicts. Lets scenario tests drive the cold path end to end with no network.
 def cold_transport(snapshots: dict[str, dict[str, Any]], stock: dict[tuple[str, int], tuple[float, int]],
-                   log: list[dict[str, Any]] | None = None):
+                   log: list[dict[str, Any]] | None = None, session_open: int = 0):
     def transport(req: dict[str, Any]) -> dict[str, Any]:
         if log is not None:
             log.append(req)
         if req["op"] == "get_option_snapshots":
             want = set(req["symbols"])
             snaps = {o: s for o, s in snapshots.items() if o in want}
-            return {"ok": True, "data": {"snapshots": snaps, "count": len(snaps)}}
+            return {"ok": True, "data": {"snapshots": snaps, "count": len(snaps), "session_open_ts": session_open}}
         prices = []
         for item in req["symbols_at"]:
             key = (item["symbol"], item["ts"])
@@ -313,6 +313,55 @@ def test_get_greeks_reprices_a_held_failure_through_the_cold_path() -> None:
 
 
 # ── scenarios ─────────────────────────────────────────────────────────────────────────────────
+
+def test_stream_ignores_a_trade_only_option_tick() -> None:
+    # Only quotes price greeks; a trade-only option tick publishes nothing (no trade fallback).
+    h = Harness()
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
+    h.opt_trade(OPT_C, NVDA_C, 9.1, et_ms(11, 0, 5))
+    assert h.published == [] and NVDA_C not in h.loop.book.contracts
+
+
+def test_cold_path_rejects_a_quote_before_session_open() -> None:
+    # A snapshot quote from before the session open is no_current_quote, with no stock lookup; one
+    # after it prices.
+    log: list[dict[str, Any]] = []
+    stale, fresh = "NVDA261120C00300000", NVDA_C
+    before, after = SESSION_OPEN - 60_000, SESSION_OPEN + 60_000
+    snaps = {
+        stale: {"osi": stale, "quote": {"bid": 0.1, "ask": 0.2, "at": before}},
+        fresh: {"osi": fresh, "quote": {"bid": 9.0, "ask": 9.2, "at": after}},
+    }
+    stock = {("NVDA", after): (181.0, after)}
+    h = Harness()
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, session_open=SESSION_OPEN),
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    out = {m.osi: m for m in h.loop.get_greeks([stale, fresh])}
+    assert out[stale].reason is FailureReason.NO_CURRENT_QUOTE and out[stale].status is RowStatus.FAILURE
+    assert out[fresh].status.value == "success" and out[fresh].spot == pytest.approx(181.0)
+    # No stock was asked for the stale contract's time; only the fresh one's.
+    eq = next(r for r in log if r["op"] == "get_equity_prices_at")
+    assert eq["symbols_at"] == [{"symbol": "NVDA", "ts": after}]
+
+
+def test_cold_path_after_hours_prices_1600_and_curb_against_stock_at_each_time() -> None:
+    log: list[dict[str, Any]] = []
+    close_osi, curb_osi = NVDA_C, NVDA_P
+    t1600, t1605 = et_ms(16, 0), et_ms(16, 5)
+    snaps = {
+        close_osi: {"osi": close_osi, "quote": {"bid": 9.0, "ask": 9.2, "at": t1600}},
+        curb_osi: {"osi": curb_osi, "quote": {"bid": 3.0, "ask": 3.2, "at": t1605}},
+    }
+    stock = {("NVDA", t1600): (186.64, t1600), ("NVDA", t1605): (186.90, t1605)}
+    h = Harness()
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, session_open=SESSION_OPEN),
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    out = {m.osi: m for m in h.loop.get_greeks([close_osi, curb_osi])}
+    assert out[close_osi].status.value == "success" and out[close_osi].spot == pytest.approx(186.64)
+    assert out[close_osi].priced_as_of == t1600
+    assert out[curb_osi].status.value == "success" and out[curb_osi].spot == pytest.approx(186.90)
+    assert out[curb_osi].priced_as_of == t1605
+
 
 def test_scenario_new_ticker_opened_after_the_close() -> None:
     # RKLB chain, never seen, opened after the close: greeks from the cold path, priced as of each
