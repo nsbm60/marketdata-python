@@ -89,7 +89,7 @@ class FakeCold:
         self.calls: list[list[str]] = []
         self.by_osi: dict[str, Any] = {}
 
-    def price(self, osis: list[str]) -> list[Any]:
+    def price(self, osis: list[str], stock_at: Any = None) -> list[Any]:
         self.calls.append(list(osis))
         return [self.by_osi[o] for o in osis]
 
@@ -163,10 +163,10 @@ def test_expired_contract_dropped_and_its_history_pruned() -> None:
 
 
 def test_get_greeks_answers_from_book_then_cold_path() -> None:
-    # Real ColdPath with a fake MDS transport: the second contract is not in the book, so it is
-    # priced through MDS and the stock is asked for at the option quote's own timestamp.
+    # Real ColdPath with a fake MDS transport: the second contract is not in the book, and its quote
+    # (10:00) predates the stock history (11:00), so the stock is fetched from MDS at the quote's ts.
     requests: list[dict[str, Any]] = []
-    qts = et_ms(11, 0, 0)
+    qts = et_ms(10, 0, 0)
 
     def transport(req: dict[str, Any]) -> dict[str, Any]:
         requests.append(req)
@@ -179,7 +179,7 @@ def test_get_greeks_answers_from_book_then_cold_path() -> None:
     cold = ColdPath(transport, h.loop._inputs, Methodology("v2", 15.0, "16:00"))
     h.loop._cold = cold  # type: ignore[assignment]
 
-    # Seed the book with one contract via a live tick.
+    # Seed the book with one contract via a live tick (history for NVDA starts at 11:00).
     h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
     h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
     h.published.clear()
@@ -188,12 +188,33 @@ def test_get_greeks_answers_from_book_then_cold_path() -> None:
     assert [m.osi for m in out] == [NVDA_C, NVDA_P]
     assert out[0].priced_as_of == et_ms(11, 0, 1)            # from the book
     assert out[1].status.value == "success" and out[1].priced_as_of == qts  # cold-path, as of the quote
-    # The stock was asked for at the quote's own timestamp.
+    # The stock was asked for at the quote's own timestamp (history did not reach back to 10:00).
     eq_req = next(r for r in requests if r["op"] == "get_equity_prices_at")
     assert eq_req["symbols_at"] == [{"symbol": "NVDA", "ts": qts}]
     # The cold-path result was added to the book and published.
     assert NVDA_P in h.loop.book.contracts
     assert any(t.endswith("P.170_00") for t, _ in h.published)
+
+
+def test_cold_path_uses_the_stock_history_and_skips_mds_when_it_reaches_back() -> None:
+    # The cold contract's quote (11:00:02) is covered by the stock history (NVDA quote at 11:00), so
+    # the cold path prices from the history and never calls get_equity_prices_at.
+    requests: list[dict[str, Any]] = []
+    qts = et_ms(11, 0, 2)
+
+    def transport(req: dict[str, Any]) -> dict[str, Any]:
+        requests.append(req)
+        if req["op"] == "get_option_snapshots":
+            return {"ok": True, "data": {"snapshots": {NVDA_P: {"osi": NVDA_P, "quote": {"bid": 3.0, "ask": 3.2, "at": qts}}}, "count": 1}}
+        raise AssertionError("get_equity_prices_at must not be called when the history covers T")
+
+    h = Harness()
+    h.loop._cold = ColdPath(transport, h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))          # history for NVDA at 11:00
+
+    out = h.loop.get_greeks([NVDA_P])
+    assert out[0].status.value == "success" and out[0].spot == pytest.approx(181.01)
+    assert [r["op"] for r in requests] == ["get_option_snapshots"]   # no equity fetch
 
 
 def test_friday_curb_quote_priced_against_the_stock_at_that_time() -> None:

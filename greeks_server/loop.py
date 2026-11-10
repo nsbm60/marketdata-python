@@ -35,7 +35,7 @@ from greeks_server.coldpath import ColdPath
 from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import select_price
+from greeks_server.price import SelectedPrice, select_price
 from greeks_server.stock_history import StockHistory
 from greeks_server.wire import Tick, decode_tick
 
@@ -232,7 +232,7 @@ class ComputeLoop(threading.Thread):
                 else:
                     missing.append(osi)
         if missing:
-            cold = self._cold.price(missing)  # MDS I/O, no lock
+            cold = self._cold.price(missing, self._history_stock_at)  # MDS I/O, no lock
             by_osi: dict[str, OptionGreeksMessage] = {cr.osi: cr.message for cr in cold}
             publish: list[tuple[str, dict[str, Any]]] = []
             with self._lock:
@@ -252,6 +252,12 @@ class ComputeLoop(threading.Thread):
                 if results[i] is None:
                     results[i] = by_osi.get(osi)
         return _nonnull(results, osis)
+
+    def _history_stock_at(self, symbol: str, t_ms: int) -> Optional["SelectedPrice"]:
+        """The stock history's price at or before t_ms (thread-safe) — the cold path's first stop, so
+        a contract whose underlying is already ticking skips the MDS round-trip."""
+        with self._lock:
+            return self.stock.at(symbol, t_ms)
 
     # ── helpers ─────────────────────────────────────────────────────────────────────────────────
 

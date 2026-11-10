@@ -53,13 +53,21 @@ class ColdPath:
         self._inputs = inputs
         self._m = m
 
-    def price(self, osis: Sequence[str]) -> list[ColdResult]:
+    def price(
+        self,
+        osis: Sequence[str],
+        stock_at: Callable[[str, int], Optional[SelectedPrice]] = lambda s, t: None,
+    ) -> list[ColdResult]:
+        """Price each osi. ``stock_at(underlying, t_ms)`` is the in-memory stock history (the loop's):
+        a contract whose stock at T is already held skips MDS; only the rest go to get_equity_prices_at,
+        in one batched call."""
         contracts = {osi: Contract.parse(osi) for osi in osis}  # raises on a non-standard OSI
         snaps = self._option_snapshots(list(osis))
 
-        # T per contract: the option price's own timestamp (mid first). Gather the (underlying, T)
-        # pairs to ask the stock for in one call.
+        # T per contract: the option price's own timestamp (mid first). The stock at T comes from the
+        # history when it reaches back that far; only the misses need an MDS fetch.
         plans: list[tuple[str, Optional[Quote], Optional[Trade], Optional[SelectedPrice], Optional[int]]] = []
+        from_history: dict[str, SelectedPrice] = {}
         wanted: set[tuple[str, int]] = set()
         for osi in osis:
             q, t = snaps.get(osi, (None, None))
@@ -67,7 +75,12 @@ class ColdPath:
             t_ms = opt_px.ts_ms if opt_px is not None else _latest_ts(q, t)
             plans.append((osi, q, t, opt_px, t_ms))
             if t_ms is not None:
-                wanted.add((contracts[osi].underlying, t_ms))
+                und = contracts[osi].underlying
+                held = stock_at(und, t_ms)
+                if held is not None:
+                    from_history[osi] = held
+                else:
+                    wanted.add((und, t_ms))
         stock = self._equity_prices_at(sorted(wanted))
 
         results: list[ColdResult] = []
@@ -80,7 +93,7 @@ class ColdPath:
                 results.append(ColdResult(osi, q, t, msg))
                 continue
             as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
-            spot_px = stock.get((contract.underlying, t_ms))
+            spot_px = from_history.get(osi) or stock.get((contract.underlying, t_ms))
             inputs = self._inputs.for_date(as_of.astimezone(ET).date())
             msg = compute_or_fail(contract, opt_px, spot_px, inputs, as_of, self._m)
             results.append(ColdResult(osi, q, t, msg))
