@@ -99,6 +99,12 @@ class ColdPath:
             results.append(ColdResult(osi, q, t, msg))
         return results
 
+    def stock_prices(self, pairs: Sequence[tuple[str, int]]) -> dict[tuple[str, int], SelectedPrice]:
+        """MDS get_equity_prices_at for the given (underlying, T) pairs, in one batched call. Used
+        when the option price is already known (a stream tick, a held failure) and only the stock is
+        missing — so there is no need to re-fetch the option snapshot."""
+        return self._equity_prices_at(sorted(set(pairs)))
+
     # ── MDS calls ──────────────────────────────────────────────────────────────────────────────
 
     def _option_snapshots(self, osis: list[str]) -> dict[str, tuple[Optional[Quote], Optional[Trade]]]:

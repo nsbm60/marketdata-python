@@ -16,11 +16,15 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from greeks.config import load_config
+from greeks.domain import FailureReason, RowStatus
 from greeks.topic_builder import TopicBuilder
 from greeks_server.coldpath import ColdPath
 from greeks_server.compute import Methodology
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.loop import ComputeLoop
+from greeks_server.message import OptionGreeksMessage
+from greeks_server.price import PriceKind, SelectedPrice
+from greeks_server.wire import Quote
 
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 11, 13)  # a Friday, well before the 2026-11-20 expiry; EST (UTC-5)
@@ -83,15 +87,23 @@ class Harness:
 
 
 class FakeCold:
-    """Stands in for ColdPath. Returns a pre-seeded ColdResult per requested osi, in order."""
+    """Stands in for ColdPath. `price` returns a pre-seeded ColdResult per osi; `stock_prices`
+    answers from a seeded (symbol, ts) -> SelectedPrice map, recording its calls."""
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.by_osi: dict[str, Any] = {}
+        self.stock: dict[tuple[str, int], SelectedPrice] = {}
+        self.stock_calls: list[list[tuple[str, int]]] = []
 
     def price(self, osis: list[str], stock_at: Any = None) -> list[Any]:
         self.calls.append(list(osis))
         return [self.by_osi[o] for o in osis]
+
+    def stock_prices(self, pairs: Any) -> dict[tuple[str, int], SelectedPrice]:
+        pairs = list(pairs)
+        self.stock_calls.append(pairs)
+        return {p: self.stock[p] for p in pairs if p in self.stock}
 
 
 def test_option_tick_prices_as_of_its_timestamp_from_the_stock_history() -> None:
@@ -144,10 +156,49 @@ def test_an_older_result_never_replaces_a_newer_one() -> None:
     assert h.published == []
 
 
-def test_missing_stock_is_a_published_failure() -> None:
+def test_option_tick_with_no_history_enqueues_instead_of_publishing_a_failure() -> None:
     h = Harness()
-    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0))       # no stock history yet
-    assert h.last()["reason"] == "missing_spot"
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(17, 0))       # after hours, no stock history
+    assert h.published == []                                 # no missing_spot failure published
+    assert h.loop._cold_queue.get_nowait() == NVDA_C         # handed to the resolver instead
+
+
+def test_resolver_prices_a_history_miss_from_mds_stock_not_a_failure() -> None:
+    # A bus quote (10:00) older than the stock history (11:00) is a miss. The resolver fetches the
+    # stock from MDS at the quote's own time and publishes a success — not a missing_spot failure.
+    h = Harness()
+    cold = FakeCold()
+    cold.stock = {("NVDA", et_ms(10, 0)): SelectedPrice(180.0, PriceKind.LAST, et_ms(10, 0))}
+    h.loop._cold = cold  # type: ignore[assignment]
+    h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))          # history starts at 11:00
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(10, 0))       # older than history -> miss -> enqueue
+    assert h.published == []
+    osi = h.loop._cold_queue.get_nowait()
+    h.loop._price_with_mds_stock([osi])                      # what the resolver thread runs
+    assert cold.stock_calls == [[("NVDA", et_ms(10, 0))]]    # MDS asked at the quote's time
+    msg = h.last()
+    assert msg["status"] == "success" and msg["priced_as_of"] == et_ms(10, 0)
+    assert msg["spot"] == pytest.approx(180.0) and "reason" not in msg
+
+
+def test_get_greeks_reprices_a_held_failure_through_the_cold_path() -> None:
+    h = Harness()
+    cold = FakeCold()
+    t = et_ms(17, 0)
+    cold.stock = {("NVDA", t): SelectedPrice(186.64, PriceKind.LAST, t)}
+    h.loop._cold = cold  # type: ignore[assignment]
+    # Seed a held missing_spot failure (as the after-hours lease bootstrap would have produced) with
+    # a held option quote so the option price is recoverable.
+    h.loop.book.ensure(NVDA_C)
+    h.loop.book.on_option_quote(NVDA_C, Quote(9.0, 9.2, t))
+    h.loop.book.accept(OptionGreeksMessage(
+        osi=NVDA_C, status=RowStatus.FAILURE, priced_as_of=t, methodology_version="v2",
+        reason=FailureReason.MISSING_SPOT))
+
+    out = h.loop.get_greeks([NVDA_C])
+    assert out[0].status.value == "success"                  # re-priced, not the held failure
+    assert out[0].spot == pytest.approx(186.64)
+    assert cold.stock_calls == [[("NVDA", t)]]
 
 
 def test_expired_contract_dropped_and_its_history_pruned() -> None:
