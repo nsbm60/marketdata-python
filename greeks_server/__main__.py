@@ -108,7 +108,7 @@ def main() -> int:
     # get_greeks reads and writes the book, which the compute thread owns, so it is served by the
     # loop under its lock; compute_greeks is pure and needs neither.
     service.register_handler(OP, make_handler(cfg, inputs))
-    service.register_handler(OP_GET, make_get_handler(loop.get_greeks))
+    service.register_handler(OP_GET, make_get_handler(loop.get_greeks, methodology(cfg)))
 
     def stop_loop() -> None:
         loop.stop()

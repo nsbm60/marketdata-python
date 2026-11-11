@@ -28,6 +28,10 @@ class FailureReason(str, Enum):
     QUANTIZED_NEAR_INTRINSIC = "quantized_near_intrinsic"
     SOLVER_FAILED = "solver_failed"
     NONSTANDARD_CONTRACT = "nonstandard_contract"
+    # Live server: a requested symbol is a string but not a standard OSI (e.g. an adjusted/binary
+    # root like B1VDA…). That one symbol fails on its own; the rest of the request is priced.
+    # Distinct from NONSTANDARD_CONTRACT, which belongs to the history pull.
+    INVALID_SYMBOL = "invalid_symbol"
     MISSING_SPOT = "missing_spot"
     # Live server: no two-sided quote and no last trade from the current session.
     NO_SESSION_PRICE = "no_session_price"

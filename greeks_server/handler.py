@@ -21,22 +21,35 @@ seen through the cold path (which asks MDS), and publishes those.
 
 Validation is at the edge: a malformed request is rejected whole with a specific error. Nothing is
 defaulted.
+
+A requested symbol that is a string but not a standard OSI (e.g. an adjusted/binary root like
+B1VDA…) is NOT a whole-request error: it becomes an ``invalid_symbol`` failure in its input
+position and the rest of the request is priced. In get_greeks such a symbol never reaches the book,
+the cold path, or publication — only the valid symbols go to ComputeLoop.get_greeks, merged back in
+input order. Still rejected whole (unchanged): contracts missing/not a list; an entry of the wrong
+type (compute_greeks: not an object; get_greeks: not a string); an osi that isn't a string; unknown
+or missing fields; a bad as_of.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Union
 from zoneinfo import ZoneInfo
 
 from greeks.config import GreeksConfig
-from greeks_server.compute import Contract, compute_or_fail
+from greeks.domain import FailureReason, RowStatus
+from greeks_server.compute import Contract, Methodology, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
 from greeks_server.message import OptionGreeksMessage
 from greeks_server.price import quote_mid, select_spot
 from greeks_server.wire import Quote, Trade
+
+log = logging.getLogger(__name__)
 
 OP = "compute_greeks"
 OP_GET = "get_greeks"
@@ -47,6 +60,31 @@ _TRADE_FIELDS = ("last", "trade_ts")
 
 # One compute_greeks input: the contract and the raw facts for it (each side present or absent).
 ParsedItem = tuple[Contract, Optional[Quote], Optional[Trade], Optional[Quote], Optional[Trade]]
+
+
+@dataclass(frozen=True)
+class InvalidSymbol:
+    """A requested symbol that is a string but not a standard OSI — it fails on its own."""
+    osi: str
+
+
+def _invalid_message(osi: str, priced_as_of_ms: int, m: Methodology) -> OptionGreeksMessage:
+    """The invalid_symbol failure, built directly (not via _failure, which needs a parsed Contract).
+    Every price and greek field is empty."""
+    return OptionGreeksMessage(
+        osi=osi,
+        status=RowStatus.FAILURE,
+        reason=FailureReason.INVALID_SYMBOL,
+        priced_as_of=priced_as_of_ms,
+        methodology_version=m.methodology_version,
+    )
+
+
+def _warn_invalid(op: str, invalid: list[str]) -> None:
+    """One WARN per request that has invalid symbols: the op, the count, up to 5 examples."""
+    if invalid:
+        log.warning("%s: %d invalid symbol(s) failed on their own (e.g. %s)",
+                    op, len(invalid), ", ".join(invalid[:5]))
 
 
 def _finite(where: str, v: Any) -> float:
@@ -96,14 +134,14 @@ def _trade(where: str, v: Any) -> Optional[Trade]:
     return Trade(_positive(f"{where}.last", v["last"]), _ts(f"{where}.trade_ts", v["trade_ts"]))
 
 
-def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[ParsedItem]]:
+def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[Union[ParsedItem, InvalidSymbol]]]:
     as_of = payload.get("as_of")
     if isinstance(as_of, bool) or not isinstance(as_of, int) or as_of <= 0:
         raise ValueError(f"'as_of' must be epoch millis (positive int), got {as_of!r}")
     contracts = payload.get("contracts")
     if not isinstance(contracts, list):
         raise ValueError("'contracts' must be a list")
-    out: list[ParsedItem] = []
+    out: list[Union[ParsedItem, InvalidSymbol]] = []
     for i, item in enumerate(contracts):
         if not isinstance(item, dict):
             raise ValueError(f"contracts[{i}] must be an object")
@@ -115,17 +153,18 @@ def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[ParsedItem]]:
         osi = item["osi"]
         if not isinstance(osi, str):
             raise ValueError(f"contracts[{i}].osi must be a string")
+        # Validate the facts first, so a malformed quote/trade still rejects the whole request even
+        # on an entry whose osi doesn't parse.
+        oq = _quote(f"contracts[{i}].opt_quote", item.get("opt_quote"))
+        ot = _trade(f"contracts[{i}].opt_trade", item.get("opt_trade"))
+        uq = _quote(f"contracts[{i}].und_quote", item.get("und_quote"))
+        ut = _trade(f"contracts[{i}].und_trade", item.get("und_trade"))
         try:
             contract = Contract.parse(osi)
         except ValueError:
-            raise ValueError(f"contracts[{i}].osi is not a standard OSI symbol: {osi!r}") from None
-        out.append((
-            contract,
-            _quote(f"contracts[{i}].opt_quote", item.get("opt_quote")),
-            _trade(f"contracts[{i}].opt_trade", item.get("opt_trade")),
-            _quote(f"contracts[{i}].und_quote", item.get("und_quote")),
-            _trade(f"contracts[{i}].und_trade", item.get("und_trade")),
-        ))
+            out.append(InvalidSymbol(osi))  # not a standard OSI: fails on its own, in position
+            continue
+        out.append((contract, oq, ot, uq, ut))
     return as_of, out
 
 
@@ -136,7 +175,13 @@ def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[s
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         as_of_ms, items = parse_request(payload)  # validate everything before any work
         results = []
-        for contract, oq, _ot, uq, ut in items:  # _ot: opt_trade is no longer used (quote mid only)
+        invalid: list[str] = []
+        for it in items:
+            if isinstance(it, InvalidSymbol):
+                invalid.append(it.osi)
+                results.append(_invalid_message(it.osi, priced_as_of_ms=as_of_ms, m=m).to_wire())
+                continue
+            contract, oq, _ot, uq, ut = it  # _ot: opt_trade is no longer used (quote mid only)
             # The option price is the quote mid only (no trade fallback), at or before as_of; a
             # contract with no such quote is a no_current_quote failure.
             mid = quote_mid(oq)
@@ -146,34 +191,49 @@ def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[s
             as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
             day_inputs = inputs.for_date(as_of.astimezone(ET).date())
             results.append(compute_or_fail(contract, opt_px, spot_px, day_inputs, as_of, m).to_wire())
+        _warn_invalid(OP, invalid)
         return {"results": results}
 
     return handle
 
 
-def parse_get_request(payload: Mapping[str, Any]) -> list[str]:
+def parse_get_request(payload: Mapping[str, Any]) -> list[Union[str, InvalidSymbol]]:
     contracts = payload.get("contracts")
     if not isinstance(contracts, list):
         raise ValueError("'contracts' must be a list")
-    osis: list[str] = []
+    out: list[Union[str, InvalidSymbol]] = []
     for i, osi in enumerate(contracts):
         if not isinstance(osi, str):
             raise ValueError(f"contracts[{i}] must be a string osi, got {osi!r}")
         try:
-            Contract.parse(osi)  # reject a non-standard OSI at the edge
+            Contract.parse(osi)
+            out.append(osi)
         except ValueError:
-            raise ValueError(f"contracts[{i}] is not a standard OSI symbol: {osi!r}") from None
-        osis.append(osi)
-    return osis
+            out.append(InvalidSymbol(osi))  # not a standard OSI: fails on its own, in position
+    return out
 
 
 def make_get_handler(
     get_greeks: Callable[[list[str]], list[OptionGreeksMessage]],
+    m: Methodology,
 ) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
-    """get_greeks: book first, cold path for the rest. ``get_greeks`` is ComputeLoop.get_greeks."""
+    """get_greeks: book first, cold path for the rest. ``get_greeks`` is ComputeLoop.get_greeks.
+    A non-OSI symbol fails on its own (invalid_symbol, priced_as_of 0 as the cold path's failures
+    use today); only the valid symbols reach ``get_greeks``, merged back in input order."""
 
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
-        osis = parse_get_request(payload)
-        return {"results": [m.to_wire() for m in get_greeks(osis)]}
+        items = parse_get_request(payload)
+        valid = [it for it in items if isinstance(it, str)]
+        priced = iter(get_greeks(valid))  # one per valid symbol, in order
+        results = []
+        invalid: list[str] = []
+        for it in items:
+            if isinstance(it, InvalidSymbol):
+                invalid.append(it.osi)
+                results.append(_invalid_message(it.osi, priced_as_of_ms=0, m=m).to_wire())
+            else:
+                results.append(next(priced).to_wire())
+        _warn_invalid(OP_GET, invalid)
+        return {"results": results}
 
     return handle

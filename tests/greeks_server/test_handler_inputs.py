@@ -87,7 +87,6 @@ def test_empty_list_is_fine() -> None:
     [
         (_req("x"), "'contracts' must be a list"),  # type: ignore[arg-type]
         ({"op": "compute_greeks", "contracts": [_item()]}, "'as_of' must be epoch millis"),
-        (_req([_item(osi="NVDA1261120C00180000")]), "not a standard OSI"),
         (_req([_item(opt_trade={"last": 0, "trade_ts": NOW_MS})]), "opt_trade.last must be positive"),
         (_req([_item(und_quote={"bid": float("inf"), "ask": 1.0, "quote_ts": NOW_MS})]), "und_quote.bid must be a finite number"),
         (_req([_item(opt_quote={"bid": 9.0, "quote_ts": NOW_MS})]), "missing field(s): ask"),
