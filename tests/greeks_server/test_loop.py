@@ -280,7 +280,7 @@ def test_get_greeks_returns_held_success_and_cold_paths_the_rest() -> None:
     snaps = {NVDA_P: {"osi": NVDA_P, "quote": {"bid": 3.0, "ask": 3.2, "at": qts}}}
     stock = {"NVDA": (180.9, 181.1, qts)}  # mid 181.0
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=as_of), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=as_of), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
     # Seed one held success via a live tick.
     h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
     h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
@@ -302,7 +302,7 @@ def test_get_greeks_reprices_a_held_failure_through_the_cold_path() -> None:
     snaps = {NVDA_C: {"osi": NVDA_C, "quote": {"bid": 9.0, "ask": 9.2, "at": t}}}
     stock = {"NVDA": (186.5, 186.78, t)}  # mid 186.64
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=t), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=t), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
     # Seed a held missing_spot failure.
     h.loop.book.ensure(NVDA_C)
     h.loop.book.accept(OptionGreeksMessage(
@@ -335,7 +335,7 @@ def test_cold_path_rejects_a_quote_before_session_open() -> None:
     stock = {"NVDA": (180.9, 181.1, after)}  # mid 181.0
     h = Harness()
     h.loop._cold = ColdPath(cold_transport(snaps, stock, log, session_open=SESSION_OPEN, as_of=after),
-                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
     out = {m.osi: m for m in h.loop.get_greeks([stale, fresh])}
     assert out[stale].reason is FailureReason.NO_CURRENT_QUOTE and out[stale].status is RowStatus.FAILURE
     assert out[fresh].status.value == "success" and out[fresh].spot == pytest.approx(181.0)
@@ -358,7 +358,7 @@ def test_cold_path_after_hours_prices_all_as_of_the_stock_reply() -> None:
     stock = {"NVDA": (186.8, 187.0, t1605)}  # latest stock mid 186.90
     h = Harness()
     h.loop._cold = ColdPath(cold_transport(snaps, stock, log, session_open=SESSION_OPEN, as_of=t1605),
-                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
     out = {m.osi: m for m in h.loop.get_greeks([close_osi, curb_osi])}
     for m in out.values():
         assert m.status.value == "success" and m.spot == pytest.approx(186.90) and m.priced_as_of == t1605
@@ -377,7 +377,7 @@ def test_scenario_new_ticker_opened_after_the_close() -> None:
     }
     stock = {"RKLB": (30.9, 31.1, q2)}  # mid 31.0
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=q2), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=q2), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
     out = h.loop.get_greeks([rklb_c, rklb_p])
     assert all(m.status.value == "success" for m in out)
     assert out[0].priced_as_of == q2 and out[1].priced_as_of == q2   # one as_of for the pass
@@ -399,7 +399,7 @@ def test_scenario_restart_then_release_completes_well_inside_the_ping_window() -
             snaps[osi] = {"osi": osi, "quote": {"bid": 5.0, "ask": 5.2, "at": base + i}}
     stock = {u: (119.9, 120.1, base) for u in unders}         # latest stock mid 120.0 per underlying
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, as_of=base), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, as_of=base), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
 
     t0 = time.perf_counter()
     out = h.loop.get_greeks(osis)

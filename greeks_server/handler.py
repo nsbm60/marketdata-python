@@ -42,12 +42,13 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional, Union
 from zoneinfo import ZoneInfo
 
 from greeks.config import GreeksConfig
 from greeks.domain import FailureReason, RowStatus
+from greeks_server.calendar import SessionCache
 from greeks_server.compute import Contract, Methodology, price_current
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
@@ -173,23 +174,19 @@ def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[Union[ParsedIte
     return as_of, out
 
 
-def _session_open_ms(as_of_ms: int) -> int:
-    """The options-session open (09:30 ET) of the day as_of falls in, in epoch ms — the lower bound
-    a current option quote is measured against."""
-    d = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc).astimezone(ET).date()
-    return int(datetime.combine(d, dtime(9, 30), tzinfo=ET).timestamp() * 1000)
-
-
 def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
     """compute_greeks: pure, raw-facts. No book, no publish. Prices every contract as of the
     request's as_of via the shared compute.price_current rule (see the module docstring)."""
     m = methodology(cfg)
+    sessions = SessionCache()  # the one source of the session open (same as the cold path uses)
 
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         as_of_ms, items = parse_request(payload)  # validate everything before any work
-        # One time for the whole request: the as_of, its session open, and its day's inputs.
+        # One time for the whole request: the as_of, its session open, and its day's inputs. The
+        # session open is the most recent regular session that opened at or before as_of (None if
+        # none can be placed → every contract is no_current_quote); never a naive 09:30 of as_of's day.
         as_of = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc)
-        session_open_ms = _session_open_ms(as_of_ms)
+        session_open_ms = sessions.most_recent_open(as_of_ms)
         day_inputs = inputs.for_date(as_of.astimezone(ET).date())
         results = []
         invalid: list[str] = []

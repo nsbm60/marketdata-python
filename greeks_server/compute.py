@@ -168,7 +168,7 @@ def price_current(
     opt_quote: Optional[Quote],
     und_quote: Optional[Quote],
     as_of: datetime,
-    session_open_ms: int,
+    session_open_ms: Optional[int],
     inputs: SessionInputs,
     m: Methodology,
 ) -> OptionGreeksMessage:
@@ -176,8 +176,10 @@ def price_current(
 
     Prices ``contract`` as of ``as_of``. The option price is the option quote's mid, valid only if
     two-sided, stamped at or before as_of, and at or after ``session_open_ms`` + 1 minute — else
-    no_current_quote. The spot is the und quote's mid, valid only if two-sided and at or before
-    as_of — else missing_spot. Never a trade. Rate and dividends come from ``inputs`` (as_of's date).
+    no_current_quote. ``session_open_ms`` is None when no session can be placed for as_of, which
+    makes every contract no_current_quote. The spot is the und quote's mid, valid only if two-sided
+    and at or before as_of — else missing_spot. Never a trade. Rate and dividends come from
+    ``inputs`` (as_of's date).
     """
     as_of_ms = int(as_of.timestamp() * 1000)
     opt_px = current_option_mid(opt_quote, as_of_ms, session_open_ms)

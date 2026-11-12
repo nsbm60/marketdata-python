@@ -12,6 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from greeks.config import load_config
+from greeks_server.calendar import SessionCache
 from greeks_server.coldpath import ColdPath
 from greeks_server.handler import make_handler
 from greeks_server.inputs import InputsHolder, SessionInputs
@@ -80,26 +81,63 @@ def test_a_valid_pair_is_priced_as_of_as_of() -> None:
     assert res["spot_kind"] == "mid" and res["spot"] == 181.0
 
 
-def _cold_transport(opt_quote: dict[str, Any], und_quote: dict[str, Any]):
-    """A ColdPath transport that serves the same opt_quote + stock quote + as_of as the handler sees,
-    with session_open_ts = the open compute_greeks derives for AS_OF's day."""
+# ── one session open for both callers (calendar lookup, not a naive 09:30 of as_of's day) ───────
+
+# Scenarios where a naive 09:30-of-as_of's-day differs from the most recent session open.
+_FRI_0800 = et_ms(8, 0)                                  # pre-market on a trading day (Fri 2026-11-13)
+_SATURDAY = et_ms(12, 0, day=date(2026, 11, 14))         # weekend
+_THANKSGIVING = et_ms(12, 0, day=date(2026, 11, 26))     # holiday
+_THU_OPEN = et_ms(9, 30, day=date(2026, 11, 12))         # the session before Fri 08:00
+_FRI_OPEN = et_ms(9, 30, day=date(2026, 11, 13))         # the session before Saturday
+_WED_OPEN = et_ms(9, 30, day=date(2026, 11, 25))         # the session before Thanksgiving
+
+
+def test_most_recent_session_open_uses_the_prior_session_not_a_naive_0930() -> None:
+    sc = SessionCache()
+    assert sc.most_recent_open(_FRI_0800) == _THU_OPEN       # 08:00 on a trading day -> previous session
+    assert sc.most_recent_open(_SATURDAY) == _FRI_OPEN       # Saturday -> Friday
+    assert sc.most_recent_open(_THANKSGIVING) == _WED_OPEN   # holiday -> the last session before it
+
+
+def _cold_transport(osi: str, opt_quote: dict[str, Any], und_quote: dict[str, Any], as_of: int):
+    """A ColdPath transport serving the same opt_quote + stock quote + as_of the handler sees. The
+    cold path derives the session open from its own calendar (now_ms), so session_open_ts is unused."""
     def send(req: dict[str, Any]) -> dict[str, Any]:
         if req["op"] == "get_option_snapshots":
-            return {"ok": True, "data": {"snapshots": {OSI: {"quote": {"bid": opt_quote["bid"], "ask": opt_quote["ask"],
-                                                                        "at": opt_quote["quote_ts"]}}},
-                                         "session_open_ts": SESSION_OPEN}}
+            return {"ok": True, "data": {"snapshots": {osi: {"quote": {"bid": opt_quote["bid"], "ask": opt_quote["ask"],
+                                                                       "at": opt_quote["quote_ts"]}}},
+                                         "session_open_ts": 0}}
         if req["op"] == "get_stock_quotes":
-            return {"ok": True, "data": {"quotes": {"NVDA": und_quote}, "missing": [], "as_of": AS_OF}}
+            return {"ok": True, "data": {"quotes": {"NVDA": und_quote}, "missing": [], "as_of": as_of}}
         raise AssertionError(f"unexpected op {req['op']}")
     return send
 
 
-def test_cold_path_and_compute_greeks_agree_for_the_same_quotes_and_time() -> None:
-    opt_quote = _oq(9.0, 9.2, AS_OF - 5_000)
-    und_quote = _oq(180.9, 181.1, AS_OF - 5_000)
-    cold = ColdPath(_cold_transport(opt_quote, und_quote), InputsHolder(_loader), M)
-
-    cold_wire = cold.price([OSI])[0].message.to_wire()
-    hot_wire = _one({"osi": OSI, "opt_quote": opt_quote, "und_quote": und_quote})
+def _agree(as_of: int, quote_ts: int, osi: str = OSI) -> dict[str, Any]:
+    """Price one contract both ways at `as_of` (cold path's clock = as_of), assert identical wire."""
+    opt_quote = _oq(9.0, 9.2, quote_ts)
+    und_quote = _oq(180.9, 181.1, quote_ts)
+    cold = ColdPath(_cold_transport(osi, opt_quote, und_quote, as_of), InputsHolder(_loader), M, now_ms=lambda: as_of)
+    cold_wire = cold.price([osi])[0].message.to_wire()
+    hot_wire = _one({"osi": osi, "opt_quote": opt_quote, "und_quote": und_quote}, as_of=as_of)
     assert cold_wire == hot_wire
-    assert cold_wire["status"] == "success" and cold_wire["priced_as_of"] == AS_OF
+    return cold_wire
+
+
+def test_cold_path_and_compute_greeks_agree_pre_market_on_a_trading_day() -> None:
+    # as_of Fri 08:00: both gate on Thu's open, so a Thu-10:00 quote is current and prices.
+    wire = _agree(_FRI_0800, quote_ts=et_ms(10, 0, day=date(2026, 11, 12)))
+    assert wire["status"] == "success" and wire["priced_as_of"] == _FRI_0800
+
+
+def test_cold_path_and_compute_greeks_agree_on_a_weekend() -> None:
+    # as_of Saturday: both gate on Friday's open, so a Fri-10:00 quote is current and prices.
+    wire = _agree(_SATURDAY, quote_ts=et_ms(10, 0, day=date(2026, 11, 13)))
+    assert wire["status"] == "success" and wire["priced_as_of"] == _SATURDAY
+
+
+def test_cold_path_and_compute_greeks_agree_on_a_holiday() -> None:
+    # as_of Thanksgiving: both gate on Wednesday's open, so a Wed-10:00 quote is current and prices.
+    # A December-expiry contract, since Thanksgiving is after the 2026-11-20 expiry.
+    wire = _agree(_THANKSGIVING, quote_ts=et_ms(10, 0, day=date(2026, 11, 25)), osi="NVDA261218C00180000")
+    assert wire["status"] == "success" and wire["priced_as_of"] == _THANKSGIVING

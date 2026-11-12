@@ -3,10 +3,11 @@
 get_greeks answers from the book. A contract not in the book has no held quote or held stock, so the
 server asks MDS and prices from that — it never relays a price a client sent. For each contract:
 
-  - get_option_snapshots gives the contract's latest quote and the session open; the option price is
-    the quote mid, used only if the quote is *current* — two-sided and timestamped at or after the
-    session open + 1 minute (09:31 ET). Otherwise the contract fails no_current_quote, with no stock
-    lookup;
+  - get_option_snapshots gives the contract's latest quote; the option price is the quote mid, used
+    only if the quote is *current* — two-sided and timestamped at or after the session open + 1
+    minute (09:31 ET). The session open comes from the server's own calendar (the most recent
+    session open at or before now, the same source compute_greeks uses), not MDS's session_open_ts.
+    Otherwise the contract fails no_current_quote, with no stock lookup;
   - get_stock_quotes ("at": "latest") gives each underlying's latest stock quote. The spot is that
     quote's mid (PriceKind.MID, timed at its quote_ts) — never a trade. An underlying MDS can't quote
     fails missing_spot for its contracts. Every current contract is priced as of the one as_of the
@@ -26,7 +27,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+import time
+
 from greeks.domain import FailureReason
+from greeks_server.calendar import SessionCache
 from greeks_server.compute import Contract, Methodology, _failure, price_current
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.message import OptionGreeksMessage
@@ -52,19 +56,26 @@ class ColdResult:
 
 
 class ColdPath:
-    def __init__(self, transport: Transport, inputs: InputsHolder, m: Methodology) -> None:
+    def __init__(self, transport: Transport, inputs: InputsHolder, m: Methodology,
+                 sessions: Optional[SessionCache] = None, now_ms: Optional[Callable[[], int]] = None) -> None:
         self._send = transport
         self._inputs = inputs
         self._m = m
+        # One source of the session open: the server's own calendar, referenced by now (the same
+        # meaning compute_greeks gets from its request as_of) — not MDS's session_open_ts.
+        self._sessions = sessions or SessionCache()
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
 
     def price(self, osis: Sequence[str]) -> list[ColdResult]:
         """Price each osi from MDS (see the module docstring). One get_option_snapshots call for the
-        quotes + session open, then one get_stock_quotes call for the distinct underlyings of the
-        current contracts; every current contract is priced as of the stock reply's as_of."""
+        quotes, then one get_stock_quotes call for the distinct underlyings of the current contracts;
+        every current contract is priced as of the stock reply's as_of. The session open — the
+        current-quote lower bound — comes from the calendar (most recent session open at or before
+        now), the same source compute_greeks uses."""
         contracts = {osi: Contract.parse(osi) for osi in osis}  # raises on a non-standard OSI
 
         try:
-            snaps, session_open_ms = self._option_snapshots(list(osis))
+            snaps, _mds_session_open = self._option_snapshots(list(osis))
         except Exception as e:  # noqa: BLE001 — MDS failure: every contract depended on this call
             log.debug("get_option_snapshots failed for %d symbols: %s", len(osis), e)
             results = [ColdResult(osi, None, _failure(contracts[osi], FailureReason.MDS_UNAVAILABLE, 0, self._m, None, None))
@@ -73,17 +84,19 @@ class ColdPath:
 
         # The current-quote lower bound decides which underlyings to fetch stock for; price_current
         # makes the final call once as_of is known (re-checking two-sided + stamped at or before it).
-        threshold = session_open_ms + CURRENT_QUOTE_MARGIN_MS
+        # No session (None) → nothing is current → every contract is no_current_quote.
+        session_open_ms = self._sessions.most_recent_open(self._now_ms())
+        threshold = None if session_open_ms is None else session_open_ms + CURRENT_QUOTE_MARGIN_MS
         by_osi: dict[str, ColdResult] = {}
         current: list[tuple[str, Optional[Quote]]] = []
         for osi in osis:
             q, _trade = snaps.get(osi, (None, None))
             mid = quote_mid(q)
-            if mid is not None and mid.ts_ms >= threshold:
+            if threshold is not None and mid is not None and mid.ts_ms >= threshold:
                 current.append((osi, q))  # candidate: price it once the stock + as_of arrive
             else:
-                # No current option quote (one-sided, or before open + 1 min): no stock lookup.
-                # price_current with the epoch as_of yields no_current_quote (priced_as_of 0).
+                # No current option quote (one-sided, or before open + 1 min, or no session): no
+                # stock lookup. price_current with the epoch as_of yields no_current_quote.
                 by_osi[osi] = ColdResult(osi, q, price_current(
                     contracts[osi], q, None, _EPOCH, session_open_ms, _no_inputs(), self._m))
 

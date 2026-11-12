@@ -45,10 +45,12 @@ def quote(bid: float, ask: float, at: int) -> dict[str, Any]:
 
 
 def transport(*, snaps: dict[str, dict], session_open: int, stock: dict[str, tuple[float, float, int]],
-              as_of: int | None, raise_ops: tuple[str, ...] = (), log: list[dict] | None = None):
+              as_of: int | None, raise_ops: tuple[str, ...] = (), log: list[dict] | None = None,
+              now: int = SESSION_OPEN + 5_400_000):  # ~11:00 ET on DAY — the cold path's session reference
     """A ColdPath transport serving get_option_snapshots + get_stock_quotes from seeded dicts.
     `stock` is sym -> (bid, ask, quote_ts). An op in `raise_ops` raises (a timeout). `as_of=None`
-    omits as_of from the get_stock_quotes reply (a malformed reply)."""
+    omits as_of from the get_stock_quotes reply (a malformed reply). `now` is the cold path's clock
+    (the session open is the calendar's most recent session open at or before it)."""
     def send(req: dict[str, Any]) -> dict[str, Any]:
         if log is not None:
             log.append(req)
@@ -67,7 +69,7 @@ def transport(*, snaps: dict[str, dict], session_open: int, stock: dict[str, tup
                 data["as_of"] = as_of
             return {"ok": True, "data": data}
         raise AssertionError(f"unexpected op {op}")  # get_equity_prices_at must never be called
-    return ColdPath(send, _inputs(), M)
+    return ColdPath(send, _inputs(), M, now_ms=lambda: now)
 
 
 def test_spot_is_the_stock_quote_mid_timed_at_its_quote_ts() -> None:

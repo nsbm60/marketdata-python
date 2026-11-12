@@ -61,10 +61,13 @@ def select_spot(
 CURRENT_QUOTE_MARGIN_MS = 60_000
 
 
-def current_option_mid(quote: Optional[Quote], as_of_ms: int, session_open_ms: int) -> Optional[SelectedPrice]:
+def current_option_mid(quote: Optional[Quote], as_of_ms: int, session_open_ms: Optional[int]) -> Optional[SelectedPrice]:
     """The option price for greeks: the two-sided quote mid, but only if it is *current* — stamped at
     or before ``as_of`` and at or after the session open + 1 minute. Else None (→ no_current_quote).
-    No trade fallback: a contract with no current quote has no market to price."""
+    No trade fallback: a contract with no current quote has no market to price. ``session_open_ms`` is
+    None when no session can be placed for as_of, which makes every quote non-current."""
+    if session_open_ms is None:
+        return None
     mid = quote_mid(quote)
     if mid is not None and session_open_ms + CURRENT_QUOTE_MARGIN_MS <= mid.ts_ms <= as_of_ms:
         return mid
