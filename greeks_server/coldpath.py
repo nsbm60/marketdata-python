@@ -147,7 +147,11 @@ class ColdPath:
         if not isinstance(quotes, dict):
             raise RuntimeError("get_stock_quotes reply has no quotes object")
         as_of = data.get("as_of")
-        as_of_ms = as_of if isinstance(as_of, int) and not isinstance(as_of, bool) else 0
+        if not isinstance(as_of, int) or isinstance(as_of, bool) or as_of <= 0:
+            # No usable as_of is a malformed reply — never price as of 1970. Raise so the contracts
+            # that depend on this call fail mds_unavailable, like any other bad MDS reply.
+            raise RuntimeError(f"get_stock_quotes reply has no valid as_of: {as_of!r}")
+        as_of_ms = as_of
         out: dict[str, SelectedPrice] = {}
         for sym, state in quotes.items():
             if isinstance(sym, str):

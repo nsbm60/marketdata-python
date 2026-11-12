@@ -45,9 +45,10 @@ def quote(bid: float, ask: float, at: int) -> dict[str, Any]:
 
 
 def transport(*, snaps: dict[str, dict], session_open: int, stock: dict[str, tuple[float, float, int]],
-              as_of: int, raise_ops: tuple[str, ...] = (), log: list[dict] | None = None):
+              as_of: int | None, raise_ops: tuple[str, ...] = (), log: list[dict] | None = None):
     """A ColdPath transport serving get_option_snapshots + get_stock_quotes from seeded dicts.
-    `stock` is sym -> (bid, ask, quote_ts). An op in `raise_ops` raises (a timeout)."""
+    `stock` is sym -> (bid, ask, quote_ts). An op in `raise_ops` raises (a timeout). `as_of=None`
+    omits as_of from the get_stock_quotes reply (a malformed reply)."""
     def send(req: dict[str, Any]) -> dict[str, Any]:
         if log is not None:
             log.append(req)
@@ -61,7 +62,10 @@ def transport(*, snaps: dict[str, dict], session_open: int, stock: dict[str, tup
         if op == "get_stock_quotes":
             want = set(req["symbols"])
             quotes = {s: {"bid": b, "ask": a, "quote_ts": t} for s, (b, a, t) in stock.items() if s in want}
-            return {"ok": True, "data": {"quotes": quotes, "missing": [s for s in want if s not in stock], "as_of": as_of}}
+            data = {"quotes": quotes, "missing": [s for s in want if s not in stock]}
+            if as_of is not None:
+                data["as_of"] = as_of
+            return {"ok": True, "data": data}
         raise AssertionError(f"unexpected op {op}")  # get_equity_prices_at must never be called
     return ColdPath(send, _inputs(), M)
 
@@ -106,6 +110,19 @@ def test_mds_timeout_fails_only_the_dependent_contracts_and_answers_the_rest() -
         snaps={NVDA_C: quote(9.0, 9.2, fresh_at), NVDA_STALE: quote(0.1, 0.2, stale_at)},
         session_open=SESSION_OPEN, stock={"NVDA": (180.9, 181.1, fresh_at)}, as_of=et_ms(11, 0, 5),
         raise_ops=("get_stock_quotes",))
+    out = {r.osi: r.message for r in cold.price([NVDA_C, NVDA_STALE])}
+    assert out[NVDA_C].reason is FailureReason.MDS_UNAVAILABLE
+    assert out[NVDA_STALE].reason is FailureReason.NO_CURRENT_QUOTE
+    assert len(out) == 2  # the whole request is still answered
+
+
+def test_stock_reply_missing_as_of_fails_only_the_current_contracts() -> None:
+    # A get_stock_quotes reply with no as_of is malformed: never price as of 1970. The current
+    # contract (which needed the stock) -> mds_unavailable; the stale one is still answered.
+    fresh_at, stale_at = et_ms(11, 0), SESSION_OPEN - 60_000
+    cold = transport(
+        snaps={NVDA_C: quote(9.0, 9.2, fresh_at), NVDA_STALE: quote(0.1, 0.2, stale_at)},
+        session_open=SESSION_OPEN, stock={"NVDA": (180.9, 181.1, fresh_at)}, as_of=None)
     out = {r.osi: r.message for r in cold.price([NVDA_C, NVDA_STALE])}
     assert out[NVDA_C].reason is FailureReason.MDS_UNAVAILABLE
     assert out[NVDA_STALE].reason is FailureReason.NO_CURRENT_QUOTE
