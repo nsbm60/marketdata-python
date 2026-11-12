@@ -10,11 +10,14 @@ the results; it never touches the book or publishes. Used by tools/Tradeability.
   Response: {"results": [<OptionGreeksMessage wire dict>, …]}  — one per input, input order.
 
   Pricing follows the same rule the cold path uses (compute.price_current), one time for the whole
-  request: every contract is priced as of the request's ``as_of``.
-    - Option price: the opt_quote mid, valid only if two-sided, stamped at or before as_of, and at or
-      after the open + 1 minute of as_of's session (09:31 ET). Otherwise no_current_quote.
-    - Spot: the und_quote mid, valid only if two-sided and stamped at or before as_of. Otherwise
-      missing_spot. Never a trade.
+  request: every contract is priced as of the request's ``as_of`` — used only for time to expiry
+  (and its date for the rate and dividends).
+    - Option price: the opt_quote mid, valid only if two-sided and stamped at or after the open + 1
+      minute of as_of's session (09:31 ET). Otherwise no_current_quote.
+    - Spot: the und_quote mid, valid only if two-sided. Otherwise missing_spot. Never a trade.
+    - Neither price is compared against as_of: ensuring a quote is as of the right time is the data
+      source's job (as_of is a computer clock, quote times are the exchange's — comparing them
+      rejects harmless millisecond skew).
     - Rate and dividends are for as_of's date.
   opt_trade and und_trade are still accepted on the wire (so existing callers don't break) but are
   IGNORED — greeks price from quote mids only.

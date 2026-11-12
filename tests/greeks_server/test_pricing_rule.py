@@ -62,9 +62,15 @@ def test_one_sided_stock_quote_is_missing_spot() -> None:
     assert res["status"] == "failure" and res["reason"] == "missing_spot"
 
 
-def test_stock_quote_after_as_of_is_missing_spot() -> None:
-    res = _one({"osi": OSI, "opt_quote": _oq(9.0, 9.2, AS_OF), "und_quote": _oq(180.9, 181.1, AS_OF + 60_000)})
-    assert res["status"] == "failure" and res["reason"] == "missing_spot"
+def test_stock_quote_stamped_after_as_of_is_used() -> None:
+    # as_of is a computer clock, quote times are the exchange's; a 300 ms skew must not drop the spot.
+    res = _one({"osi": OSI, "opt_quote": _oq(9.0, 9.2, AS_OF), "und_quote": _oq(180.9, 181.1, AS_OF + 300)})
+    assert res["status"] == "success" and res["spot"] == 181.0 and res["spot_kind"] == "mid"
+
+
+def test_option_quote_stamped_after_as_of_is_used() -> None:
+    res = _one({"osi": OSI, "opt_quote": _oq(9.0, 9.2, AS_OF + 300), "und_quote": _oq(180.9, 181.1, AS_OF)})
+    assert res["status"] == "success" and res["price"] == 9.1 and res["price_kind"] == "mid"
 
 
 def test_a_trade_with_no_stock_quote_is_missing_spot() -> None:

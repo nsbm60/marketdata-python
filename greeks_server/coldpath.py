@@ -9,9 +9,10 @@ server asks MDS and prices from that — it never relays a price a client sent. 
     session open at or before now, the same source compute_greeks uses), not MDS's session_open_ts.
     Otherwise the contract fails no_current_quote, with no stock lookup;
   - get_stock_quotes ("at": "latest") gives each underlying's latest stock quote. The spot is that
-    quote's mid (PriceKind.MID, timed at its quote_ts) — never a trade. An underlying MDS can't quote
-    fails missing_spot for its contracts. Every current contract is priced as of the one as_of the
-    stock reply carries.
+    quote's mid (PriceKind.MID, timed at its quote_ts) if two-sided — never a trade. An underlying
+    MDS can't quote fails missing_spot for its contracts. Every current contract is priced as of the
+    one as_of the stock reply carries, used only for time to expiry — neither the option nor the
+    stock quote timestamp is compared against it (ensuring a quote is current is MDS's job).
 
 An MDS call that raises or times out fails ONLY the contracts that depended on it: if
 get_option_snapshots fails, every contract gets mds_unavailable; if get_stock_quotes fails, only the

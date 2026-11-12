@@ -72,13 +72,6 @@ def test_no_trade_fallback() -> None:
     assert res[0]["status"] == "failure" and res[0]["reason"] == "no_current_quote"
 
 
-def test_a_quote_after_as_of_is_not_current() -> None:
-    # The option quote is the only price; stamped after as_of it is rejected -> no_current_quote.
-    item = _item(opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS + 60_000})
-    res = _handler([])(_req([item], as_of=NOW_MS))["results"]
-    assert res[0]["status"] == "failure" and res[0]["reason"] == "no_current_quote"
-
-
 def test_empty_list_is_fine() -> None:
     assert _handler([])(_req([])) == {"results": []}
 
