@@ -9,9 +9,15 @@ the results; it never touches the book or publishes. Used by tools/Tradeability.
                             "und_quote": {"bid","ask","quote_ts"}?,  "und_trade": {"last","trade_ts"}?}, …]}
   Response: {"results": [<OptionGreeksMessage wire dict>, …]}  — one per input, input order.
 
-  as_of is an upper bound: for each contract T is the option price's own timestamp at or before
-  as_of (mid first, else last), the spot is the newest fact at or before T, and the rate and
-  dividends are for T's date. No session, no clock.
+  Pricing follows the same rule the cold path uses (compute.price_current), one time for the whole
+  request: every contract is priced as of the request's ``as_of``.
+    - Option price: the opt_quote mid, valid only if two-sided, stamped at or before as_of, and at or
+      after the open + 1 minute of as_of's session (09:31 ET). Otherwise no_current_quote.
+    - Spot: the und_quote mid, valid only if two-sided and stamped at or before as_of. Otherwise
+      missing_spot. Never a trade.
+    - Rate and dividends are for as_of's date.
+  opt_trade and und_trade are still accepted on the wire (so existing callers don't break) but are
+  IGNORED — greeks price from quote mids only.
 
 get_greeks — the live book op. Answers each contract from the book, prices any the book has never
 seen through the cold path (which asks MDS), and publishes those.
@@ -36,17 +42,16 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from typing import Any, Callable, Mapping, Optional, Union
 from zoneinfo import ZoneInfo
 
 from greeks.config import GreeksConfig
 from greeks.domain import FailureReason, RowStatus
-from greeks_server.compute import Contract, Methodology, compute_or_fail
+from greeks_server.compute import Contract, Methodology, price_current
 from greeks_server.inputs import InputsHolder
 from greeks_server.loop import methodology
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import quote_mid, select_spot
 from greeks_server.wire import Quote, Trade
 
 log = logging.getLogger(__name__)
@@ -168,12 +173,24 @@ def parse_request(payload: Mapping[str, Any]) -> tuple[int, list[Union[ParsedIte
     return as_of, out
 
 
+def _session_open_ms(as_of_ms: int) -> int:
+    """The options-session open (09:30 ET) of the day as_of falls in, in epoch ms — the lower bound
+    a current option quote is measured against."""
+    d = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc).astimezone(ET).date()
+    return int(datetime.combine(d, dtime(9, 30), tzinfo=ET).timestamp() * 1000)
+
+
 def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
-    """compute_greeks: pure, raw-facts. No book, no publish, no clock."""
+    """compute_greeks: pure, raw-facts. No book, no publish. Prices every contract as of the
+    request's as_of via the shared compute.price_current rule (see the module docstring)."""
     m = methodology(cfg)
 
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
         as_of_ms, items = parse_request(payload)  # validate everything before any work
+        # One time for the whole request: the as_of, its session open, and its day's inputs.
+        as_of = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc)
+        session_open_ms = _session_open_ms(as_of_ms)
+        day_inputs = inputs.for_date(as_of.astimezone(ET).date())
         results = []
         invalid: list[str] = []
         for it in items:
@@ -181,16 +198,8 @@ def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[s
                 invalid.append(it.osi)
                 results.append(_invalid_message(it.osi, priced_as_of_ms=as_of_ms, m=m).to_wire())
                 continue
-            contract, oq, _ot, uq, ut = it  # _ot: opt_trade is no longer used (quote mid only)
-            # The option price is the quote mid only (no trade fallback), at or before as_of; a
-            # contract with no such quote is a no_current_quote failure.
-            mid = quote_mid(oq)
-            opt_px = mid if (mid is not None and mid.ts_ms <= as_of_ms) else None
-            t_ms = opt_px.ts_ms if opt_px is not None else as_of_ms
-            spot_px = select_spot(uq, (ut,), t_ms)
-            as_of = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
-            day_inputs = inputs.for_date(as_of.astimezone(ET).date())
-            results.append(compute_or_fail(contract, opt_px, spot_px, day_inputs, as_of, m).to_wire())
+            contract, oq, _ot, uq, _ut = it  # opt_trade/und_trade accepted on the wire but ignored
+            results.append(price_current(contract, oq, uq, as_of, session_open_ms, day_inputs, m).to_wire())
         _warn_invalid(OP, invalid)
         return {"results": results}
 

@@ -15,13 +15,13 @@ from gs_helpers import NOW_MS, SESSION, sofr_flat
 
 
 def _item(**over: Any) -> dict[str, Any]:
-    # Raw facts: a two-sided option quote (mid 9.1) and an underlying last trade. An absent side is
-    # omitted. select_price picks the mid for the option (fixing T at its quote_ts); select_spot
-    # picks the last for the spot.
+    # Raw facts: a two-sided option quote (mid 9.1) and a two-sided underlying quote (mid 181.0),
+    # both current (at NOW_MS, within [open + 1 min, as_of]). The option and spot are both quote
+    # mids; trades are accepted on the wire but ignored.
     d: dict[str, Any] = {
         "osi": "NVDA261120C00180000",
         "opt_quote": {"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS},
-        "und_trade": {"last": 181.0, "trade_ts": NOW_MS},
+        "und_quote": {"bid": 180.9, "ask": 181.1, "quote_ts": NOW_MS},
     }
     d.update(over)
     return d
@@ -46,20 +46,21 @@ def test_results_in_input_order_and_inputs_cached_by_date() -> None:
     res = out["results"]
     assert [r["osi"] for r in res] == ["NVDA261120C00180000", "NVDA261120C00100000"]
     assert res[0]["status"] == "success" and res[1]["reason"] == "below_intrinsic"
-    assert res[0]["spot_kind"] == "last" and res[0]["price_kind"] == "mid"  # the server ran the §4 rule
+    assert res[0]["spot_kind"] == "mid" and res[0]["price_kind"] == "mid"  # both are quote mids now
     # Both price as of the same date; inputs are loaded once for it.
     assert loads == [SESSION]
 
 
-def test_priced_as_of_is_the_option_price_timestamp_not_as_of() -> None:
-    # T is the option price's own timestamp, at or before as_of.
+def test_priced_as_of_is_the_request_as_of() -> None:
+    # One time for the whole request: a contract is priced as of the request's as_of, not the
+    # option quote's own timestamp (quotes stamped at or before as_of, within the session).
     item = _item(
         opt_quote={"bid": 9.0, "ask": 9.2, "quote_ts": NOW_MS - 5_000},
-        und_trade={"last": 181.0, "trade_ts": NOW_MS - 5_000},
+        und_quote={"bid": 180.9, "ask": 181.1, "quote_ts": NOW_MS - 5_000},
     )
     res = _handler([])(_req([item], as_of=NOW_MS))["results"]
     assert res[0]["status"] == "success"
-    assert res[0]["priced_as_of"] == NOW_MS - 5_000
+    assert res[0]["priced_as_of"] == NOW_MS
 
 
 def test_no_trade_fallback() -> None:

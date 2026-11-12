@@ -55,3 +55,26 @@ def select_spot(
         return None
     newest = max(valid, key=lambda t: t.ts_ms)
     return SelectedPrice(newest.price, PriceKind.LAST, newest.ts_ms)
+
+
+# A current quote is stamped at or after the session open + this margin (09:31 ET).
+CURRENT_QUOTE_MARGIN_MS = 60_000
+
+
+def current_option_mid(quote: Optional[Quote], as_of_ms: int, session_open_ms: int) -> Optional[SelectedPrice]:
+    """The option price for greeks: the two-sided quote mid, but only if it is *current* — stamped at
+    or before ``as_of`` and at or after the session open + 1 minute. Else None (→ no_current_quote).
+    No trade fallback: a contract with no current quote has no market to price."""
+    mid = quote_mid(quote)
+    if mid is not None and session_open_ms + CURRENT_QUOTE_MARGIN_MS <= mid.ts_ms <= as_of_ms:
+        return mid
+    return None
+
+
+def current_spot_mid(quote: Optional[Quote], as_of_ms: int) -> Optional[SelectedPrice]:
+    """The spot for greeks: the two-sided quote mid, but only if stamped at or before ``as_of``. Else
+    None (→ missing_spot). Never a trade — a print describes a market that may no longer exist."""
+    mid = quote_mid(quote)
+    if mid is not None and mid.ts_ms <= as_of_ms:
+        return mid
+    return None

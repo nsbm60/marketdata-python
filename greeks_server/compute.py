@@ -18,7 +18,8 @@ from greeks.occ import OccContract, parse_occ
 from greeks.solver.invert import invert
 from greeks_server.inputs import SessionInputs
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import SelectedPrice
+from greeks_server.price import SelectedPrice, current_option_mid, current_spot_mid
+from greeks_server.wire import Quote
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,28 @@ def compute(
         discount=c.discount,
         t_years=c.time_to_expiry,
     )
+
+
+def price_current(
+    contract: Contract,
+    opt_quote: Optional[Quote],
+    und_quote: Optional[Quote],
+    as_of: datetime,
+    session_open_ms: int,
+    inputs: SessionInputs,
+    m: Methodology,
+) -> OptionGreeksMessage:
+    """The one pricing rule the cold path and compute_greeks share, so it lives in one place.
+
+    Prices ``contract`` as of ``as_of``. The option price is the option quote's mid, valid only if
+    two-sided, stamped at or before as_of, and at or after ``session_open_ms`` + 1 minute — else
+    no_current_quote. The spot is the und quote's mid, valid only if two-sided and at or before
+    as_of — else missing_spot. Never a trade. Rate and dividends come from ``inputs`` (as_of's date).
+    """
+    as_of_ms = int(as_of.timestamp() * 1000)
+    opt_px = current_option_mid(opt_quote, as_of_ms, session_open_ms)
+    spot_px = current_spot_mid(und_quote, as_of_ms)
+    return compute_or_fail(contract, opt_px, spot_px, inputs, as_of, m)
 
 
 def compute_or_fail(

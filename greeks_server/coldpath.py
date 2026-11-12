@@ -27,19 +27,16 @@ from typing import Any, Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from greeks.domain import FailureReason
-from greeks_server.compute import Contract, Methodology, _failure, compute_or_fail
+from greeks_server.compute import Contract, Methodology, _failure, price_current
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.message import OptionGreeksMessage
-from greeks_server.price import PriceKind, SelectedPrice, quote_mid
+from greeks_server.price import CURRENT_QUOTE_MARGIN_MS, SelectedPrice, quote_mid
 from greeks_server.wire import Quote
 
 log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
-
-# A current option quote must be timestamped at or after the session open + this margin (09:31 ET).
-_CURRENT_QUOTE_MARGIN_MS = 60_000
 
 # A control transport: send a request dict, get the parsed reply dict. Raises on timeout/transport.
 Transport = Callable[[dict[str, Any]], dict[str, Any]]
@@ -74,35 +71,40 @@ class ColdPath:
                        for osi in osis]
             return self._finish(results)
 
-        threshold = session_open_ms + _CURRENT_QUOTE_MARGIN_MS
+        # The current-quote lower bound decides which underlyings to fetch stock for; price_current
+        # makes the final call once as_of is known (re-checking two-sided + stamped at or before it).
+        threshold = session_open_ms + CURRENT_QUOTE_MARGIN_MS
         by_osi: dict[str, ColdResult] = {}
-        current: list[tuple[str, Optional[Quote], SelectedPrice]] = []
+        current: list[tuple[str, Optional[Quote]]] = []
         for osi in osis:
             q, _trade = snaps.get(osi, (None, None))
-            opt_px = quote_mid(q)
-            if opt_px is not None and opt_px.ts_ms >= threshold:
-                current.append((osi, q, opt_px))
+            mid = quote_mid(q)
+            if mid is not None and mid.ts_ms >= threshold:
+                current.append((osi, q))  # candidate: price it once the stock + as_of arrive
             else:
-                # No current two-sided quote: no_current_quote, and no stock lookup.
-                msg = compute_or_fail(contracts[osi], None, None, _no_inputs(), _EPOCH, self._m)
-                by_osi[osi] = ColdResult(osi, q, msg)
+                # No current option quote (one-sided, or before open + 1 min): no stock lookup.
+                # price_current with the epoch as_of yields no_current_quote (priced_as_of 0).
+                by_osi[osi] = ColdResult(osi, q, price_current(
+                    contracts[osi], q, None, _EPOCH, session_open_ms, _no_inputs(), self._m))
 
         if current:
-            underlyings = sorted({contracts[osi].underlying for osi, _, _ in current})
+            underlyings = sorted({contracts[osi].underlying for osi, _ in current})
             try:
-                spots, as_of_ms = self._stock_quotes(underlyings)
+                stock_quotes, as_of_ms = self._stock_quotes(underlyings)
             except Exception as e:  # noqa: BLE001 — MDS failure: only the current contracts depended
                 log.debug("get_stock_quotes failed for %d underlyings: %s", len(underlyings), e)
-                for osi, q, opt_px in current:
+                for osi, q in current:
+                    opt_px = quote_mid(q)
+                    ts = opt_px.ts_ms if opt_px is not None else 0
                     by_osi[osi] = ColdResult(osi, q, _failure(
-                        contracts[osi], FailureReason.MDS_UNAVAILABLE, opt_px.ts_ms, self._m, opt_px, None))
+                        contracts[osi], FailureReason.MDS_UNAVAILABLE, ts, self._m, opt_px, None))
             else:
                 as_of = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc)
                 inputs = self._inputs.for_date(as_of.astimezone(ET).date())  # one pass, one inputs load
-                for osi, q, opt_px in current:
-                    spot_px = spots.get(contracts[osi].underlying)  # None -> compute() -> missing_spot
-                    msg = compute_or_fail(contracts[osi], opt_px, spot_px, inputs, as_of, self._m)
-                    by_osi[osi] = ColdResult(osi, q, msg)
+                for osi, q in current:
+                    und_q = stock_quotes.get(contracts[osi].underlying)  # None -> missing_spot
+                    by_osi[osi] = ColdResult(osi, q, price_current(
+                        contracts[osi], q, und_q, as_of, session_open_ms, inputs, self._m))
 
         return self._finish([by_osi[osi] for osi in osis])
 
@@ -113,7 +115,8 @@ class ColdPath:
         latest quote mid regardless, so each pair maps to its underlying's latest mid (if any)."""
         unique = sorted(set(pairs))
         underlyings = sorted({u for u, _ in unique})
-        spots, _as_of = self._stock_quotes(underlyings)
+        quotes, _as_of = self._stock_quotes(underlyings)
+        spots = {u: mid for u, q in quotes.items() if (mid := quote_mid(q)) is not None}
         return {(u, t): spots[u] for (u, t) in unique if u in spots}
 
     # ── MDS calls ──────────────────────────────────────────────────────────────────────────────
@@ -136,10 +139,11 @@ class ColdPath:
                   len(osis), len(out), session_open_ms)
         return out, session_open_ms
 
-    def _stock_quotes(self, underlyings: list[str]) -> tuple[dict[str, SelectedPrice], int]:
+    def _stock_quotes(self, underlyings: list[str]) -> tuple[dict[str, Quote], int]:
         """One get_stock_quotes ("at": "latest") call for the given underlyings. Returns (per-symbol
-        stock mid, reply as_of). The spot is the quote mid, PriceKind.MID, timed at its quote_ts; an
-        underlying with no current two-sided quote is simply absent (its contracts -> missing_spot)."""
+        stock quote, reply as_of). The raw quote is returned (not yet mid'd) so price_current applies
+        the one spot rule — two-sided mid, stamped at or before as_of, never a trade. An underlying
+        MDS can't quote is simply absent (price_current then yields missing_spot for its contracts)."""
         if not underlyings:
             return {}, 0
         data = self._data({"op": "get_stock_quotes", "symbols": underlyings, "at": "latest"}, "get_stock_quotes")
@@ -152,13 +156,13 @@ class ColdPath:
             # that depend on this call fail mds_unavailable, like any other bad MDS reply.
             raise RuntimeError(f"get_stock_quotes reply has no valid as_of: {as_of!r}")
         as_of_ms = as_of
-        out: dict[str, SelectedPrice] = {}
+        out: dict[str, Quote] = {}
         for sym, state in quotes.items():
             if isinstance(sym, str):
-                px = quote_mid(_stock_quote_of(state))
-                if px is not None:
-                    out[sym] = px
-        log.debug("get_stock_quotes: %d requested, %d priced (as_of=%d)", len(underlyings), len(out), as_of_ms)
+                q = _stock_quote_of(state)
+                if q is not None:
+                    out[sym] = q
+        log.debug("get_stock_quotes: %d requested, %d returned (as_of=%d)", len(underlyings), len(out), as_of_ms)
         return out, as_of_ms
 
     def _data(self, req: dict[str, Any], op: str) -> dict[str, Any]:
