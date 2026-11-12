@@ -104,7 +104,7 @@ class ComputeLoop(threading.Thread):
         self._time_topic = TopicBuilder.for_options_time()
         # Option ticks whose underlying has no held stock: the stock is fetched from MDS off the
         # compute thread (a blocking RPC must not stall repricing) by this resolver, which coalesces
-        # a burst (a chain's lease bootstrap) into one batched get_equity_prices_at.
+        # a burst (a chain's lease bootstrap) into one batched get_stock_quotes.
         self._cold_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._resolver: Optional[threading.Thread] = None
 
@@ -301,9 +301,9 @@ class ComputeLoop(threading.Thread):
 
     def _price_with_mds_stock(self, osis: list[str]) -> list[OptionGreeksMessage]:
         """The stream resolver's work: price contracts in the book from their held option price and
-        the stock at T — the held live stock if one arrived since the tick, else MDS
-        get_equity_prices_at (one batched call). Accepts and publishes. A failure is published only
-        if MDS itself has no print."""
+        the stock — the held live stock if one arrived since the tick, else the latest stock quote
+        mid from MDS get_stock_quotes (one batched call). Accepts and publishes. A failure is
+        published only if MDS has no current stock quote."""
         if not osis:
             return []
         plans: list[tuple[Contract, Optional[SelectedPrice], int, Optional[SelectedPrice]]] = []

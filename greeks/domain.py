@@ -41,6 +41,9 @@ class FailureReason(str, Enum):
     NO_CURRENT_QUOTE = "no_current_quote"
     MISSING_FORWARD_INPUTS = "missing_forward_inputs"
     EXCLUDED_DATE = "excluded_date"
+    # Live cold path: an MDS call (get_option_snapshots / get_stock_quotes) raised or timed out, so
+    # the contracts that depended on it can't be priced. Only those fail; the rest are still answered.
+    MDS_UNAVAILABLE = "mds_unavailable"
     # Diagnostic: --price mid requires a two-sided vendor quote at join; not a solver fault.
     MISSING_VENDOR_MID = "missing_vendor_mid"
 
