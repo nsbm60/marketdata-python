@@ -48,6 +48,13 @@ Transport = Callable[[dict[str, Any]], dict[str, Any]]
 At = Union[str, int]
 
 
+class MdsRequestError(RuntimeError):
+    """A failure of an MDS control request: a transport error, a not-ok reply (e.g. ``unsupported
+    op`` during a deploy), or a malformed reply. It is distinct from a programming error so callers
+    can treat an MDS restart or outage as recoverable (fail the affected contracts mds_unavailable)
+    rather than let it take the greeks server down."""
+
+
 @dataclass(frozen=True)
 class ColdResult:
     """One priced contract and the quote it was priced from, so the book can hold the quote for the
@@ -121,10 +128,10 @@ class ColdPath:
         data = self._data({"op": "get_quotes", "symbols": symbols, "at": at}, "get_quotes")
         quotes_raw = data.get("quotes")
         if not isinstance(quotes_raw, dict):
-            raise RuntimeError("get_quotes reply has no quotes object")
+            raise MdsRequestError("get_quotes reply has no quotes object")
         as_of = data.get("as_of")
         if not isinstance(as_of, int) or isinstance(as_of, bool) or as_of <= 0:
-            raise RuntimeError(f"get_quotes reply has no valid as_of: {as_of!r}")
+            raise MdsRequestError(f"get_quotes reply has no valid as_of: {as_of!r}")
         so = data.get("session_open_ts")
         session_open_ms = so if (isinstance(so, int) and not isinstance(so, bool) and so > 0) else None
         quotes: dict[str, Quote] = {}
@@ -136,12 +143,17 @@ class ColdPath:
         return quotes, session_open_ms, as_of
 
     def _data(self, req: dict[str, Any], op: str) -> dict[str, Any]:
-        reply = self._send(req)
+        try:
+            reply = self._send(req)
+        except MdsRequestError:
+            raise
+        except Exception as e:  # a transport/timeout failure of the request itself (an MDS outage)
+            raise MdsRequestError(f"MDS {op} request failed: {e}") from e
         if not isinstance(reply, dict) or not reply.get("ok"):
-            raise RuntimeError(f"MDS {op} failed: {reply.get('error') if isinstance(reply, dict) else reply!r}")
+            raise MdsRequestError(f"MDS {op} failed: {reply.get('error') if isinstance(reply, dict) else reply!r}")
         data = reply.get("data")
         if not isinstance(data, dict):
-            raise RuntimeError(f"MDS {op} reply has no data object")
+            raise MdsRequestError(f"MDS {op} reply has no data object")
         return data
 
     def _log(self, results: list[ColdResult], at: At, session_open_ms: Optional[int], as_of_ms: int, t0: float) -> None:

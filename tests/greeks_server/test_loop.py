@@ -20,7 +20,7 @@ import pytest
 from greeks.config import load_config
 from greeks.domain import FailureReason, RowStatus
 from greeks.topic_builder import TopicBuilder
-from greeks_server.coldpath import ColdPath
+from greeks_server.coldpath import ColdPath, MdsRequestError
 from greeks_server.compute import Methodology
 from greeks_server.inputs import InputsHolder, SessionInputs
 from greeks_server.loop import ComputeLoop
@@ -206,6 +206,52 @@ def test_loop_resolver_fetches_held_stock_via_get_quotes_latest() -> None:
     assert h.last()["status"] == "success" and h.last()["spot"] == pytest.approx(186.64)
     gq = [r for r in log if r["op"] == "get_quotes"]
     assert len(gq) == 1 and gq[0]["symbols"] == ["NVDA"] and gq[0]["at"] == "latest"
+
+
+def test_resolver_mds_failure_is_not_fatal_then_next_batch_is_priced() -> None:
+    # An MDS failure (e.g. `unsupported op` during a deploy) must not take the server down: the
+    # batch fails mds_unavailable (published like any other failure) and the resolver carries on.
+    class FailOnceCold:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stock_prices(self, pairs: Any) -> dict[tuple[str, int], SelectedPrice]:
+            self.calls += 1
+            if self.calls == 1:
+                raise MdsRequestError("MDS get_quotes failed: unsupported op")
+            return {p: SelectedPrice(186.64, PriceKind.LAST, et_ms(17, 0)) for p in pairs}
+
+    h = Harness()
+    cold = FailOnceCold()
+    h.loop._cold = cold  # type: ignore[assignment]
+    # Two contracts, each a current option quote with no held stock, so each needs MDS stock.
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(17, 0))
+    h.opt_quote(OPT_P, NVDA_P, 3.0, 3.2, et_ms(17, 0))
+    h.published.clear()
+
+    assert h.loop._resolve_batch([NVDA_C]) is True   # MDS failed -> not fatal, resolver continues
+    assert h.fatal == []
+    m1 = h.last()
+    assert m1["status"] == "failure" and m1["reason"] == "mds_unavailable"
+
+    assert h.loop._resolve_batch([NVDA_P]) is True   # MDS back -> this batch prices
+    assert h.fatal == []
+    assert h.last()["status"] == "success"
+    assert cold.calls == 2
+
+
+def test_resolver_unrelated_exception_still_calls_on_fatal() -> None:
+    # A genuine programming error (not raised by the MDS request) stays fatal.
+    class BuggyCold:
+        def stock_prices(self, pairs: Any) -> dict[tuple[str, int], SelectedPrice]:
+            raise ValueError("a real bug in resolver code")
+
+    h = Harness()
+    h.loop._cold = BuggyCold()  # type: ignore[assignment]
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(17, 0))
+
+    assert h.loop._resolve_batch([NVDA_C]) is False  # fatal -> resolver stops
+    assert len(h.fatal) == 1 and isinstance(h.fatal[0], ValueError)
 
 
 # ── time route + the open as a restart ───────────────────────────────────────────────────────

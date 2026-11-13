@@ -32,10 +32,11 @@ from typing import Any, Callable, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 from greeks.config import GreeksConfig
+from greeks.domain import FailureReason
 from greeks.topic_builder import TopicBuilder
 from greeks_server.book import Book
-from greeks_server.coldpath import ColdPath
-from greeks_server.compute import Contract, Methodology, compute_or_fail
+from greeks_server.coldpath import ColdPath, MdsRequestError
+from greeks_server.compute import Contract, Methodology, _failure, compute_or_fail
 from greeks_server.inputs import InputsHolder
 from greeks_server.held_stock import HeldStock
 from greeks_server.message import OptionGreeksMessage
@@ -345,7 +346,8 @@ class ComputeLoop(threading.Thread):
 
     def _resolve_loop(self) -> None:
         """Drain the cold queue (coalescing a burst), price the batch from MDS stock, publish. One
-        blocking RPC per batch, off the compute thread. A fatal input load ends the process."""
+        blocking RPC per batch, off the compute thread. A fatal input load or programming error ends
+        the process; an MDS failure does not (see _resolve_batch)."""
         while not self._stop_event.is_set():
             first = self._cold_queue.get()
             if first is None:
@@ -360,12 +362,43 @@ class ComputeLoop(threading.Thread):
                     batch.add(nxt)
             except queue.Empty:
                 pass
-            try:
-                self._price_with_mds_stock(sorted(batch))
-            except BaseException as e:  # noqa: BLE001 — same posture as the compute thread
-                log.exception("cold resolver failed: %s", e)
-                self._on_fatal(e)
+            if not self._resolve_batch(sorted(batch)):
                 return
+
+    def _resolve_batch(self, osis: list[str]) -> bool:
+        """Price one resolver batch from MDS stock. Returns True to keep the resolver running.
+
+        An MDS failure (restart, outage, ``unsupported op`` during a deploy) is NOT fatal: the
+        batch's contracts fail mds_unavailable, are published like any other failure, and the
+        resolver carries on. Only a genuine programming error — one not raised by the MDS request —
+        is fatal: on_fatal is called and the resolver stops (returns False)."""
+        try:
+            self._price_with_mds_stock(osis)
+            return True
+        except MdsRequestError as e:
+            log.warning("cold resolver: MDS failed for %d contract(s), failing mds_unavailable: %s",
+                        len(osis), e)
+            self._publish_mds_unavailable(osis)
+            return True
+        except BaseException as e:  # noqa: BLE001 — a real bug; same posture as the compute thread
+            log.exception("cold resolver failed: %s", e)
+            self._on_fatal(e)
+            return False
+
+    def _publish_mds_unavailable(self, osis: list[str]) -> None:
+        """Fail each contract in the batch mds_unavailable and publish it — the same accept/publish
+        path any other failure takes (priced_as_of 0, as the cold path's mds_unavailable uses)."""
+        publish: list[tuple[str, dict[str, Any]]] = []
+        with self._lock:
+            for osi in osis:
+                contract = self.book.contracts.get(osi)
+                if contract is None:
+                    continue
+                msg = _failure(contract, FailureReason.MDS_UNAVAILABLE, 0, self._m, None, None)
+                if self.book.accept(msg):
+                    publish.append((greeks_topic(self._prefix, contract), msg.to_wire()))
+        for topic, wire in publish:
+            self._publish(topic, wire)
 
     # ── helpers ─────────────────────────────────────────────────────────────────────────────────
 
