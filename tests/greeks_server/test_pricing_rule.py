@@ -105,26 +105,36 @@ def test_most_recent_session_open_uses_the_prior_session_not_a_naive_0930() -> N
     assert sc.most_recent_open(_THANKSGIVING) == _WED_OPEN   # holiday -> the last session before it
 
 
-def _cold_transport(osi: str, opt_quote: dict[str, Any], und_quote: dict[str, Any], as_of: int):
-    """A ColdPath transport serving the same opt_quote + stock quote + as_of the handler sees. The
-    cold path derives the session open from its own calendar (now_ms), so session_open_ts is unused."""
+def _cold_transport(osi: str, opt_quote: dict[str, Any], und_quote: dict[str, Any], as_of: int, session_open: int | None):
+    """A ColdPath transport serving the one get_quotes call: the opt_quote and stock quote in one
+    `quotes` object, plus the reply's own session_open_ts and as_of. In production MDS computes
+    session_open_ts the same way the handler's calendar does, so the two callers gate identically —
+    the test passes the calendar's value as the reply's to reproduce that."""
     def send(req: dict[str, Any]) -> dict[str, Any]:
-        if req["op"] == "get_option_snapshots":
-            return {"ok": True, "data": {"snapshots": {osi: {"quote": {"bid": opt_quote["bid"], "ask": opt_quote["ask"],
-                                                                       "at": opt_quote["quote_ts"]}}},
-                                         "session_open_ts": 0}}
-        if req["op"] == "get_stock_quotes":
-            return {"ok": True, "data": {"quotes": {"NVDA": und_quote}, "missing": [], "as_of": as_of}}
-        raise AssertionError(f"unexpected op {req['op']}")
+        assert req["op"] == "get_quotes"
+        want = set(req["symbols"])
+        quotes: dict[str, Any] = {}
+        if osi in want:
+            quotes[osi] = {"bid": opt_quote["bid"], "ask": opt_quote["ask"], "quote_ts": opt_quote["quote_ts"]}
+        if "NVDA" in want:
+            quotes["NVDA"] = {"bid": und_quote["bid"], "ask": und_quote["ask"], "quote_ts": und_quote["quote_ts"]}
+        data: dict[str, Any] = {"quotes": quotes, "missing": {}, "as_of": as_of}
+        if session_open is not None:
+            data["session_open_ts"] = session_open
+        return {"ok": True, "data": data}
     return send
 
 
 def _agree(as_of: int, quote_ts: int, osi: str = OSI) -> dict[str, Any]:
-    """Price one contract both ways at `as_of` (cold path's clock = as_of), assert identical wire."""
+    """Price one contract both ways at `as_of`, assert identical wire. The cold path gates on the
+    reply's session_open_ts; compute_greeks gates on its calendar — the fake reply carries the
+    calendar's value, as production MDS does, so they agree."""
     opt_quote = _oq(9.0, 9.2, quote_ts)
     und_quote = _oq(180.9, 181.1, quote_ts)
-    cold = ColdPath(_cold_transport(osi, opt_quote, und_quote, as_of), InputsHolder(_loader), M, now_ms=lambda: as_of)
-    cold_wire = cold.price([osi])[0].message.to_wire()
+    session_open = SessionCache().most_recent_open(as_of)
+    cold = ColdPath(_cold_transport(osi, opt_quote, und_quote, as_of, session_open), InputsHolder(_loader), M)
+    cold_results, _ = cold.price([osi], "latest")
+    cold_wire = cold_results[0].message.to_wire()
     hot_wire = _one({"osi": osi, "opt_quote": opt_quote, "und_quote": und_quote}, as_of=as_of)
     assert cold_wire == hot_wire
     return cold_wire

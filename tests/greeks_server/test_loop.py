@@ -106,18 +106,21 @@ class Harness:
 
 
 class FakeCold:
-    """Stands in for ColdPath. `price` returns a pre-seeded ColdResult per osi; `stock_prices`
-    answers from a seeded (symbol, ts) -> SelectedPrice map, recording its calls."""
+    """Stands in for ColdPath. `price` returns a pre-seeded ColdResult per osi plus a reply as_of;
+    `stock_prices` answers from a seeded (symbol, ts) -> SelectedPrice map, recording its calls."""
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.ats: list[Any] = []
+        self.as_of: int | None = None
         self.by_osi: dict[str, Any] = {}
         self.stock: dict[tuple[str, int], SelectedPrice] = {}
         self.stock_calls: list[list[tuple[str, int]]] = []
 
-    def price(self, osis: list[str]) -> list[Any]:
+    def price(self, osis: list[str], at: Any) -> tuple[list[Any], int | None]:
         self.calls.append(list(osis))
-        return [self.by_osi[o] for o in osis]
+        self.ats.append(at)
+        return [self.by_osi[o] for o in osis], self.as_of
 
     def stock_prices(self, pairs: Any) -> dict[tuple[str, int], SelectedPrice]:
         pairs = list(pairs)
@@ -125,22 +128,29 @@ class FakeCold:
         return {p: self.stock[p] for p in pairs if p in self.stock}
 
 
-# A transport (for the real ColdPath) that serves get_option_snapshots and get_stock_quotes from
-# seeded dicts. `stock` is sym -> (bid, ask, quote_ts); `as_of` is the single pricing time the stock
-# reply carries. Lets scenario tests drive the cold path end to end with no network.
+# A transport (for the real ColdPath) that serves the one get_quotes call from seeded dicts: the
+# option quotes (OSIs) and stock quotes (underlyings) share one `quotes` object. `snapshots` keeps
+# the legacy shape {osi: {"quote": {"bid","ask","at"}}}; `stock` is sym -> (bid, ask, quote_ts).
+# `session_open`/`as_of` are the reply's own session marker and pricing time. Lets scenario tests
+# drive the cold path end to end with no network.
 def cold_transport(snapshots: dict[str, dict[str, Any]], stock: dict[str, tuple[float, float, int]],
-                   log: list[dict[str, Any]] | None = None, session_open: int = 0, as_of: int = 0):
+                   log: list[dict[str, Any]] | None = None, session_open: int = SESSION_OPEN, as_of: int = 0):
     def transport(req: dict[str, Any]) -> dict[str, Any]:
         if log is not None:
             log.append(req)
-        if req["op"] == "get_option_snapshots":
-            want = set(req["symbols"])
-            snaps = {o: s for o, s in snapshots.items() if o in want}
-            return {"ok": True, "data": {"snapshots": snaps, "count": len(snaps), "session_open_ts": session_open}}
+        assert req["op"] == "get_quotes", f"the cold path must make only get_quotes, got {req['op']}"
         want = set(req["symbols"])
-        quotes = {s: {"bid": b, "ask": a, "quote_ts": t} for s, (b, a, t) in stock.items() if s in want}
-        missing = [s for s in want if s not in stock]
-        return {"ok": True, "data": {"quotes": quotes, "missing": missing, "as_of": as_of}}
+        quotes: dict[str, Any] = {}
+        for osi, snap in snapshots.items():
+            if osi in want:
+                q = snap["quote"]
+                quotes[osi] = {"bid": q["bid"], "ask": q["ask"], "bid_size": 1, "ask_size": 1, "quote_ts": q["at"]}
+        for s, (b, a, t) in stock.items():
+            if s in want:
+                quotes[s] = {"bid": b, "ask": a, "bid_size": 1, "ask_size": 1, "quote_ts": t}
+        missing = {s: "no_quote" for s in want if s not in quotes}
+        return {"ok": True, "data": {"quotes": quotes, "missing": missing,
+                                     "session_open_ts": session_open, "as_of": as_of}}
     return transport
 
 
@@ -180,6 +190,22 @@ def test_a_live_option_tick_with_no_held_stock_is_fetched_not_failed() -> None:
     msg = h.last()
     assert msg["status"] == "success" and msg["spot"] == pytest.approx(186.64)
     assert cold.stock_calls == [[("NVDA", et_ms(17, 0))]]
+
+
+def test_loop_resolver_fetches_held_stock_via_get_quotes_latest() -> None:
+    # The streaming held-stock fetch: a live option tick with no held stock, resolved against a real
+    # ColdPath, sends ONE get_quotes ("at": "latest") for the underlying.
+    log: list[dict[str, Any]] = []
+    t = et_ms(17, 0)
+    h = Harness()
+    h.loop._cold = ColdPath(cold_transport({}, {"NVDA": (186.5, 186.78, t)}, log, as_of=t),
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, t)   # after hours, no held equity
+    assert h.published == []                  # handed to the resolver, not failed
+    h.drain_resolver()
+    assert h.last()["status"] == "success" and h.last()["spot"] == pytest.approx(186.64)
+    gq = [r for r in log if r["op"] == "get_quotes"]
+    assert len(gq) == 1 and gq[0]["symbols"] == ["NVDA"] and gq[0]["at"] == "latest"
 
 
 # ── time route + the open as a restart ───────────────────────────────────────────────────────
@@ -280,19 +306,22 @@ def test_get_greeks_returns_held_success_and_cold_paths_the_rest() -> None:
     snaps = {NVDA_P: {"osi": NVDA_P, "quote": {"bid": 3.0, "ask": 3.2, "at": qts}}}
     stock = {"NVDA": (180.9, 181.1, qts)}  # mid 181.0
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=as_of), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=as_of), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
     # Seed one held success via a live tick.
     h.eq_quote("NVDA", 181.0, 181.02, et_ms(11, 0))
     h.opt_quote(OPT_C, NVDA_C, 9.0, 9.2, et_ms(11, 0, 1))
     h.published.clear()
 
-    out = h.loop.get_greeks([NVDA_C, NVDA_P])
+    out, reply_as_of = h.loop.get_greeks([NVDA_C, NVDA_P], "latest")
     assert [m.osi for m in out] == [NVDA_C, NVDA_P]
     assert out[0].priced_as_of == et_ms(11, 0, 1)             # from the book
     assert out[1].status.value == "success" and out[1].priced_as_of == as_of  # cold path, one as_of
     assert out[1].spot == pytest.approx(181.0)               # the stock quote mid
-    assert any(r["op"] == "get_stock_quotes" and r["symbols"] == ["NVDA"] and r["at"] == "latest" for r in log)
-    assert not any(r["op"] == "get_equity_prices_at" for r in log)
+    assert reply_as_of == as_of                              # the MDS reply's as_of surfaced
+    # One get_quotes call, carrying the miss (NVDA_P) plus its underlying, at "latest".
+    gq = [r for r in log if r["op"] == "get_quotes"]
+    assert len(gq) == 1 and set(gq[0]["symbols"]) == {NVDA_P, "NVDA"} and gq[0]["at"] == "latest"
+    assert not any(r["op"] in ("get_stock_quotes", "get_option_snapshots", "get_equity_prices_at") for r in log)
     assert NVDA_P in h.loop.book.contracts
 
 
@@ -302,13 +331,13 @@ def test_get_greeks_reprices_a_held_failure_through_the_cold_path() -> None:
     snaps = {NVDA_C: {"osi": NVDA_C, "quote": {"bid": 9.0, "ask": 9.2, "at": t}}}
     stock = {"NVDA": (186.5, 186.78, t)}  # mid 186.64
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=t), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=t), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
     # Seed a held missing_spot failure.
     h.loop.book.ensure(NVDA_C)
     h.loop.book.accept(OptionGreeksMessage(
         osi=NVDA_C, status=RowStatus.FAILURE, priced_as_of=t, methodology_version="v2",
         reason=FailureReason.MISSING_SPOT))
-    out = h.loop.get_greeks([NVDA_C])
+    out, _ = h.loop.get_greeks([NVDA_C], "latest")
     assert out[0].status.value == "success" and out[0].spot == pytest.approx(186.64)
 
 
@@ -335,14 +364,15 @@ def test_cold_path_rejects_a_quote_before_session_open() -> None:
     stock = {"NVDA": (180.9, 181.1, after)}  # mid 181.0
     h = Harness()
     h.loop._cold = ColdPath(cold_transport(snaps, stock, log, session_open=SESSION_OPEN, as_of=after),
-                            h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
-    out = {m.osi: m for m in h.loop.get_greeks([stale, fresh])}
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    msgs, _ = h.loop.get_greeks([stale, fresh], "latest")
+    out = {m.osi: m for m in msgs}
     assert out[stale].reason is FailureReason.NO_CURRENT_QUOTE and out[stale].status is RowStatus.FAILURE
     assert out[fresh].status.value == "success" and out[fresh].spot == pytest.approx(181.0)
-    # Stock was asked once, for the underlying of the current contract only — never get_equity_prices_at.
-    sq = next(r for r in log if r["op"] == "get_stock_quotes")
-    assert sq["symbols"] == ["NVDA"] and sq["at"] == "latest"
-    assert not any(r["op"] == "get_equity_prices_at" for r in log)
+    # One get_quotes call, carrying both OSIs and their underlying — never the old split ops.
+    gq = [r for r in log if r["op"] == "get_quotes"]
+    assert len(gq) == 1 and "NVDA" in gq[0]["symbols"] and gq[0]["at"] == "latest"
+    assert not any(r["op"] in ("get_stock_quotes", "get_option_snapshots", "get_equity_prices_at") for r in log)
 
 
 def test_cold_path_after_hours_prices_all_as_of_the_stock_reply() -> None:
@@ -358,11 +388,12 @@ def test_cold_path_after_hours_prices_all_as_of_the_stock_reply() -> None:
     stock = {"NVDA": (186.8, 187.0, t1605)}  # latest stock mid 186.90
     h = Harness()
     h.loop._cold = ColdPath(cold_transport(snaps, stock, log, session_open=SESSION_OPEN, as_of=t1605),
-                            h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
-    out = {m.osi: m for m in h.loop.get_greeks([close_osi, curb_osi])}
+                            h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    msgs, _ = h.loop.get_greeks([close_osi, curb_osi], "latest")
+    out = {m.osi: m for m in msgs}
     for m in out.values():
         assert m.status.value == "success" and m.spot == pytest.approx(186.90) and m.priced_as_of == t1605
-    assert sum(1 for r in log if r["op"] == "get_stock_quotes") == 1
+    assert sum(1 for r in log if r["op"] == "get_quotes") == 1   # one call for both contracts + stock
 
 
 def test_scenario_new_ticker_opened_after_the_close() -> None:
@@ -377,8 +408,8 @@ def test_scenario_new_ticker_opened_after_the_close() -> None:
     }
     stock = {"RKLB": (30.9, 31.1, q2)}  # mid 31.0
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=q2), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
-    out = h.loop.get_greeks([rklb_c, rklb_p])
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, log, as_of=q2), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
+    out, _ = h.loop.get_greeks([rklb_c, rklb_p], "latest")
     assert all(m.status.value == "success" for m in out)
     assert out[0].priced_as_of == q2 and out[1].priced_as_of == q2   # one as_of for the pass
 
@@ -399,10 +430,10 @@ def test_scenario_restart_then_release_completes_well_inside_the_ping_window() -
             snaps[osi] = {"osi": osi, "quote": {"bid": 5.0, "ask": 5.2, "at": base + i}}
     stock = {u: (119.9, 120.1, base) for u in unders}         # latest stock mid 120.0 per underlying
     h = Harness()
-    h.loop._cold = ColdPath(cold_transport(snaps, stock, as_of=base), h.loop._inputs, Methodology("v2", 15.0, "16:00"), now_ms=lambda: et_ms(11, 0))  # type: ignore[assignment]
+    h.loop._cold = ColdPath(cold_transport(snaps, stock, as_of=base), h.loop._inputs, Methodology("v2", 15.0, "16:00"))  # type: ignore[assignment]
 
     t0 = time.perf_counter()
-    out = h.loop.get_greeks(osis)
+    out, _ = h.loop.get_greeks(osis, "latest")
     elapsed = time.perf_counter() - t0
 
     assert len(out) == len(osis)

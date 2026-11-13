@@ -34,11 +34,14 @@ def _compute_handler() -> Any:
     return make_handler(load_config(), InputsHolder(loader))
 
 
-def _fake_get(calls: list[list[str]]):
-    def fake(osis: list[str]) -> list[OptionGreeksMessage]:
+def _fake_get(calls: list[list[str]], ats: list[Any] | None = None):
+    def fake(osis: list[str], at: Any) -> tuple[list[OptionGreeksMessage], int]:
         calls.append(list(osis))
-        return [OptionGreeksMessage(osi=o, status=RowStatus.FAILURE, reason=FailureReason.NO_CURRENT_QUOTE,
+        if ats is not None:
+            ats.append(at)
+        msgs = [OptionGreeksMessage(osi=o, status=RowStatus.FAILURE, reason=FailureReason.NO_CURRENT_QUOTE,
                                     priced_as_of=123, methodology_version="v2") for o in osis]
+        return msgs, 999  # (messages, the MDS reply's as_of)
     return fake
 
 
@@ -57,21 +60,44 @@ def test_compute_greeks_invalid_symbol_fails_only_itself() -> None:
 
 def test_get_greeks_invalid_symbol_fails_only_itself() -> None:
     calls: list[list[str]] = []
-    h = make_get_handler(_fake_get(calls), M)
-    res = h({"op": "get_greeks", "contracts": [V1, BAD, V2]})["results"]
+    ats: list[Any] = []
+    h = make_get_handler(_fake_get(calls, ats), M)
+    reply = h({"op": "get_greeks", "contracts": [V1, BAD, V2], "at": "latest"})
+    res = reply["results"]
 
     assert calls == [[V1, V2]]                                           # only the valid symbols reach get_greeks
+    assert ats == ["latest"]                                             # at passed through unchanged
     assert [r["osi"] for r in res] == [V1, BAD, V2]                      # merged back in input order
     assert res[1]["status"] == "failure" and res[1]["reason"] == "invalid_symbol"
     assert res[1]["priced_as_of"] == 0                                  # cold-path failures use today (0)
     assert res[1]["methodology_version"] == "v2"                        # the methodology passed in
     assert res[0]["priced_as_of"] == 123 and res[2]["priced_as_of"] == 123  # these came from get_greeks
+    assert reply["priced_as_of"] == 999                                 # the MDS reply's as_of, on the reply
+
+
+def test_get_greeks_numeric_at_is_passed_through() -> None:
+    ats: list[Any] = []
+    h = make_get_handler(_fake_get([], ats), M)
+    h({"op": "get_greeks", "contracts": [V1], "at": 1762000000000})
+    assert ats == [1762000000000]
+
+
+def test_get_greeks_missing_at_is_refused() -> None:
+    h = make_get_handler(_fake_get([]), M)
+    with pytest.raises(ValueError, match="'at' is required"):
+        h({"op": "get_greeks", "contracts": [V1]})
+
+
+def test_get_greeks_invalid_at_is_refused() -> None:
+    h = make_get_handler(_fake_get([]), M)
+    with pytest.raises(ValueError, match="'at' is required"):
+        h({"op": "get_greeks", "contracts": [V1], "at": "soon"})
 
 
 def test_warn_logged_once_with_count_and_examples(caplog: pytest.LogCaptureFixture) -> None:
     h = make_get_handler(_fake_get([]), M)
     with caplog.at_level(logging.WARNING, logger="greeks_server.handler"):
-        h({"op": "get_greeks", "contracts": [BAD, BAD2, V1]})
+        h({"op": "get_greeks", "contracts": [BAD, BAD2, V1], "at": "latest"})
     warns = [r for r in caplog.records if r.name == "greeks_server.handler" and r.levelno == logging.WARNING]
     assert len(warns) == 1
     msg = warns[0].getMessage()
@@ -81,7 +107,7 @@ def test_warn_logged_once_with_count_and_examples(caplog: pytest.LogCaptureFixtu
 def test_no_warn_when_all_valid(caplog: pytest.LogCaptureFixture) -> None:
     h = make_get_handler(_fake_get([]), M)
     with caplog.at_level(logging.WARNING, logger="greeks_server.handler"):
-        h({"op": "get_greeks", "contracts": [V1]})
+        h({"op": "get_greeks", "contracts": [V1], "at": "latest"})
     assert [r for r in caplog.records if r.name == "greeks_server.handler" and r.levelno == logging.WARNING] == []
 
 

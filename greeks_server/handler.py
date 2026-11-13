@@ -25,8 +25,13 @@ the results; it never touches the book or publishes. Used by tools/Tradeability.
 get_greeks — the live book op. Answers each contract from the book, prices any the book has never
 seen through the cold path (which asks MDS), and publishes those.
 
-  Request:  {"op": "get_greeks", "contracts": [<osi>, …]}
-  Response: {"results": [<OptionGreeksMessage wire dict>, …]}  — one per contract, input order.
+  Request:  {"op": "get_greeks", "contracts": [<osi>, …], "at": "latest" | <epoch ms>}
+  Response: {"results": [<OptionGreeksMessage wire dict>, …],  — one per contract, input order
+             "priced_as_of": <epoch ms>}  — the MDS get_quotes reply's as_of (present when any
+                                            contract was cold-pathed).
+
+  ``at`` is required ("latest" or an epoch-ms T) and is passed through unchanged to the cold path;
+  the server makes no session decision of its own. A missing or invalid ``at`` is rejected whole.
 
 Validation is at the edge: a malformed request is rejected whole with a specific error. Nothing is
 defaulted.
@@ -206,6 +211,19 @@ def make_handler(cfg: GreeksConfig, inputs: InputsHolder) -> Callable[[Mapping[s
     return handle
 
 
+def parse_at(payload: Mapping[str, Any]) -> Union[str, int]:
+    """The required ``at``: the string "latest" or an epoch-ms int (positive). A missing or invalid
+    ``at`` is a whole-request error — no default. Only the shape is checked; whether a past T is in
+    the future is MDS's call (the server makes no session decision of its own), so ``at`` is passed
+    through unchanged."""
+    at = payload.get("at")
+    if at == "latest":
+        return "latest"
+    if isinstance(at, int) and not isinstance(at, bool) and at > 0:
+        return at
+    raise ValueError(f"'at' is required: \"latest\" or epoch millis (positive int), got {at!r}")
+
+
 def parse_get_request(payload: Mapping[str, Any]) -> list[Union[str, InvalidSymbol]]:
     contracts = payload.get("contracts")
     if not isinstance(contracts, list):
@@ -223,17 +241,22 @@ def parse_get_request(payload: Mapping[str, Any]) -> list[Union[str, InvalidSymb
 
 
 def make_get_handler(
-    get_greeks: Callable[[list[str]], list[OptionGreeksMessage]],
+    get_greeks: Callable[[list[str], Union[str, int]], tuple[list[OptionGreeksMessage], Optional[int]]],
     m: Methodology,
 ) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
-    """get_greeks: book first, cold path for the rest. ``get_greeks`` is ComputeLoop.get_greeks.
-    A non-OSI symbol fails on its own (invalid_symbol, priced_as_of 0 as the cold path's failures
-    use today); only the valid symbols reach ``get_greeks``, merged back in input order."""
+    """get_greeks: book first, cold path for the rest. ``get_greeks`` is ComputeLoop.get_greeks,
+    which takes the required ``at`` ("latest" or epoch ms) and returns (messages, priced_as_of). The
+    ``at`` is validated here and passed through unchanged. A non-OSI symbol fails on its own
+    (invalid_symbol, priced_as_of 0 as the cold path's failures use today); only the valid symbols
+    reach ``get_greeks``, merged back in input order. The reply carries ``priced_as_of`` — the MDS
+    get_quotes reply's as_of — when anything was cold-pathed (omitted, not defaulted, otherwise)."""
 
     def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
+        at = parse_at(payload)             # required; a missing/invalid at is a whole-request error
         items = parse_get_request(payload)
         valid = [it for it in items if isinstance(it, str)]
-        priced = iter(get_greeks(valid))  # one per valid symbol, in order
+        priced_msgs, as_of = get_greeks(valid, at)  # one per valid symbol, in order, + the reply as_of
+        priced = iter(priced_msgs)
         results = []
         invalid: list[str] = []
         for it in items:
@@ -243,6 +266,9 @@ def make_get_handler(
             else:
                 results.append(next(priced).to_wire())
         _warn_invalid(OP_GET, invalid)
-        return {"results": results}
+        reply: dict[str, Any] = {"results": results}
+        if as_of is not None:
+            reply["priced_as_of"] = as_of
+        return reply
 
     return handle

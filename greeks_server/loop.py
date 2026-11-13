@@ -104,7 +104,7 @@ class ComputeLoop(threading.Thread):
         self._time_topic = TopicBuilder.for_options_time()
         # Option ticks whose underlying has no held stock: the stock is fetched from MDS off the
         # compute thread (a blocking RPC must not stall repricing) by this resolver, which coalesces
-        # a burst (a chain's lease bootstrap) into one batched get_stock_quotes.
+        # a burst (a chain's lease bootstrap) into one batched get_quotes ("at": "latest").
         self._cold_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._resolver: Optional[threading.Thread] = None
 
@@ -258,11 +258,13 @@ class ComputeLoop(threading.Thread):
 
     # ── get_greeks (router thread) ──────────────────────────────────────────────────────────────
 
-    def get_greeks(self, osis: list[str]) -> list[OptionGreeksMessage]:
-        """One message per osi, in order. A held success is returned from the book; everything else
-        (a held failure, or a contract never seen) goes through the cold path — option snapshot +
-        stock from MDS — is added to the book and published. Run on a control worker, so a slow
-        cold path doesn't block pings or other requests (see Router concurrent dispatch)."""
+    def get_greeks(self, osis: list[str], at: "str | int") -> tuple[list[OptionGreeksMessage], Optional[int]]:
+        """One message per osi, in order, plus the cold path's priced_as_of (the MDS get_quotes
+        reply's as_of, None when nothing was cold-pathed). A held success is returned from the book;
+        everything else (a held failure, or a contract never seen) goes through the cold path — one
+        get_quotes call to MDS as of ``at`` — is added to the book and published. Run on a control
+        worker, so a slow cold path doesn't block pings or other requests (see Router concurrent
+        dispatch)."""
         results: dict[str, OptionGreeksMessage] = {}
         misses: list[str] = []
         with self._lock:
@@ -273,18 +275,21 @@ class ComputeLoop(threading.Thread):
                 else:
                     misses.append(osi)
 
+        as_of: Optional[int] = None
         if misses:
-            for m in self._run_cold(misses):
+            cold_msgs, as_of = self._run_cold(misses, at)
+            for m in cold_msgs:
                 results[m.osi] = m
 
         out = _nonnull([results.get(osi) for osi in osis], osis)
-        log.info("get_greeks: requested=%d from_book=%d cold=%d%s",
-                 len(osis), len(osis) - len(misses), len(misses), _by_reason(out))
-        return out
+        log.debug("get_greeks: requested=%d from_book=%d cold=%d%s",
+                  len(osis), len(osis) - len(misses), len(misses), _by_reason(out))
+        return out, as_of
 
-    def _run_cold(self, osis: list[str]) -> list[OptionGreeksMessage]:
-        """Cold path: option snapshot + stock from MDS, add to the book, publish."""
-        cold = self._cold.price(osis)  # MDS I/O, no lock
+    def _run_cold(self, osis: list[str], at: "str | int") -> tuple[list[OptionGreeksMessage], Optional[int]]:
+        """Cold path: one get_quotes call to MDS (as of ``at``), add to the book, publish. Returns
+        (messages, priced_as_of)."""
+        cold, as_of = self._cold.price(osis, at)  # MDS I/O, no lock
         publish: list[tuple[str, dict[str, Any]]] = []
         with self._lock:
             for cr in cold:
@@ -297,12 +302,12 @@ class ComputeLoop(threading.Thread):
                     publish.append((greeks_topic(self._prefix, contract), cr.message.to_wire()))
         for topic, wire in publish:
             self._publish(topic, wire)
-        return [cr.message for cr in cold]
+        return [cr.message for cr in cold], as_of
 
     def _price_with_mds_stock(self, osis: list[str]) -> list[OptionGreeksMessage]:
         """The stream resolver's work: price contracts in the book from their held option price and
         the stock — the held live stock if one arrived since the tick, else the latest stock quote
-        mid from MDS get_stock_quotes (one batched call). Accepts and publishes. A failure is
+        mid from MDS get_quotes ("at": "latest", one batched call). Accepts and publishes. A failure is
         published only if MDS has no current stock quote."""
         if not osis:
             return []
