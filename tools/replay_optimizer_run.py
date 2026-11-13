@@ -47,6 +47,19 @@ def main() -> None:
         print(f"{s['step']:<9}{bp:>12.2f}   " + "   ".join(f"{c:>16}" for c in cells) + mark)
         prev_bp = bp
 
+    outcomes = tr.get("repair_outcomes", {})
+    print()
+    if outcomes:
+        print("stock repair outcomes (out-of-band names):")
+        for u, o in outcomes.items():
+            extra = ""
+            if o["outcome"] == "bp_capped":
+                extra = (f" (wanted {o['wanted_shares']} shares, moved {o['moved_shares']}, "
+                         f"BP left {o['bp_remaining']:.2f})")
+            print(f"  {u:<8} {o['outcome']}{extra}")
+    else:
+        print("stock repair outcomes: none (no name left its band after rounding)")
+
 
 if __name__ == "__main__":
     main()

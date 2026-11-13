@@ -151,6 +151,15 @@ from wire_format import (
     BC_VALUE_PCT,
     BCT_BP_LIMIT,
     BCT_DELTA_TARGET,
+    BC_REPAIR,
+    RP_OUTCOME,
+    RP_WANTED_SHARES,
+    RP_MOVED_SHARES,
+    RP_BP_REMAINING,
+    RPO_REPAIRED,
+    RPO_BP_CAPPED,
+    RPO_NO_STOCK_LEGS,
+    RPO_NOT_TRADEABLE,
     DIAGNOSTIC_FIELDS,
 )
 
@@ -200,9 +209,16 @@ CONSTRAINT_CHECK_EPS = 1e-6
 # Solver noise allowance when flooring: 1.9999999 is 2 contracts, not 1.
 ROUNDING_EPS = 1e-6
 
-# Operator-facing message for a book that still breaks a hard constraint after
-# rounding and the stock repair (normally only a non-tradeable underlying).
-ERR_POST_ROUNDING = "Rounded book breaks hard constraints after the stock repair: "
+# A failing stock repair: the rounded book is outside a delta band and the repair could not
+# restore it (out of BP, no stock legs, or not tradeable). The message names each failing
+# underlying and its cause. This is the normal infeasible reason after rounding.
+ERR_STOCK_REPAIR = "Stock repair could not restore the delta band: "
+
+# A breach the stock repair is NOT responsible for: the BP limit itself, or a band on an
+# underlying the repair reported as repaired. The repair never breaks BP and a repaired band is
+# inside, so reaching here is a bug — the message says so.
+ERR_POST_ROUNDING = ("BUG: rounded book breaks a hard constraint the stock repair is not "
+                     "responsible for (the BP limit, or a band the repair reported repaired): ")
 
 # CVXPY status → our status. Verified empirically: Clarabel reports "user_limit"
 # when the time limit is hit (see tools/test_optimizer_units.py).
@@ -616,47 +632,63 @@ def _extract_targets(target_value, bundle: dict) -> list:
 
 
 def _repair_band_with_stock(q: list, bundle: dict) -> tuple:
-    """For each tradeable underlying whose rounded book is outside its delta band, move
-    the stock by the smallest whole number of shares that brings net delta back inside
-    the band — not all the way to the target. The continuous optimum sat at the band
-    edge because that was optimal; the repair undoes the rounding error, it does not
-    overrule the solver. Stock carries exactly 1 delta per share. Underlyings already
-    inside their band are left alone. Returns (q, repaired underlyings)."""
+    """For each underlying whose rounded book is outside its delta band, try to move the stock by
+    the smallest whole number of shares that brings net delta back inside the band — not all the
+    way to the target. The continuous optimum sat at the band edge because that was optimal; the
+    repair undoes the rounding error, it does not overrule the solver. Stock carries exactly 1 delta
+    per share. Underlyings already inside their band are left alone.
+
+    Returns (q, outcomes), where outcomes maps EVERY out-of-band underlying to its repair outcome —
+    nothing a name couldn't be fixed for is skipped silently:
+      - repaired:      moved back inside the band;
+      - bp_capped:     out of BP; carries wanted_shares, moved_shares, bp_remaining;
+      - no_stock_legs: tradeable but no long/short equity legs to move;
+      - not_tradeable: the underlying is not tradeable.
+    """
     q = list(q)
-    repaired = []
+    outcomes: dict = {}
     eps = CONSTRAINT_CHECK_EPS
     net_delta = bundle["G_delta"] @ np.asarray(q, dtype=float)
     for k, u in enumerate(bundle["und_names"]):
         if bundle["u_lo"][k] - eps <= net_delta[k] <= bundle["u_hi"][k] + eps:
-            continue
+            continue  # inside the band — nothing to repair, nothing to report
+        lo, hi, nd = bundle["u_lo"][k], bundle["u_hi"][k], net_delta[k]
         legs = bundle["equity_legs"].get(u, {})
-        if not bundle["tradeable"][u] or "long" not in legs or "short" not in legs:
-            continue  # no stock to repair with; the re-check reports it
+        if not bundle["tradeable"][u]:
+            outcomes[u] = {RP_OUTCOME: RPO_NOT_TRADEABLE}
+            log.debug("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f] but not tradeable", u, nd, lo, hi)
+            continue
+        if "long" not in legs or "short" not in legs:
+            outcomes[u] = {RP_OUTCOME: RPO_NO_STOCK_LEGS}
+            log.debug("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f] but has no stock legs", u, nd, lo, hi)
+            continue
         li, si = legs["long"], legs["short"]
-        if net_delta[k] > bundle["u_hi"][k]:
-            shift = -int(np.ceil(net_delta[k] - bundle["u_hi"][k] - eps))   # sell just enough
+        if nd > hi:
+            shift = -int(np.ceil(nd - hi - eps))   # sell just enough
         else:
-            shift = int(np.ceil(bundle["u_lo"][k] - net_delta[k] - eps))    # buy just enough
+            shift = int(np.ceil(lo - nd - eps))     # buy just enough
         s0 = q[li] - q[si]
         s1 = s0 + shift
         # The repair consumes buying power like any position. The continuous solve respected
         # bp_limit and rounding/cap only lowered margin, so the book is within BP here — never
         # let the stock move push it back over (it used to: a cap-dropped hedge sent the band
         # far out and the repair shorted whatever closed it, ignoring BP). Cap the move at the
-        # BP the rest of the book leaves free; the re-check reports any residual band breach.
+        # BP the rest of the book leaves free.
         m_other = _book_margin(bundle, q) - (bundle["margin"][li] * q[li] + bundle["margin"][si] * q[si])
         budget = bundle["bp_limit"] - m_other
         shares = _max_stock_within_bp(s0, s1, bundle["margin"][li], bundle["margin"][si], budget)
         q[li], q[si] = max(shares, 0), max(-shares, 0)
-        repaired.append(u)
-        if shares != s1:
-            log.info("[Solver] stock repair BP-capped: %s net delta %.4f outside [%.4f, %.4f]; "
-                     "wanted %+d shares, moved to %+d within remaining BP %.2f (residual band breach left to re-check)",
-                     u, net_delta[k], bundle["u_lo"][k], bundle["u_hi"][k], s1, shares, budget)
+        if shares == s1:
+            outcomes[u] = {RP_OUTCOME: RPO_REPAIRED}
+            log.debug("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f]; stock moved %+d to %+d shares",
+                      u, nd, lo, hi, shift, shares)
         else:
-            log.info("[Solver] stock repair: %s net delta %.4f outside [%.4f, %.4f]; stock moved %+d to %+d shares",
-                     u, net_delta[k], bundle["u_lo"][k], bundle["u_hi"][k], shift, shares)
-    return q, repaired
+            outcomes[u] = {RP_OUTCOME: RPO_BP_CAPPED, RP_WANTED_SHARES: int(s1),
+                           RP_MOVED_SHARES: int(shares), RP_BP_REMAINING: float(budget)}
+            log.debug("[Solver] stock repair BP-capped: %s net delta %.4f outside [%.4f, %.4f]; "
+                      "wanted %+d shares, moved to %+d within remaining BP %.2f",
+                      u, nd, lo, hi, s1, shares, budget)
+    return q, outcomes
 
 
 def _max_stock_within_bp(s0: int, s1: int, m_long: float, m_short: float, budget: float) -> int:
@@ -760,13 +792,14 @@ def _post_solve_pipeline(target_value, bundle: dict, groups: dict) -> dict:
     cont = [0.0] * n if target_value is None else list(np.maximum(np.asarray(target_value, dtype=float), 0.0))
     netted = _net_pairs(target_value, bundle)
     rounded = _extract_targets(netted, bundle)
-    repaired, _repaired_names = _repair_band_with_stock(rounded, bundle)
-    return {
+    repaired, repair_outcomes = _repair_band_with_stock(rounded, bundle)
+    stages = {
         "solve": cont,
         "netting": cont if netted is None else list(netted),
         "rounding": rounded,
         "repair": repaired,
     }
+    return stages, repair_outcomes
 
 
 def pipeline_trace(payload: dict) -> dict:
@@ -779,7 +812,7 @@ def pipeline_trace(payload: dict) -> dict:
     bundle = _extract_inputs(dvs, payload[F_PER_UNDERLYING], payload[F_POLICY],
                              payload[F_CAPITAL], groups, payload[F_HORIZON_DAYS])
     target, problem, _ = _build_and_solve(len(dvs), bundle)
-    stages = _post_solve_pipeline(target.value, bundle, groups)
+    stages, repair_outcomes = _post_solve_pipeline(target.value, bundle, groups)
     und = bundle["und_names"]
     steps = []
     for name, q in stages.items():
@@ -797,12 +830,53 @@ def pipeline_trace(payload: dict) -> dict:
         "net_liq": bundle["net_liq"],
         "bands_pct": {u: {"target": bundle["pu"][u][1], "tol": bundle["pu"][u][2]} for u in und},
         "steps": steps,
+        "repair_outcomes": repair_outcomes,   # per-underlying outcome for every out-of-band name
     }
 
 
 # ─────────────────────────────────────────────────────────────
 # Response construction
 # ─────────────────────────────────────────────────────────────
+
+
+def _repair_cause_text(u: str, outcome: dict) -> str:
+    """One underlying's repair failure, for the error/WARN message. e.g.
+    `AAPL bp_capped (wanted -14 shares, moved -1, BP left 832.80)`; otherwise `SPY no_stock_legs`."""
+    oc = outcome[RP_OUTCOME]
+    if oc == RPO_BP_CAPPED:
+        return (f"{u} {oc} (wanted {outcome[RP_WANTED_SHARES]} shares, "
+                f"moved {outcome[RP_MOVED_SHARES]}, BP left {outcome[RP_BP_REMAINING]:.2f})")
+    return f"{u} {oc}"
+
+
+def _attach_repairs(breaches: list, failed: dict) -> list:
+    """Attach each failing underlying's repair object to its delta_target binding_constraints
+    record (every failing name is out of band, so it has one). Mutates and returns `breaches`."""
+    for b in breaches:
+        if b.get(BC_TYPE) == BCT_DELTA_TARGET and b.get(BC_UNDERLYING) in failed:
+            b[BC_REPAIR] = failed[b[BC_UNDERLYING]]
+    return breaches
+
+
+def _post_rounding_error(breaches: list, repair_outcomes: dict):
+    """The infeasible reason (if any) after rounding + the stock repair, as (error, binding).
+
+    If the repair could not restore a band for any underlying (outcome other than repaired), the
+    reason is ERR_STOCK_REPAIR, naming each failing name and its cause, with a repair object on each
+    one's delta_target record. Otherwise a remaining breach is one the repair is not responsible for
+    — the BP limit, or a band on a name it reported repaired — which is a bug: ERR_POST_ROUNDING.
+    Returns None when the book is feasible."""
+    failed = {u: o for u, o in repair_outcomes.items() if o[RP_OUTCOME] != RPO_REPAIRED}
+    if failed:
+        detail = "; ".join(_repair_cause_text(u, o) for u, o in failed.items())
+        return ERR_STOCK_REPAIR + detail + ".", _attach_repairs(breaches, failed)
+    if breaches:
+        detail = "; ".join(
+            f"{b.get(BC_UNDERLYING, 'portfolio')} {b[BC_TYPE]} (value "
+            + (f"{b[BC_VALUE_PCT]:.4f}% of net liq" if BC_VALUE_PCT in b else f"{b[BC_VALUE_AT_SOLUTION]:.4f}") + ")"
+            for b in breaches)
+        return ERR_POST_ROUNDING + detail + ".", breaches
+    return None
 
 
 def _build_solved_response(meta, status, target_value, problem, dvs, bundle, groups,
@@ -828,20 +902,18 @@ def _build_solved_response(meta, status, target_value, problem, dvs, bundle, gro
 
     # Net long/short legs → round (step 8) → cardinality (step 9) → stock repair →
     # re-check (step 10). One inspectable pipeline, shared with pipeline_trace.
-    stages = _post_solve_pipeline(target_value, bundle, groups)
+    stages, repair_outcomes = _post_solve_pipeline(target_value, bundle, groups)
     optimal_q = stages["repair"]
     breaches = _breached_constraints(bundle, optimal_q)
-    if breaches:
-        detail = "; ".join(
-            f"{b.get(BC_UNDERLYING, 'portfolio')} {b[BC_TYPE]} (value "
-            + (f"{b[BC_VALUE_PCT]:.4f}% of net liq" if BC_VALUE_PCT in b else f"{b[BC_VALUE_AT_SOLUTION]:.4f}") + ")"
-            for b in breaches)
-        log.warning("[Solver] post-rounding breach: %s", detail)
+    infeasible = _post_rounding_error(breaches, repair_outcomes)
+    if infeasible is not None:
+        error, binding = infeasible
+        log.warning("[Solver] %s", error)   # one WARN per run, the same text as the error
         return {
             **meta,
             F_STATUS: STATUS_INFEASIBLE,
-            F_BINDING_CONSTRAINTS: breaches,
-            F_ERROR: ERR_POST_ROUNDING + detail + ".",
+            F_BINDING_CONSTRAINTS: binding,
+            F_ERROR: error,
             F_SOLVER_META: solver_meta,
         }
     optimal_contribs = _compute_contributions(bundle, optimal_q)

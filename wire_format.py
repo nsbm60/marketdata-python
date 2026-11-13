@@ -132,5 +132,19 @@ BC_VALUE_PCT = "value_pct"
 BCT_BP_LIMIT = "bp_limit"
 BCT_DELTA_TARGET = "delta_target"
 
+# Stock-repair outcome, attached to a delta_target binding_constraints record the repair
+# could not restore (the `repair` object). Fields present depend on the outcome.
+BC_REPAIR = "repair"
+RP_OUTCOME = "outcome"
+RP_WANTED_SHARES = "wanted_shares"    # net stock position that would restore the band
+RP_MOVED_SHARES = "moved_shares"      # net stock position actually reached (capped by BP)
+RP_BP_REMAINING = "bp_remaining"      # BP the rest of the book left the repair
+
+# Stock-repair outcome values
+RPO_REPAIRED = "repaired"
+RPO_BP_CAPPED = "bp_capped"
+RPO_NO_STOCK_LEGS = "no_stock_legs"
+RPO_NOT_TRADEABLE = "not_tradeable"
+
 # Diagnostic fields echoed from request to response recommendations
 DIAGNOSTIC_FIELDS = ("strike", "expiry", "days_to_expiry", "iv", "rv_forecast")
