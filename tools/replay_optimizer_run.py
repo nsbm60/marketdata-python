@@ -24,7 +24,8 @@ def main() -> None:
     payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     tr = optimizer.pipeline_trace(payload)
 
-    print(f"status={tr['status']}   bp_limit={tr['bp_limit']:.2f}   net_liq={tr['net_liq']:.2f}")
+    print(f"status={tr['status']}   bp_limit={tr['bp_limit']:.2f}   "
+          f"bp_solve_limit={tr['bp_solve_limit']:.2f}   net_liq={tr['net_liq']:.2f}")
     print("bands (% of net liq):")
     for u, b in tr["bands_pct"].items():
         print(f"  {u:<8} target {b['target']:+.2f}  tol ±{b['tol']:.2f}")

@@ -32,7 +32,7 @@ def _underlying(uid: str) -> dict:
             "delta_tolerance_pct": 10.0, "tradeable": True}
 
 
-_POLICY = {"bp_limit_pct": 60, "risk_aversion": 4.0, "hedge_interval_days": 1.0,
+_POLICY = {"bp_limit_pct": 60, "bp_reserve_pct": 0, "risk_aversion": 4.0, "hedge_interval_days": 1.0,
            "min_improvement": 0.0}
 _CAPITAL = {"net_liq": 100000.0}
 

@@ -237,6 +237,7 @@
   ],
   "policy": {
     "bp_limit_pct": 60,
+    "bp_reserve_pct": 0,
     "max_positions_per_underlying": 8,
     "delta_ceiling_threshold": 0.3,
     "lambda_delta_ceiling": 1,

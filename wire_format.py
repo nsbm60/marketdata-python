@@ -68,6 +68,7 @@ F_SIGMA_RV = "sigma_rv"  # 5-session HAR forecast σ per underlying — the risk
 
 # Policy field names
 F_BP_LIMIT_PCT = "bp_limit_pct"
+F_BP_RESERVE_PCT = "bp_reserve_pct"  # reserve held back for the post-solve stock repair, % of net liq
 F_RISK_AVERSION = "risk_aversion"  # replaces lambda_gamma (2026-10-23): dollar-variance risk term
 F_MIN_IMPROVEMENT = "min_improvement"
 

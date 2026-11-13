@@ -104,6 +104,7 @@ from wire_format import (
     F_TRADEABLE,
     F_SIGMA_RV,
     F_BP_LIMIT_PCT,
+    F_BP_RESERVE_PCT,
     F_RISK_AVERSION,
     F_MIN_IMPROVEMENT,
     F_NET_LIQ,
@@ -396,6 +397,16 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     if not delta_years > 0.0:
         raise ValueError(f"hedge_interval_days must be > 0, got {hedge_interval_days!r}")
 
+    # bp_reserve_pct is required (no default): the share of net liq the solve must leave unused so
+    # the stock repair has margin. Must be 0 <= reserve < bp_limit_pct.
+    if F_BP_RESERVE_PCT not in policy:
+        raise ValueError(f"policy.{F_BP_RESERVE_PCT} is required")
+    bp_limit_pct = float(policy[F_BP_LIMIT_PCT])
+    bp_reserve_pct = float(policy[F_BP_RESERVE_PCT])
+    if not (0.0 <= bp_reserve_pct < bp_limit_pct):
+        raise ValueError(
+            f"bp_reserve_pct must be 0 <= reserve < bp_limit_pct ({bp_limit_pct}), got {bp_reserve_pct}")
+
     n = len(dvs)
     theta = np.empty(n)
     edge = np.empty(n)
@@ -509,7 +520,11 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         "pairs": pairs, "sigma_rv": sigma_rv,
         "risk_aversion": float(policy[F_RISK_AVERSION]),
         "min_improvement": float(policy[F_MIN_IMPROVEMENT]),
-        "bp_limit": float(policy[F_BP_LIMIT_PCT]) / 100.0 * net_liq,
+        "bp_limit": bp_limit_pct / 100.0 * net_liq,
+        # The solve leaves the reserve unused so the post-solve stock repair has margin to work with;
+        # it runs against (bp_limit_pct − bp_reserve_pct). The repair and the final check still use
+        # the full bp_limit.
+        "bp_solve_limit": (bp_limit_pct - bp_reserve_pct) / 100.0 * net_liq,
         "net_liq": net_liq,
         "pu": pu,
         # Vectorized per-underlying structure (§3.4)
@@ -545,8 +560,11 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
 
     Maximize  (theta∘h)·q − exec·|q − current|
               − (risk_aversion/2)/net_liq·‖M_risk_slices · q‖²   (dollar P&L-variance risk term)
-    s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_limit;
+    s.t.      q ≥ 0;  q[closeable] ≤ current[closeable];  margin·q ≤ bp_solve_limit;
               per underlying: lo ≤ G_δ q ≤ hi (the dollar band in shares).
+
+    The solve constrains margin to bp_solve_limit (bp_limit minus the reserve), leaving the reserve
+    free for the post-solve stock repair, which may use margin up to the full bp_limit.
 
     The delta band is the only delta mechanism; execution cost is counted at its full
     dollar value. `fixed` (index → value) pins those variables with an equality constraint.
@@ -565,8 +583,8 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
     if closeable_idx.size:
         constraints.append(target[closeable_idx] <= current[closeable_idx])
 
-    # Buying-power limit
-    constraints.append(bundle["margin"] @ target <= bundle["bp_limit"])
+    # Buying-power limit for the solve: bp_limit minus the reserve (kept for the stock repair).
+    constraints.append(bundle["margin"] @ target <= bundle["bp_solve_limit"])
 
     # Per-underlying delta band (vectorized), in shares
     net_delta = bundle["G_delta"] @ target  # share-equivalent, one entry per underlying
@@ -827,6 +845,7 @@ def pipeline_trace(payload: dict) -> dict:
     return {
         "status": _map_status(problem.status),
         "bp_limit": bundle["bp_limit"],
+        "bp_solve_limit": bundle["bp_solve_limit"],   # the solve's limit; the reserve is bp_limit − this
         "net_liq": bundle["net_liq"],
         "bands_pct": {u: {"target": bundle["pu"][u][1], "tol": bundle["pu"][u][2]} for u in und},
         "steps": steps,
