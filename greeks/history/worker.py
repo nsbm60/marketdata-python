@@ -12,25 +12,62 @@ import logging
 import multiprocessing
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence, Set
 
 from clickhouse_connect.driver.exceptions import OperationalError
 
 from greeks.config import load_config
 from greeks.domain import RowStatus
-from greeks.history import COLUMNS, COLUMNS_NON_GREEKS, Deps, Pair, PairResult, Row, dataset_for, price_rows
+from greeks.history import (
+    COLUMNS, COLUMNS_NON_GREEKS, Deps, Pair, PairResult, Row, StopRequested, dataset_for, price_rows,
+)
 
 log = logging.getLogger(__name__)
 
 TABLE = "trading.option_trade"
 LEDGER = "trading.option_archive_ledger"
 
+# Read, price and insert one (day, underlying) in chunks of at most this many rows, so a heavy day
+# (SPY: millions of trades) never loads a whole day into Python dicts at once.
+CHUNK_ROWS = 200_000
+
+# At most processes × this many pairs are kept in flight, so memory stays flat over a ~1M-pair run
+# instead of growing with one future per pair.
+INFLIGHT_PER_PROCESS = 4
+
+# Replace each worker process after this many pairs so its memory is returned to the system (the
+# initializer rebuilds the per-process state in the fresh worker).
+MAX_TASKS_PER_CHILD = 50
+
+# The drain loop waits on futures with this timeout so it re-checks the stop flag promptly even when
+# no pair has just completed (the signal handler only sets a flag).
+_POLL_SECONDS = 0.2
+
 # Mapper type: run a per-pair function over the pairs and STREAM the results as they complete.
 Mapper = Callable[[Callable[[Pair], PairResult], List[Pair]], Iterable[PairResult]]
+
+# Stop flag for a clean shutdown. main() installs SIGINT/SIGTERM handlers that set it; the mapper
+# polls it to stop submitting, cancel the unstarted pairs and drain the running ones. A bare list,
+# not a threading primitive (greeks/ forbids threading): a signal handler runs in the main thread
+# between bytecodes, so a plain flag is safe to set and poll.
+_STOP: List[bool] = [False]
+
+
+def request_stop() -> None:
+    _STOP[0] = True
+
+
+def reset_stop() -> None:
+    _STOP[0] = False
+
+
+def _stop_requested() -> bool:
+    return _STOP[0]
 
 # Set to "ok" / "die" to run the entry point against in-process fakes over the real forkserver pool
 # (the subprocess entry-point test), instead of touching ClickHouse.
@@ -67,11 +104,15 @@ def _count_rows(client: Any, day: date, underlying: str) -> int:
     return int(res.result_rows[0][0]) if res.result_rows else 0
 
 
-def _read_rows(client: Any, day: date, underlying: str) -> List[Row]:
+def _read_chunk(client: Any, day: date, underlying: str, limit: int, offset: int) -> List[Row]:
+    """One chunk of a (day, underlying)'s rows, ordered by the table key so LIMIT/OFFSET paging is
+    stable — the key (underlying, symbol, sip_timestamp_ns, ordinal) is unique after FINAL, so no row
+    is skipped or repeated across chunks."""
     cols = ", ".join(COLUMNS_NON_GREEKS)
     res = client.query(
-        f"SELECT {cols} FROM {TABLE} FINAL WHERE underlying = %(u)s AND session_date = %(d)s",
-        parameters={"u": underlying.upper(), "d": day})
+        f"SELECT {cols} FROM {TABLE} FINAL WHERE underlying = %(u)s AND session_date = %(d)s "
+        "ORDER BY symbol, sip_timestamp_ns, ordinal LIMIT %(lim)s OFFSET %(off)s",
+        parameters={"u": underlying.upper(), "d": day, "lim": limit, "off": offset})
     names = res.column_names
     return [dict(zip(names, row)) for row in res.result_rows]
 
@@ -153,18 +194,32 @@ def _reconnect(w: _Worker) -> None:
 
 
 def _price_pair(w: _Worker, day: date, underlying: str, t0: float) -> PairResult:
-    """Read → price → insert → ledger one (day, underlying) on the per-process client, config and
-    day-cached inputs. Raises on any IO/pricing failure; the caller classifies it."""
-    rows = _read_rows(w.client, day, underlying)
+    """Read → price → insert one (day, underlying) in chunks of at most CHUNK_ROWS, then write the
+    ledger row — ONCE, after every chunk is inserted. A failure partway leaves no ledger row, so a
+    rerun redoes the whole pair; re-inserting is safe under ReplacingMergeTree. Raises on any IO/
+    pricing failure; the caller classifies it."""
     inputs = _inputs_for_day(w, day)
-    priced, reasons = price_rows(
-        rows, inputs, methodology_version=w.cfg.methodology_version,
-        t_floor_minutes=float(w.cfg.t_floor_minutes), expiry_time_et=w.cfg.expiry_time_et,
-        now=datetime.now(timezone.utc))
-    _insert_rows(w.client, priced)
-    _write_ledger(w.client, day, underlying, len(priced), dataset_for(w.cfg.methodology_version))
-    ok = sum(1 for r in priced if r["greeks_status"] == RowStatus.SUCCESS.value)
-    return PairResult(day, underlying, len(rows), ok, dict(reasons), time.perf_counter() - t0, None)
+    total_rows = total_priced = 0
+    reasons: "Counter[str]" = Counter()
+    offset = 0
+    while True:
+        rows = _read_chunk(w.client, day, underlying, CHUNK_ROWS, offset)
+        if not rows:
+            break
+        priced, chunk_reasons = price_rows(
+            rows, inputs, methodology_version=w.cfg.methodology_version,
+            t_floor_minutes=float(w.cfg.t_floor_minutes), expiry_time_et=w.cfg.expiry_time_et,
+            now=datetime.now(timezone.utc))
+        _insert_rows(w.client, priced)
+        total_rows += len(rows)
+        total_priced += sum(1 for r in priced if r["greeks_status"] == RowStatus.SUCCESS.value)
+        reasons.update(chunk_reasons)
+        offset += len(rows)
+        if len(rows) < CHUNK_ROWS:
+            break
+    _write_ledger(w.client, day, underlying, total_rows, dataset_for(w.cfg.methodology_version))
+    return PairResult(day, underlying, total_rows, total_priced, dict(reasons),
+                      time.perf_counter() - t0, None)
 
 
 def _process_pair(pair: Pair) -> PairResult:
@@ -191,30 +246,70 @@ def _process_pair(pair: Pair) -> PairResult:
 
 # ── process pool (forkserver, fail-fast) ─────────────────────────────────────────────────────────
 
+def _bounded(ex: Any, fn: Callable[[Pair], PairResult], items: List[Pair],
+             bound: int) -> Iterator[PairResult]:
+    """Stream results while keeping at most ``bound`` futures in flight. Submit the first ``bound``
+    pairs (in list order — date order), then submit one more each time a result is taken, and drop the
+    future as soon as its result is yielded, so memory stays flat.
+
+    On a stop request (a signal set the flag): shut the pool down with wait=True, cancel_futures=True —
+    the pairs still running finish (each writes its ledger row) and every not-yet-started pair is
+    cancelled — then raise StopRequested with the counts. A dead worker (BrokenProcessPool) still
+    stops the run at once with the specific error — unchanged.
+    """
+    it = iter(items)
+    pending: Set["Future[PairResult]"] = set()
+
+    def submit_one() -> bool:
+        try:
+            item = next(it)
+        except StopIteration:
+            return False
+        pending.add(ex.submit(fn, item))
+        return True
+
+    for _ in range(bound):
+        if not submit_one():
+            break
+
+    yielded = 0
+    while pending:
+        if _stop_requested():
+            # Running pairs finish (ledger rows written); the rest are cancelled. The executor's
+            # context-manager exit would otherwise wait for ALL ~1M pending futures to run.
+            ex.shutdown(wait=True, cancel_futures=True)
+            raise StopRequested(done=yielded, not_started=len(items) - yielded)
+        done, pending = wait(pending, timeout=_POLL_SECONDS, return_when=FIRST_COMPLETED)
+        for f in done:
+            try:
+                res = f.result()
+            except BrokenProcessPool as e:
+                raise RuntimeError(
+                    f"greeks.history worker process died — stopping the run: {e}") from e
+            yielded += 1
+            yield res
+            submit_one()
+
+
 def pool_mapper(processes: int, initializer: Optional[Callable[[], None]] = _worker_init) -> Mapper:
-    """Run each pair in its own forkserver worker. ``initializer`` runs ONCE per worker process when it
-    starts (production: _worker_init, which builds the config/client/loader reused for every pair); the
-    self-tests pass None, so they touch no ClickHouse. A dead worker (anything other than a per-pair
-    failure, which returns an error result) stops the run at once with a specific error — never the
-    silent respawn-dead-workers loop a multiprocessing.Pool does."""
+    """Run each pair in its own forkserver worker, at most ``processes × INFLIGHT_PER_PROCESS`` in
+    flight (see _bounded). Each worker is replaced after MAX_TASKS_PER_CHILD pairs so its memory is
+    returned to the system; ``initializer`` runs ONCE per worker process when it starts — including
+    each replacement — (production: _worker_init, which builds the config/client/loader reused for
+    every pair); the self-tests pass None, so they touch no ClickHouse. A dead worker (anything other
+    than a per-pair failure, which returns an error result) stops the run at once with a specific
+    error — never the silent respawn-dead-workers loop a multiprocessing.Pool does."""
     # forkserver, stated explicitly: Python 3.14 made it the Linux default, and under it a worker
     # imports its task by module path — so the start method can't drift and break the import again.
     ctx = multiprocessing.get_context("forkserver")
+    bound = processes * INFLIGHT_PER_PROCESS
 
     def mapper(fn: Callable[[Pair], PairResult], items: List[Pair]) -> Iterator[PairResult]:
         if not items:
             return
-        # One executor for the whole run; yield each pair's result the moment it completes (as_completed,
-        # so possibly out of order) rather than waiting for all of them. A dead worker still raises
-        # BrokenProcessPool here, stopping the run with the specific error.
-        with ProcessPoolExecutor(max_workers=processes, mp_context=ctx, initializer=initializer) as ex:
-            futures = [ex.submit(fn, it) for it in items]
-            for f in as_completed(futures):
-                try:
-                    yield f.result()
-                except BrokenProcessPool as e:
-                    raise RuntimeError(
-                        f"greeks.history worker process died — stopping the run: {e}") from e
+        with ProcessPoolExecutor(max_workers=processes, mp_context=ctx, initializer=initializer,
+                                 max_tasks_per_child=MAX_TASKS_PER_CHILD) as ex:
+            yield from _bounded(ex, fn, items, bound)
 
     return mapper
 
@@ -242,10 +337,24 @@ def _suicide_pair(pair: Pair) -> PairResult:
     os._exit(1)  # die without returning — a worker death, not a per-pair failure
 
 
-def _selftest_deps(processes: int, pair_fn: Callable[[Pair], PairResult]) -> Deps:
-    pairs = [(date(2016, 1, 4), "AAA"), (date(2016, 1, 5), "BBB")]
+def _slow_pair(pair: Pair) -> PairResult:
+    """A worker that takes ~0.5s — long enough for a SIGTERM to land mid-run so the clean-stop path
+    (cancel unstarted, drain running) can be driven as a subprocess. No ClickHouse."""
+    time.sleep(0.5)
+    return PairResult(pair[0], pair[1], rows=1, priced=1, reasons={}, seconds=0.5, error=None)
+
+
+def _pid_pair(pair: Pair) -> PairResult:
+    """A worker that reports its process id (in the underlying field) so a test can see workers being
+    recycled after MAX_TASKS_PER_CHILD pairs. No ClickHouse."""
+    return PairResult(pair[0], str(os.getpid()), rows=1, priced=1, reasons={}, seconds=0.0, error=None)
+
+
+def _selftest_deps(processes: int, pair_fn: Callable[[Pair], PairResult],
+                   pairs: Optional[List[Pair]] = None) -> Deps:
+    todo = pairs if pairs is not None else [(date(2016, 1, 4), "AAA"), (date(2016, 1, 5), "BBB")]
     return Deps(
-        list_pairs=lambda a, b: list(pairs),
+        list_pairs=lambda a, b: list(todo),
         ledgered=lambda a, b: set(),
         count_rows=lambda d, u: 0,
         process_pair=pair_fn,
@@ -259,4 +368,8 @@ def default_build_deps(processes: int) -> Deps:
         return _selftest_deps(processes, _selftest_pair)
     if mode == "die":
         return _selftest_deps(processes, _suicide_pair)
+    if mode == "slow":
+        # Many same-day pairs so a SIGTERM leaves plenty unstarted to cancel.
+        return _selftest_deps(processes, _slow_pair,
+                              pairs=[(date(2016, 1, 4), f"S{i:03d}") for i in range(60)])
     return _build_prod_deps(processes)

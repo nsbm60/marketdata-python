@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 from datetime import date
-from typing import Callable, Sequence
+from types import FrameType
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from greeks.history import Deps, Summary, run
-from greeks.history.worker import default_build_deps
+from greeks.history.worker import default_build_deps, request_stop, reset_stop
 
 
 def _parse(argv: Sequence[str]) -> argparse.Namespace:
@@ -29,14 +31,35 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
     return p.parse_args(list(argv))
 
 
+def _install_stop_handlers() -> Dict[int, Any]:
+    """Ctrl-C and SIGTERM request a clean stop (cancel unstarted pairs, drain running ones) rather
+    than killing the run. Returns the previous handlers to restore afterwards."""
+    def handler(signum: int, frame: Optional[FrameType]) -> None:
+        request_stop()
+    prev: Dict[int, Any] = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        prev[sig] = signal.signal(sig, handler)
+    return prev
+
+
+def _restore_handlers(prev: Dict[int, Any]) -> None:
+    for sig, h in prev.items():
+        signal.signal(sig, h)
+
+
 def main(argv: Sequence[str], *, build_deps: Callable[[int], Deps] = default_build_deps,
          run_fn: Callable[[date, date, bool, Deps], Summary] = run) -> int:
     args = _parse(argv)
     if args.processes < 1:
         raise SystemExit("--processes must be >= 1")
     deps = build_deps(args.processes)
-    run_fn(args.from_date, args.to_date, args.dry_run, deps)
-    return 0
+    reset_stop()
+    prev = _install_stop_handlers()
+    try:
+        summary = run_fn(args.from_date, args.to_date, args.dry_run, deps)
+    finally:
+        _restore_handlers(prev)
+    return 1 if summary.stopped else 0  # stopped runs exit non-zero so a rerun is prompted
 
 
 if __name__ == "__main__":  # pragma: no cover

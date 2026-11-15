@@ -13,6 +13,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -23,6 +24,8 @@ from greeks.history import (
     COLUMNS_NON_GREEKS,
     Deps,
     PairResult,
+    StopRequested,
+    Summary,
     dataset_for,
     price_rows,
     run,
@@ -191,12 +194,13 @@ def test_entry_point_main_path_parses_and_runs() -> None:
         seen["processes"] = processes
         return _fake_deps([], set(), {"processed": [], "counted": []})
 
-    def fake_run(a: date, b: date, dry: bool, deps: Deps):  # type: ignore[no-untyped-def]
+    def fake_run(a: date, b: date, dry: bool, deps: Deps) -> Summary:
         seen["args"] = (a, b, dry)
-        return None
+        return Summary(days=0, pairs=0, rows=0, priced=0, failed_pairs=0)
 
-    main(["2016-01-04", "2016-01-06", "--processes", "3", "--dry-run"],
-         build_deps=fake_build, run_fn=fake_run)
+    rc = main(["2016-01-04", "2016-01-06", "--processes", "3", "--dry-run"],
+              build_deps=fake_build, run_fn=fake_run)
+    assert rc == 0  # a run that finished exits zero
     assert seen["processes"] == 3
     assert seen["args"] == (date(2016, 1, 4), date(2016, 1, 6), True)
 
@@ -315,22 +319,92 @@ def test_a_day_change_reloads_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     assert days == [D1, D2, D1]  # reload on each change; only the most recent day is cached
 
 
-def test_day_line_has_the_new_format_with_failed_as_a_number(caplog: pytest.LogCaptureFixture) -> None:
-    # One ok pair and one failed pair on D1: "1 underlying(s), 2 rows, 2 priced, 1 failed, 0.5s".
-    def mapper(fn: Any, items: List[tuple[date, str]]) -> Any:
-        yield PairResult(D1, "A", rows=2, priced=2, reasons={}, seconds=0.3, error=None)
-        yield PairResult(D1, "B", rows=0, priced=0, reasons={}, seconds=0.2, error="boom")
+# ── chunked read/price/insert, ledger only after every chunk ─────────────────────────────────────
 
-    deps = Deps(list_pairs=lambda a, b: [(D1, "A"), (D1, "B")], ledgered=lambda a, b: set(),
+class _ChunkClient:
+    """Serves a (day, underlying)'s rows in LIMIT/OFFSET chunks and records the chunk inserts and the
+    single ledger write. `fail_on_insert` (1-based count of option_trade inserts) raises, to prove a
+    mid-pair failure writes no ledger row."""
+    def __init__(self, rows: List[Dict[str, Any]], fail_on_insert: int | None = None) -> None:
+        self._rows = rows
+        self._fail_on = fail_on_insert
+        self.chunks: List[int] = []     # option_trade insert sizes, in order
+        self.ledger: List[Any] = []     # option_archive_ledger insert payloads
+
+    def query(self, sql: str, parameters: Dict[str, Any] | None = None) -> Any:
+        p = parameters or {}
+        sl = self._rows[p["off"]: p["off"] + p["lim"]]
+        rows = [tuple(r[c] for c in COLUMNS_NON_GREEKS) for r in sl]
+        return SimpleNamespace(column_names=list(COLUMNS_NON_GREEKS), result_rows=rows)
+
+    def insert(self, table: str, data: Any, column_names: Any = None, database: Any = None) -> None:
+        if table == "option_trade":
+            if self._fail_on is not None and len(self.chunks) + 1 == self._fail_on:
+                raise RuntimeError("insert boom")  # raise before recording: chunks = inserted chunks
+            self.chunks.append(len(data))
+        elif table == "option_archive_ledger":
+            self.ledger.append(data)
+
+
+def test_a_pair_bigger_than_one_chunk_is_processed_in_several_chunks_one_ledger(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import greeks.history.worker as w
+    monkeypatch.setattr(w, "CHUNK_ROWS", 2)
+    client = _ChunkClient([_row() for _ in range(5)])
+    wk = w._Worker(cfg=_Cfg(), client=client, loader=lambda d: _inputs())
+    res = w._price_pair(wk, SESSION, "NVDA", 0.0)
+    assert res.error is None and res.rows == 5 and res.priced == 5
+    assert client.chunks == [2, 2, 1]        # five rows in chunks of two
+    assert len(client.ledger) == 1           # exactly one ledger row, after all chunks
+    assert client.ledger[0][0][2] == 5       # rows_inserted = total rows
+
+
+def test_a_failure_in_a_later_chunk_writes_no_ledger_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    import greeks.history.worker as w
+    monkeypatch.setattr(w, "CHUNK_ROWS", 2)
+    client = _ChunkClient([_row() for _ in range(5)], fail_on_insert=2)  # 2nd chunk insert raises
+    wk = w._Worker(cfg=_Cfg(), client=client, loader=lambda d: _inputs())
+    with pytest.raises(RuntimeError):
+        w._price_pair(wk, SESSION, "NVDA", 0.0)
+    assert client.chunks == [2]              # first chunk inserted, second raised
+    assert client.ledger == []               # no ledger row on a mid-pair failure
+
+
+def _day_line(caplog: pytest.LogCaptureFixture) -> str:
+    return next(m for m in (r.getMessage() for r in caplog.records if r.name == "greeks.history")
+                if " underlying(s), " in m)
+
+
+def _run_with_results(caplog: pytest.LogCaptureFixture, results: List[PairResult]) -> None:
+    def mapper(fn: Any, items: List[tuple[date, str]]) -> Any:
+        yield from results
+    pairs = [(r.day, r.underlying) for r in results]
+    deps = Deps(list_pairs=lambda a, b: list(pairs), ledgered=lambda a, b: set(),
                 count_rows=lambda d, u: 0,
-                process_pair=lambda p: PairResult(p[0], p[1], 0, 0, {}, 0.0, None),
-                mapper=mapper)
+                process_pair=lambda p: PairResult(p[0], p[1], 0, 0, {}, 0.0, None), mapper=mapper)
     with caplog.at_level(logging.INFO, logger="greeks.history"):
         run(D1, D1, dry_run=False, deps=deps)
-    line = next(m for m in (r.getMessage() for r in caplog.records if r.name == "greeks.history")
-                if " underlying(s), " in m)
-    assert line == f"[greeks] {D1}: 1 underlying(s), 2 rows, 2 priced, 1 failed, 0.5s"
-    assert "failed=" not in line  # the old per-reason breakdown is gone
+
+
+def test_day_line_failed_counts_failed_rows_and_names_failed_pairs(caplog: pytest.LogCaptureFixture) -> None:
+    # One pair priced 3 of 5 rows (2 row failures) plus one whole-pair failure: failed counts the 2
+    # rows (rows − priced), and ", 1 failed pair(s)" is appended because a pair failed.
+    _run_with_results(caplog, [
+        PairResult(D1, "A", rows=5, priced=3, reasons={"missing_spot": 2}, seconds=0.4, error=None),
+        PairResult(D1, "B", rows=0, priced=0, reasons={}, seconds=0.1, error="boom"),
+    ])
+    assert _day_line(caplog) == f"[greeks] {D1}: 1 underlying(s), 5 rows, 3 priced, 2 failed, 0.5s, 1 failed pair(s)"
+
+
+def test_day_line_has_no_failed_pair_suffix_when_none_failed(caplog: pytest.LogCaptureFixture) -> None:
+    # Only per-row failures, no whole-pair failure: failed = 1 (10 rows − 9 priced), no pair suffix.
+    _run_with_results(caplog, [
+        PairResult(D1, "A", rows=4, priced=4, reasons={}, seconds=0.2, error=None),
+        PairResult(D1, "B", rows=6, priced=5, reasons={"below_intrinsic": 1}, seconds=0.3, error=None),
+    ])
+    line = _day_line(caplog)
+    assert line == f"[greeks] {D1}: 2 underlying(s), 10 rows, 9 priced, 1 failed, 0.5s"
+    assert "failed pair(s)" not in line
 
 
 # ── one ledger read, and a day line as each day finishes ─────────────────────────────────────────
@@ -396,3 +470,97 @@ def test_summary_totals_match_the_day_lines(caplog: pytest.LogCaptureFixture) ->
     assert summary.rows == day_rows == 6
     assert summary.priced == day_priced == 6
     assert summary.days == 2 and summary.pairs == 3
+
+
+# ── bounded submission and a clean stop ──────────────────────────────────────────────────────────
+
+class _SyncExec:
+    """A synchronous stand-in for ProcessPoolExecutor: submit() runs fn at once and returns a resolved
+    Future, tracking how many futures are live (submitted but not yet result()-ed) so a test can check
+    the in-flight bound. A real forkserver pool is covered by the subprocess test below."""
+    def __init__(self, rec: Dict[str, int]) -> None:
+        self._rec = rec
+
+    def submit(self, fn: Any, item: Any) -> Any:
+        from concurrent.futures import Future
+        self._rec["live"] += 1
+        self._rec["peak"] = max(self._rec["peak"], self._rec["live"])
+        f: Future = Future()
+        f.set_result(fn(item))
+        orig = f.result
+
+        def result(*a: Any, **k: Any) -> Any:
+            if not f.__dict__.get("_counted"):
+                f.__dict__["_counted"] = True
+                self._rec["live"] -= 1
+            return orig(*a, **k)
+
+        f.result = result  # type: ignore[method-assign]
+        return f
+
+    def shutdown(self, **k: Any) -> None:
+        pass
+
+
+def test_in_flight_pairs_never_exceed_the_bound() -> None:
+    from greeks.history.worker import _bounded
+    rec = {"live": 0, "peak": 0}
+    items = [(D1, str(i)) for i in range(50)]
+    bound = 4
+    results = list(_bounded(_SyncExec(rec), lambda p: PairResult(p[0], p[1], 1, 1, {}, 0.0, None),
+                            items, bound))
+    assert len(results) == 50          # every pair streamed
+    assert rec["peak"] == bound        # the window fills to exactly the bound, never beyond
+    assert rec["live"] == 0            # and every future's result was taken (dropped)
+
+
+def test_run_logs_the_stop_line_and_reports_stopped(caplog: pytest.LogCaptureFixture) -> None:
+    todo = [(D1, "A"), (D1, "B"), (D1, "C"), (D2, "X"), (D2, "Y")]
+
+    def mapper(fn: Any, items: List[tuple[date, str]]) -> Any:
+        yield PairResult(D1, "A", 2, 2, {}, 0.1, None)
+        yield PairResult(D1, "B", 2, 2, {}, 0.1, None)
+        raise StopRequested(done=2, not_started=3)  # as the real mapper does after draining
+
+    deps = Deps(list_pairs=lambda a, b: list(todo), ledgered=lambda a, b: set(),
+                count_rows=lambda d, u: 0,
+                process_pair=lambda p: PairResult(p[0], p[1], 0, 0, {}, 0.0, None), mapper=mapper)
+    with caplog.at_level(logging.INFO, logger="greeks.history"):
+        summary = run(D1, D2, dry_run=False, deps=deps)
+    assert summary.stopped is True and summary.pairs == 2
+    msgs = [r.getMessage() for r in caplog.records if r.name == "greeks.history"]
+    assert "[greeks] stopped: 2 pairs done, 3 not started — rerun to continue" in msgs
+    assert not any(m.startswith("[greeks] done:") for m in msgs)  # no normal summary on a stop
+
+
+def test_a_sigterm_during_a_run_stops_cleanly_and_exits_nonzero() -> None:
+    # `python -m greeks.history … SELFTEST=slow`: a real forkserver pool over 60 slow pairs. A SIGTERM
+    # mid-run cancels the unstarted pairs, lets the running ones finish, logs the stop line and exits
+    # non-zero. No ClickHouse (initializer=None).
+    import signal
+    import time as _time
+    env = {**os.environ, "GREEKS_HISTORY_SELFTEST": "slow"}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "greeks.history", "2016-01-04", "2016-01-04", "--processes", "2"],
+        cwd=str(_REPO_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _time.sleep(4)  # let workers start and finish a few pairs
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+    assert proc.returncode != 0, f"expected non-zero exit, got 0\n{out}"
+    assert "stopped:" in out and "not started — rerun to continue" in out, out
+
+
+def test_workers_are_recycled_after_max_tasks_per_child() -> None:
+    # Over several generations of work, max_tasks_per_child replaces each worker, so more distinct
+    # worker pids appear than there are workers. _pid_pair reports its pid in the underlying field.
+    from greeks.history.worker import MAX_TASKS_PER_CHILD, _pid_pair, pool_mapper
+    n = MAX_TASKS_PER_CHILD * 3
+    items = [(D1, f"P{i}") for i in range(n)]
+    results = list(pool_mapper(2, initializer=None)(_pid_pair, items))
+    assert len(results) == n
+    pids = {r.underlying for r in results}
+    assert len(pids) > 2  # more worker pids than the 2 workers -> recycled

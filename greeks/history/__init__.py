@@ -141,6 +141,17 @@ class Summary:
     rows: int
     priced: int
     failed_pairs: int
+    stopped: bool = False       # True if the run was stopped by a signal before finishing
+
+
+class StopRequested(Exception):
+    """Raised by the mapper after a stop signal (Ctrl-C/SIGTERM), once the pairs that were already
+    running have drained (each wrote its ledger row). Carries how many pairs completed and how many
+    never started, so the run can log the stop line and a rerun can continue."""
+    def __init__(self, done: int, not_started: int) -> None:
+        super().__init__(f"stopped: {done} done, {not_started} not started")
+        self.done = done
+        self.not_started = not_started
 
 
 @dataclass(frozen=True)
@@ -203,27 +214,37 @@ def run(from_date: date, to_date: date, dry_run: bool, deps: Deps) -> Summary:
             agg.remaining += 1
 
     days_done = pairs_total = rows_total = priced_total = failed_pairs = 0
-    for r in deps.mapper(deps.process_pair, todo):
-        pairs_total += 1
-        agg = days[r.day]
-        agg.remaining -= 1
-        agg.seconds += r.seconds
-        if r.error is not None:
-            failed_pairs += 1
-            agg.failed += 1
-            log.warning("[greeks] %s %s FAILED — no ledger row, a rerun retries it: %s",
-                        r.day, r.underlying, r.error)
-        else:
-            agg.ok += 1
-            agg.rows += r.rows
-            agg.priced += r.priced
-        if agg.remaining == 0:
-            log.info("[greeks] %s: %d underlying(s), %d rows, %d priced, %d failed, %.1fs",
-                     r.day, agg.ok, agg.rows, agg.priced, agg.failed, agg.seconds)
-            days_done += 1
-            rows_total += agg.rows
-            priced_total += agg.priced
-            del days[r.day]  # free the day's totals; nothing else is retained
+    try:
+        for r in deps.mapper(deps.process_pair, todo):
+            pairs_total += 1
+            agg = days[r.day]
+            agg.remaining -= 1
+            agg.seconds += r.seconds
+            if r.error is not None:
+                failed_pairs += 1
+                agg.failed += 1
+                log.warning("[greeks] %s %s FAILED — no ledger row, a rerun retries it: %s",
+                            r.day, r.underlying, r.error)
+            else:
+                agg.ok += 1
+                agg.rows += r.rows
+                agg.priced += r.priced
+            if agg.remaining == 0:
+                failed_rows = agg.rows - agg.priced                 # rows read but not priced
+                pairs_suffix = f", {agg.failed} failed pair(s)" if agg.failed else ""
+                log.info("[greeks] %s: %d underlying(s), %d rows, %d priced, %d failed, %.1fs%s",
+                         r.day, agg.ok, agg.rows, agg.priced, failed_rows, agg.seconds, pairs_suffix)
+                days_done += 1
+                rows_total += agg.rows
+                priced_total += agg.priced
+                del days[r.day]  # free the day's totals; nothing else is retained
+    except StopRequested:
+        # A clean stop: the running pairs drained (each wrote its ledger row), the rest were cancelled.
+        not_started = len(todo) - pairs_total
+        log.info("[greeks] stopped: %d pairs done, %d not started — rerun to continue",
+                 pairs_total, not_started)
+        return Summary(days=days_done, pairs=pairs_total, rows=rows_total, priced=priced_total,
+                       failed_pairs=failed_pairs, stopped=True)
 
     log.info("[greeks] done: %d day(s), %d pair(s), %d rows, %d priced, %d failed pair(s)",
              days_done, pairs_total, rows_total, priced_total, failed_pairs)
