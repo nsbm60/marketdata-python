@@ -136,6 +136,43 @@ def continuous_rate_from_sofr(
     return math.log(acc) / t_cal
 
 
+# ── pre-SOFR fallback: the 1-month T-bill as an overnight rate ────────────────────────────────────
+#
+# SOFR begins 2018-04-02, but historical greeks price back to 2016. For a date before the first SOFR
+# fix, the overnight rate is that date's 1-month Treasury-bill yield. Treasury yields are quoted
+# ACT/365 (coupon/investment basis); the accrual above treats each rate as an ACT/360 simple overnight
+# rate — one day contributes the factor (1 + rate/360). The same daily accrual expressed on the
+# ACT/360 basis the accrual uses is therefore
+#
+#     r_360 = y_365 * 360 / 365
+#
+# so a converted bill rate enters compound_overnight_accumulation exactly like a SOFR fix.
+
+
+def tbill_to_overnight_act360(bill_yield: float) -> float:
+    """A 1-month T-bill yield (decimal, ACT/365) as an ACT/360 simple overnight rate: ``y * 360/365``.
+
+    The SOFR accrual compounds ``(1 + rate/360)`` per day, so ``rate`` is an ACT/360-annualized simple
+    rate; the Treasury yield is ACT/365-annualized, so the same daily rate is ``y * 360/365``."""
+    return bill_yield * 360.0 / 365.0
+
+
+def combined_overnight_series(
+    sofr: Mapping[date, float],
+    tbill_overnight: Mapping[date, float],
+    first_sofr_date: date,
+) -> dict[date, float]:
+    """One overnight series spanning the SOFR boundary: the ACT/360 T-bill rate on dates strictly
+    before ``first_sofr_date``, SOFR on dates on or after it. ``tbill_overnight`` is already
+    ACT/360-converted (see :func:`tbill_to_overnight_act360`). An accrual window that crosses the
+    boundary then compounds T-bills before it and SOFR after it, with no gap. T-bills never fill a
+    date on or after ``first_sofr_date`` — a missing SOFR fix there stays missing (an error upstream).
+    """
+    out = {d: r for d, r in tbill_overnight.items() if d < first_sofr_date}
+    out.update({d: r for d, r in sofr.items() if d >= first_sofr_date})
+    return out
+
+
 def discount_from_sofr(
     series: Mapping[date, float],
     as_of_date: date,

@@ -15,7 +15,11 @@ from datetime import date, timedelta
 from typing import Callable, Mapping
 
 from greeks.domain import Dividend
-from greeks.forwards.sofr import continuous_rate_from_sofr
+from greeks.forwards.sofr import (
+    combined_overnight_series,
+    continuous_rate_from_sofr,
+    tbill_to_overnight_act360,
+)
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +28,10 @@ SOFR_MAX_AGE_DAYS = 10
 # Written by the Scala BatchService sofr job from the NY Fed API (the publisher of SOFR).
 # The validation-phase rows are source='fred' (and 'fixture'); the server reads only these.
 SOFR_SOURCE = "nyfed"
+# Pre-SOFR dates (before the first SOFR fix, 2018-04-02) take the overnight rate from the 1-month
+# Treasury bill in trading.treasury_yields (Scala TreasuryYieldsJob). Live greeks never reach these
+# dates, so the live server only ever sees SOFR.
+TBILL_SOURCE = "massive"
 
 
 @dataclass(frozen=True)
@@ -70,30 +78,69 @@ def clickhouse_loader(get_client: Callable[[], object]) -> Loader:
     One client, used under a lock: the compute thread (at open) and the router thread
     (compute_greeks off-session) may both load, and a clickhouse-connect client is not safe for
     concurrent queries.
+
+    The overnight series is SOFR on and after the first SOFR fix (read from the table, not hard-coded)
+    and the ACT/360-converted 1-month T-bill before it, so historical greeks price back to 2016. A
+    post-SOFR gap is still an error — the T-bill never fills one. Live greeks only ever request recent
+    dates, whose window never reaches before the first SOFR fix, so the live server only sees SOFR.
     """
-    from greeks.ch import load_sofr_series_from_ch, load_upcoming_dividends
+    from greeks.ch import (
+        first_sofr_date_from_ch,
+        load_sofr_series_from_ch,
+        load_tbill_1m_series_from_ch,
+        load_upcoming_dividends,
+    )
 
     lock = threading.Lock()
     client_box: list[object] = []
+    first_sofr_box: list[date] = []  # the first SOFR fix date, stable — read once per loader
 
     def load(session_date: date) -> SessionInputs:
+        window_start = session_date - timedelta(days=SOFR_LOOKBACK_DAYS)
         with lock:
             if not client_box:
                 client_box.append(get_client())
             client = client_box[0]
+            if not first_sofr_box:
+                first_sofr_box.append(first_sofr_date_from_ch(client, source=SOFR_SOURCE))  # type: ignore[arg-type]
+            first_sofr = first_sofr_box[0]
             sofr = load_sofr_series_from_ch(
                 client,  # type: ignore[arg-type]
-                start=session_date - timedelta(days=SOFR_LOOKBACK_DAYS),
+                start=window_start,
                 end=session_date,
                 source=SOFR_SOURCE,
+                required=False,  # a pre-SOFR window has no SOFR rows; T-bills fill it below
             )
-            validate_sofr(sofr, session_date)
+            # Only the window dates before the first SOFR fix are filled from the T-bill.
+            tbill_overnight: dict[date, float] = {}
+            if window_start < first_sofr:
+                pre_end = min(session_date, first_sofr - timedelta(days=1))
+                bills = load_tbill_1m_series_from_ch(
+                    client,  # type: ignore[arg-type]
+                    start=window_start, end=pre_end, source=TBILL_SOURCE,
+                )
+                tbill_overnight = {d: tbill_to_overnight_act360(y) for d, y in bills.items()}
             divs = load_upcoming_dividends(client, after=session_date)  # type: ignore[arg-type]
+
+        combined = combined_overnight_series(sofr, tbill_overnight, first_sofr)
+        # A date on or after the first SOFR fix must have a recent SOFR fix (a gap is an error, as
+        # before); a pre-SOFR date must have a T-bill yield on or before it (named if absent). Nothing
+        # is defaulted.
+        if session_date >= first_sofr:
+            validate_sofr(sofr, session_date)
+        elif not any(d <= session_date for d in tbill_overnight):
+            raise ValueError(
+                f"no 1-month T-bill yield on or before {session_date}"
+                " (pre-SOFR date needs a bill rate — is the treasury-yields job loaded?)"
+            )
+
+        has_sofr, has_tbill = bool(sofr), bool(tbill_overnight)
+        rate_src = "TBILL1M+SOFR" if (has_sofr and has_tbill) else ("SOFR" if has_sofr else "TBILL1M")
         log.info(
-            "session inputs for %s: %d SOFR fixes (newest %s), dividends for %d symbols",
-            session_date, len(sofr), max(sofr), len(divs),
+            "session inputs for %s: rate=%s, %d overnight fixes (newest %s), dividends for %d symbols",
+            session_date, rate_src, len(combined), max(combined), len(divs),
         )
-        return SessionInputs(session_date=session_date, sofr=dict(sofr), dividends=divs)
+        return SessionInputs(session_date=session_date, sofr=dict(combined), dividends=divs)
 
     return load
 

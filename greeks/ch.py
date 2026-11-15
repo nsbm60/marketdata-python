@@ -55,13 +55,15 @@ def load_sofr_series_from_ch(
     start: Optional[date] = None,
     end: Optional[date] = None,
     source: str = "nyfed",
+    required: bool = True,
 ) -> dict[date, float]:
     """Read SOFR rates from ClickHouse into ``date -> decimal rate``.
 
     **No silent fallback.** Uses ``FINAL`` (ReplacingMergeTree) and requires an
     explicit ``source`` (default ``nyfed``: the Scala BatchService sofr job, the table's only
     writer). Fixture and old ``fred`` rows are never mixed in.
-    Raises ``ValueError`` if the query returns no rows.
+    Raises ``ValueError`` if the query returns no rows, unless ``required`` is False (a pre-SOFR
+    window has no SOFR rows and the caller fills it from T-bills) — then it returns ``{}``.
     """
     if not source or not str(source).strip():
         raise ValueError("source is required (e.g. 'nyfed'); refusing unscoped load")
@@ -95,12 +97,66 @@ def load_sofr_series_from_ch(
             )
         out[d] = rate
     if not out:
+        if not required:
+            return out
         raise ValueError(
             f"no SOFR rows in {table} for source={src!r}"
             + (f" start={start}" if start is not None else "")
             + (f" end={end}" if end is not None else "")
             + " — is the BatchService sofr job running? Will not fall back to fixture"
         )
+    return out
+
+
+def first_sofr_date_from_ch(
+    client: Client,
+    *,
+    table: str = "trading.sofr_daily",
+    source: str = "nyfed",
+) -> date:
+    """The earliest SOFR fix date for ``source`` — read from the table, never hard-coded (SOFR began
+    2018-04-02). Raises ``ValueError`` if there are no rows for ``source``."""
+    result = client.query(
+        f"SELECT min(date) FROM {table} FINAL WHERE source = {{src:String}}",
+        parameters={"src": source},
+    )
+    rows = result.result_rows
+    d = rows[0][0] if rows else None
+    if d is None:
+        raise ValueError(
+            f"no SOFR rows in {table} for source={source!r} — cannot establish the first SOFR date"
+        )
+    if isinstance(d, datetime):
+        d = d.date()
+    return d
+
+
+def load_tbill_1m_series_from_ch(
+    client: Client,
+    *,
+    start: date,
+    end: date,
+    table: str = "trading.treasury_yields",
+    source: str = "massive",
+) -> dict[date, float]:
+    """1-month Treasury-bill yields (decimal, as stored) by date over ``[start, end]``, source-scoped
+    and ``FINAL``. A NULL ``y_1m`` row is skipped (no 1-month tenor that day). Returns ``{}`` if none
+    in range — the caller decides whether an absent pre-SOFR bill is an error."""
+    sql = (
+        f"SELECT date, y_1m FROM {table} FINAL "
+        "WHERE source = {src:String} AND y_1m IS NOT NULL "
+        "AND date >= {start:Date} AND date <= {end:Date} ORDER BY date"
+    )
+    result = client.query(sql, parameters={"src": source, "start": start, "end": end})
+    out: dict[date, float] = {}
+    for row in result.result_rows:
+        d = row[0]
+        if isinstance(d, datetime):
+            d = d.date()
+        y = row[1]
+        if y is None:
+            continue
+        out[d] = float(y)
     return out
 
 

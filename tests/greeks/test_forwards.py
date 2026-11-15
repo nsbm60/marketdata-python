@@ -16,11 +16,13 @@ from greeks.forwards.carry import (
     years_to_ex_date,
 )
 from greeks.forwards.sofr import (
+    combined_overnight_series,
     compound_overnight_accumulation,
     continuous_rate_from_sofr,
     discount_from_sofr,
     load_sofr_csv,
     rate_on_or_before,
+    tbill_to_overnight_act360,
 )
 from greeks.solver.time import years_to_expiry
 
@@ -159,3 +161,24 @@ def test_mu_dividend_applied_when_ex_inside_life() -> None:
     t_i = years_to_ex_date(as_of, div.ex_date)
     expected = s * math.exp(r * t) - div.amount * math.exp(r * (t - t_i))
     assert abs(f - expected) < 1e-12
+
+
+# ── pre-SOFR 1-month T-bill fallback ──────────────────────────────────────────────────────────────
+
+def test_tbill_to_overnight_act360_known_value() -> None:
+    # 3.65% ACT/365 -> 3.60% ACT/360 exactly (0.0365 * 360 / 365 = 0.036).
+    assert tbill_to_overnight_act360(0.0365) == pytest.approx(0.036, abs=1e-12)
+    assert tbill_to_overnight_act360(0.02) == pytest.approx(0.02 * 360.0 / 365.0, rel=1e-15)
+
+
+def test_combined_series_crosses_the_sofr_boundary() -> None:
+    first_sofr = date(2018, 4, 2)
+    tbill = {date(2018, 3, 30): 0.036, date(2018, 3, 31): 0.036, date(2018, 4, 1): 0.036}
+    sofr = {date(2018, 4, 2): 0.018, date(2018, 4, 3): 0.018}
+    combined = combined_overnight_series(sofr, tbill, first_sofr)
+    assert combined[date(2018, 3, 30)] == 0.036  # T-bill before the boundary
+    assert combined[date(2018, 4, 2)] == 0.018   # SOFR on/after the boundary
+    # Accrual over [2018-03-30, 2018-04-04): three T-bill days then two SOFR days — both are used.
+    r = continuous_rate_from_sofr(combined, date(2018, 3, 30), date(2018, 4, 4))
+    acc = (1 + 0.036 / 360.0) ** 3 * (1 + 0.018 / 360.0) ** 2
+    assert r == pytest.approx(math.log(acc) / (5 / 365.0), rel=1e-12)
