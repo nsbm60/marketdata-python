@@ -8,17 +8,23 @@ be imported that way (every worker died with AttributeError: module '__main__' h
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Iterable, Iterator, List, Sequence
+from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence
+
+from clickhouse_connect.driver.exceptions import OperationalError
 
 from greeks.config import load_config
 from greeks.domain import RowStatus
 from greeks.history import COLUMNS, COLUMNS_NON_GREEKS, Deps, Pair, PairResult, Row, dataset_for, price_rows
+
+log = logging.getLogger(__name__)
 
 TABLE = "trading.option_trade"
 LEDGER = "trading.option_archive_ledger"
@@ -86,36 +92,109 @@ def _write_ledger(client: Any, day: date, underlying: str, n: int, dataset: str)
         database="trading")
 
 
+# ── per-process state (built once by the pool initializer, reused for every pair) ────────────────
+#
+# Each (day, underlying) costs ~1.2 s of fixed setup against ~40 µs/row of pricing, so the config,
+# ClickHouse client and loader are built ONCE when the worker process starts — not once per pair. The
+# loader's first-SOFR-date lookup then happens once per process (on its first load). Inputs are cached
+# for the most recent day only: pairs are submitted in date order, so a worker mostly repeats one day;
+# when the day changes the new day's inputs load and the old are dropped.
+
+@dataclass
+class _Worker:
+    cfg: Any
+    client: Any
+    loader: Callable[[date], Any]
+    day: Optional[date] = None
+    inputs: Any = None
+
+
+_WORKER: Optional[_Worker] = None
+
+
+def _make_config() -> Any:
+    return load_config()
+
+
+def _make_loader(client: Any) -> Callable[[date], Any]:
+    from greeks_server.inputs import clickhouse_loader  # live inputs mechanism (SessionInputs)
+    return clickhouse_loader(lambda: client)
+
+
+def _worker_init() -> None:
+    """Pool initializer: build this process's config, ClickHouse client and loader ONCE, reused for
+    every pair the worker handles. Run by ProcessPoolExecutor when the worker starts."""
+    global _WORKER
+    client = _client()
+    _WORKER = _Worker(cfg=_make_config(), client=client, loader=_make_loader(client))
+
+
+def _worker_state() -> _Worker:
+    if _WORKER is None:
+        raise RuntimeError("worker not initialized — _worker_init must run as the pool initializer")
+    return _WORKER
+
+
+def _inputs_for_day(w: _Worker, day: date) -> Any:
+    """The day's inputs, cached per process — only the most recent day is kept. A new day loads fresh
+    (the SOFR/T-bill/dividend queries) and drops the old day's inputs."""
+    if w.inputs is None or w.day != day:
+        w.inputs = w.loader(day)
+        w.day = day
+    return w.inputs
+
+
+def _reconnect(w: _Worker) -> None:
+    """Rebuild the ClickHouse client after a lost connection, and the loader and day cache on it."""
+    w.client = _client()
+    w.loader = _make_loader(w.client)
+    w.day = None
+    w.inputs = None
+
+
+def _price_pair(w: _Worker, day: date, underlying: str, t0: float) -> PairResult:
+    """Read → price → insert → ledger one (day, underlying) on the per-process client, config and
+    day-cached inputs. Raises on any IO/pricing failure; the caller classifies it."""
+    rows = _read_rows(w.client, day, underlying)
+    inputs = _inputs_for_day(w, day)
+    priced, reasons = price_rows(
+        rows, inputs, methodology_version=w.cfg.methodology_version,
+        t_floor_minutes=float(w.cfg.t_floor_minutes), expiry_time_et=w.cfg.expiry_time_et,
+        now=datetime.now(timezone.utc))
+    _insert_rows(w.client, priced)
+    _write_ledger(w.client, day, underlying, len(priced), dataset_for(w.cfg.methodology_version))
+    ok = sum(1 for r in priced if r["greeks_status"] == RowStatus.SUCCESS.value)
+    return PairResult(day, underlying, len(rows), ok, dict(reasons), time.perf_counter() - t0, None)
+
+
 def _process_pair(pair: Pair) -> PairResult:
-    """Price one (day, underlying) end to end on this worker's OWN ClickHouse client and config.
-    Importable by module path (greeks.history.worker._process_pair) so forkserver can run it. A
-    whole-pair failure (CH/inputs) returns an error result (one WARN, no ledger row); a DEAD worker is
-    a different thing — that stops the run via BrokenProcessPool in the mapper."""
+    """Price one (day, underlying) on this worker's per-process client/config/loader (built once by
+    the pool initializer). A lost connection rebuilds the client ONCE and retries the pair; a second
+    failure, or any other failure, is the per-pair failure (one WARN at the run level, no ledger row).
+    A DEAD worker is different — that stops the run via BrokenProcessPool in the mapper."""
     day, underlying = pair
     t0 = time.perf_counter()
+    w = _worker_state()
     try:
-        from greeks_server.inputs import clickhouse_loader  # live inputs mechanism (SessionInputs)
-        cfg = load_config()
-        client = _client()
-        loader = clickhouse_loader(lambda: client)
-        rows = _read_rows(client, day, underlying)
-        inputs = loader(day)
-        priced, reasons = price_rows(
-            rows, inputs, methodology_version=cfg.methodology_version,
-            t_floor_minutes=float(cfg.t_floor_minutes), expiry_time_et=cfg.expiry_time_et,
-            now=datetime.now(timezone.utc))
-        _insert_rows(client, priced)
-        _write_ledger(client, day, underlying, len(priced), dataset_for(cfg.methodology_version))
-        ok = sum(1 for r in priced if r["greeks_status"] == RowStatus.SUCCESS.value)
-        return PairResult(day, underlying, len(rows), ok, dict(reasons), time.perf_counter() - t0, None)
+        return _price_pair(w, day, underlying, t0)
+    except OperationalError as e:
+        log.debug("[greeks] %s %s: lost ClickHouse connection (%s) — reconnecting and retrying",
+                  day, underlying, e)
+        _reconnect(w)
+        try:
+            return _price_pair(w, day, underlying, t0)
+        except Exception as e2:  # noqa: BLE001 — retry failed; a rerun retries the pair
+            return PairResult(day, underlying, 0, 0, {}, time.perf_counter() - t0, f"{type(e2).__name__}: {e2}")
     except Exception as e:  # noqa: BLE001 — a whole-pair failure; a rerun retries it
         return PairResult(day, underlying, 0, 0, {}, time.perf_counter() - t0, f"{type(e).__name__}: {e}")
 
 
 # ── process pool (forkserver, fail-fast) ─────────────────────────────────────────────────────────
 
-def pool_mapper(processes: int) -> Mapper:
-    """Run each pair in its own forkserver worker. A dead worker (anything other than a per-pair
+def pool_mapper(processes: int, initializer: Optional[Callable[[], None]] = _worker_init) -> Mapper:
+    """Run each pair in its own forkserver worker. ``initializer`` runs ONCE per worker process when it
+    starts (production: _worker_init, which builds the config/client/loader reused for every pair); the
+    self-tests pass None, so they touch no ClickHouse. A dead worker (anything other than a per-pair
     failure, which returns an error result) stops the run at once with a specific error — never the
     silent respawn-dead-workers loop a multiprocessing.Pool does."""
     # forkserver, stated explicitly: Python 3.14 made it the Linux default, and under it a worker
@@ -128,7 +207,7 @@ def pool_mapper(processes: int) -> Mapper:
         # One executor for the whole run; yield each pair's result the moment it completes (as_completed,
         # so possibly out of order) rather than waiting for all of them. A dead worker still raises
         # BrokenProcessPool here, stopping the run with the specific error.
-        with ProcessPoolExecutor(max_workers=processes, mp_context=ctx) as ex:
+        with ProcessPoolExecutor(max_workers=processes, mp_context=ctx, initializer=initializer) as ex:
             futures = [ex.submit(fn, it) for it in items]
             for f in as_completed(futures):
                 try:
@@ -170,7 +249,7 @@ def _selftest_deps(processes: int, pair_fn: Callable[[Pair], PairResult]) -> Dep
         ledgered=lambda a, b: set(),
         count_rows=lambda d, u: 0,
         process_pair=pair_fn,
-        mapper=pool_mapper(processes))
+        mapper=pool_mapper(processes, initializer=None))  # the self-test pairs touch no ClickHouse
 
 
 def default_build_deps(processes: int) -> Deps:

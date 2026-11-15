@@ -230,9 +230,107 @@ def test_a_dying_worker_stops_the_run_with_an_error() -> None:
     # A worker that _exit()s mid-task is a dead worker, not a per-pair failure: ProcessPoolExecutor
     # raises BrokenProcessPool and the mapper stops the run at once with a specific error.
     from greeks.history.worker import _suicide_pair, pool_mapper
-    mapper = pool_mapper(2)
+    mapper = pool_mapper(2, initializer=None)  # no ClickHouse setup; the suicide pair just exits
     with pytest.raises(RuntimeError, match="worker process died"):
         list(mapper(_suicide_pair, [(D1, "AAA"), (D2, "BBB")]))  # the mapper streams, so iterate it
+
+
+# ── per-process setup built once, inputs cached per day ──────────────────────────────────────────
+
+class _FakeRes:
+    column_names: List[str] = []
+    result_rows: List[Any] = []
+
+
+class _FakeClient:
+    """A ClickHouse client whose reads return no rows (so pricing is a no-op) and whose writes are
+    swallowed — enough to drive _process_pair without a database."""
+    def query(self, *a: Any, **k: Any) -> _FakeRes:
+        return _FakeRes()
+
+    def insert(self, *a: Any, **k: Any) -> None:
+        return None
+
+
+class _Cfg:
+    methodology_version = "v2"
+    t_floor_minutes = 15.0
+    expiry_time_et = "16:00"
+
+
+def _patch_worker(monkeypatch: pytest.MonkeyPatch, loader_days: List[date]) -> Dict[str, int]:
+    """Replace the three per-process builders with counting fakes and reset the worker global."""
+    import greeks.history.worker as w
+    counts = {"config": 0, "client": 0, "loader": 0}
+
+    def make_config() -> Any:
+        counts["config"] += 1
+        return _Cfg()
+
+    def make_client() -> Any:
+        counts["client"] += 1
+        return _FakeClient()
+
+    def make_loader(client: Any) -> Any:
+        counts["loader"] += 1
+        def load(day: date) -> Any:
+            loader_days.append(day)
+            return object()
+        return load
+
+    monkeypatch.setattr(w, "_WORKER", None)
+    monkeypatch.setattr(w, "_make_config", make_config)
+    monkeypatch.setattr(w, "_client", make_client)
+    monkeypatch.setattr(w, "_make_loader", make_loader)
+    return counts
+
+
+def test_config_client_loader_built_once_per_process_not_per_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    import greeks.history.worker as w
+    days: List[date] = []
+    counts = _patch_worker(monkeypatch, days)
+    w._worker_init()  # the pool initializer: runs once when the worker starts
+    for pair in [(D1, "A"), (D1, "B"), (D2, "A")]:
+        assert w._process_pair(pair).error is None
+    assert counts == {"config": 1, "client": 1, "loader": 1}  # once per process, not per pair
+
+
+def test_inputs_load_once_per_day_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    import greeks.history.worker as w
+    days: List[date] = []
+    _patch_worker(monkeypatch, days)
+    w._worker_init()
+    for pair in [(D1, "A"), (D1, "B"), (D1, "C")]:
+        w._process_pair(pair)
+    assert days == [D1]  # one load for the day, reused for every pair of it
+
+
+def test_a_day_change_reloads_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    import greeks.history.worker as w
+    days: List[date] = []
+    _patch_worker(monkeypatch, days)
+    w._worker_init()
+    for pair in [(D1, "A"), (D1, "B"), (D2, "A"), (D2, "B"), (D1, "C")]:
+        w._process_pair(pair)
+    assert days == [D1, D2, D1]  # reload on each change; only the most recent day is cached
+
+
+def test_day_line_has_the_new_format_with_failed_as_a_number(caplog: pytest.LogCaptureFixture) -> None:
+    # One ok pair and one failed pair on D1: "1 underlying(s), 2 rows, 2 priced, 1 failed, 0.5s".
+    def mapper(fn: Any, items: List[tuple[date, str]]) -> Any:
+        yield PairResult(D1, "A", rows=2, priced=2, reasons={}, seconds=0.3, error=None)
+        yield PairResult(D1, "B", rows=0, priced=0, reasons={}, seconds=0.2, error="boom")
+
+    deps = Deps(list_pairs=lambda a, b: [(D1, "A"), (D1, "B")], ledgered=lambda a, b: set(),
+                count_rows=lambda d, u: 0,
+                process_pair=lambda p: PairResult(p[0], p[1], 0, 0, {}, 0.0, None),
+                mapper=mapper)
+    with caplog.at_level(logging.INFO, logger="greeks.history"):
+        run(D1, D1, dry_run=False, deps=deps)
+    line = next(m for m in (r.getMessage() for r in caplog.records if r.name == "greeks.history")
+                if " underlying(s), " in m)
+    assert line == f"[greeks] {D1}: 1 underlying(s), 2 rows, 2 priced, 1 failed, 0.5s"
+    assert "failed=" not in line  # the old per-reason breakdown is gone
 
 
 # ── one ledger read, and a day line as each day finishes ─────────────────────────────────────────

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
@@ -166,7 +166,7 @@ class _DayAgg:
     ok: int = 0                                           # successfully-processed pairs (underlyings)
     rows: int = 0
     priced: int = 0
-    reasons: "Counter[str]" = field(default_factory=Counter)
+    failed: int = 0                                       # whole-pair failures (per-reason stays in the rows)
     seconds: float = 0.0
 
 
@@ -210,16 +210,16 @@ def run(from_date: date, to_date: date, dry_run: bool, deps: Deps) -> Summary:
         agg.seconds += r.seconds
         if r.error is not None:
             failed_pairs += 1
+            agg.failed += 1
             log.warning("[greeks] %s %s FAILED — no ledger row, a rerun retries it: %s",
                         r.day, r.underlying, r.error)
         else:
             agg.ok += 1
             agg.rows += r.rows
             agg.priced += r.priced
-            agg.reasons.update(r.reasons)
         if agg.remaining == 0:
-            log.info("[greeks] %s: %d underlying(s), %d rows, %d priced, failed=%s, %.1fs",
-                     r.day, agg.ok, agg.rows, agg.priced, dict(agg.reasons) or "none", agg.seconds)
+            log.info("[greeks] %s: %d underlying(s), %d rows, %d priced, %d failed, %.1fs",
+                     r.day, agg.ok, agg.rows, agg.priced, agg.failed, agg.seconds)
             days_done += 1
             rows_total += agg.rows
             priced_total += agg.priced
