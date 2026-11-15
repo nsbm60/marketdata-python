@@ -17,9 +17,9 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from greeks.domain import Dividend, FailureReason, RowStatus
 from greeks.occ import parse_occ
@@ -150,17 +150,32 @@ class Deps:
     reads → prices → re-inserts → ledgers); `mapper` runs it (a process pool in production, serial in
     tests)."""
     list_pairs: Callable[[date, date], List[Pair]]       # distinct (session_date, underlying) in option_trade
-    ledgered: Callable[[date, date], "set[Pair]"]        # pairs with a greeks ledger row already
+    ledgered: Callable[[date, date], "set[Pair]"]        # pairs with a greeks ledger row already (read ONCE)
     count_rows: Callable[[date, str], int]               # dry-run preview size
     process_pair: Callable[[Pair], PairResult]
-    mapper: Callable[[Callable[[Pair], PairResult], List[Pair]], List[PairResult]]
+    # Streams results AS THEY COMPLETE (production: one forkserver pool + as_completed), so a day line
+    # can be logged the moment its last pair finishes. May yield out of order.
+    mapper: Callable[[Callable[[Pair], PairResult], List[Pair]], Iterable[PairResult]]
+
+
+@dataclass
+class _DayAgg:
+    """Per-day running totals so the day line can be logged on completion without holding every
+    pair's result. `remaining` counts down to the day's last pair."""
+    remaining: int
+    ok: int = 0                                           # successfully-processed pairs (underlyings)
+    rows: int = 0
+    priced: int = 0
+    reasons: "Counter[str]" = field(default_factory=Counter)
+    seconds: float = 0.0
 
 
 def run(from_date: date, to_date: date, dry_run: bool, deps: Deps) -> Summary:
     """Price every (day, underlying) in [from_date, to_date] not already greeks-ledgered. A dry run
     prints the pairs and their row counts and writes nothing. One INFO line per day; one summary."""
     pairs = sorted(deps.list_pairs(from_date, to_date))
-    todo = [p for p in pairs if p not in deps.ledgered(from_date, to_date)]
+    done = deps.ledgered(from_date, to_date)             # ONE ClickHouse read, kept as a set
+    todo = [p for p in pairs if p not in done]
 
     if dry_run:
         by_day: "defaultdict[date, List[str]]" = defaultdict(list)
@@ -176,31 +191,41 @@ def run(from_date: date, to_date: date, dry_run: bool, deps: Deps) -> Summary:
         log.info("[greeks][dry-run] %d pair(s) to do, %d rows — nothing written", len(todo), total)
         return Summary(days=len(by_day), pairs=len(todo), rows=total, priced=0, failed_pairs=0)
 
-    results = deps.mapper(deps.process_pair, todo)
-    by_day_res: "defaultdict[date, List[PairResult]]" = defaultdict(list)
-    for r in results:
-        by_day_res[r.day].append(r)
+    # One executor for the whole run; consume results AS THEY COMPLETE (deps.mapper streams, possibly
+    # out of order). Track only per-day running totals and the failed-pair count — never every result —
+    # and log a day's INFO line the moment its last pair finishes (days may finish out of order).
+    days: Dict[date, _DayAgg] = {}
+    for d, _ in todo:
+        agg = days.get(d)
+        if agg is None:
+            days[d] = _DayAgg(remaining=1)
+        else:
+            agg.remaining += 1
 
-    rows_total = priced_total = failed_pairs = 0
-    for d in sorted(by_day_res):
-        rs = by_day_res[d]
-        ok = [r for r in rs if r.error is None]
-        reasons: "Counter[str]" = Counter()
-        for r in rs:
-            if r.error is not None:
-                failed_pairs += 1
-                log.warning("[greeks] %s %s FAILED — no ledger row, a rerun retries it: %s",
-                            d, r.underlying, r.error)
-            else:
-                reasons.update(r.reasons)
-        day_rows = sum(r.rows for r in ok)
-        day_priced = sum(r.priced for r in ok)
-        rows_total += day_rows
-        priced_total += day_priced
-        log.info("[greeks] %s: %d underlying(s), %d rows, %d priced, failed=%s, %.1fs",
-                 d, len(ok), day_rows, day_priced, dict(reasons) or "none", sum(r.seconds for r in rs))
+    days_done = pairs_total = rows_total = priced_total = failed_pairs = 0
+    for r in deps.mapper(deps.process_pair, todo):
+        pairs_total += 1
+        agg = days[r.day]
+        agg.remaining -= 1
+        agg.seconds += r.seconds
+        if r.error is not None:
+            failed_pairs += 1
+            log.warning("[greeks] %s %s FAILED — no ledger row, a rerun retries it: %s",
+                        r.day, r.underlying, r.error)
+        else:
+            agg.ok += 1
+            agg.rows += r.rows
+            agg.priced += r.priced
+            agg.reasons.update(r.reasons)
+        if agg.remaining == 0:
+            log.info("[greeks] %s: %d underlying(s), %d rows, %d priced, failed=%s, %.1fs",
+                     r.day, agg.ok, agg.rows, agg.priced, dict(agg.reasons) or "none", agg.seconds)
+            days_done += 1
+            rows_total += agg.rows
+            priced_total += agg.priced
+            del days[r.day]  # free the day's totals; nothing else is retained
 
     log.info("[greeks] done: %d day(s), %d pair(s), %d rows, %d priced, %d failed pair(s)",
-             len(by_day_res), len(results), rows_total, priced_total, failed_pairs)
-    return Summary(days=len(by_day_res), pairs=len(results), rows=rows_total, priced=priced_total,
+             days_done, pairs_total, rows_total, priced_total, failed_pairs)
+    return Summary(days=days_done, pairs=pairs_total, rows=rows_total, priced=priced_total,
                    failed_pairs=failed_pairs)

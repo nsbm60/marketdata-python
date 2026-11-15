@@ -5,6 +5,7 @@ ledgered pairs, writes nothing on a dry run, and parses its CLI. No live ClickHo
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
@@ -231,4 +232,69 @@ def test_a_dying_worker_stops_the_run_with_an_error() -> None:
     from greeks.history.worker import _suicide_pair, pool_mapper
     mapper = pool_mapper(2)
     with pytest.raises(RuntimeError, match="worker process died"):
-        mapper(_suicide_pair, [(D1, "AAA"), (D2, "BBB")])
+        list(mapper(_suicide_pair, [(D1, "AAA"), (D2, "BBB")]))  # the mapper streams, so iterate it
+
+
+# ── one ledger read, and a day line as each day finishes ─────────────────────────────────────────
+
+def _streaming_deps(pairs: List[tuple[date, str]], complete_order: List[tuple[date, str]], *,
+                    rows: int = 2, priced: int = 2, seconds: float = 0.5,
+                    ledger_calls: Dict[str, int] | None = None) -> Deps:
+    """Deps whose mapper yields results in `complete_order` (possibly out of order), counting ledger
+    reads."""
+    def ledgered(a: date, b: date) -> set[tuple[date, str]]:
+        if ledger_calls is not None:
+            ledger_calls["n"] = ledger_calls.get("n", 0) + 1
+        return set()
+
+    def process_pair(p: tuple[date, str]) -> PairResult:
+        return PairResult(p[0], p[1], rows=rows, priced=priced, reasons={}, seconds=seconds, error=None)
+
+    def mapper(fn: Any, items: List[tuple[date, str]]) -> Any:
+        for p in complete_order:
+            yield fn(p)
+
+    return Deps(list_pairs=lambda a, b: list(pairs), ledgered=ledgered, count_rows=lambda d, u: 0,
+                process_pair=process_pair, mapper=mapper)
+
+
+def test_ledgered_is_read_exactly_once_per_run() -> None:
+    calls: Dict[str, int] = {}
+    pairs = [(D1, "A"), (D1, "B"), (D2, "X")]
+    deps = _streaming_deps(pairs, pairs, ledger_calls=calls)
+    run(D1, D2, dry_run=False, deps=deps)
+    assert calls["n"] == 1  # one ClickHouse read, not one per pair
+
+
+def test_each_day_line_is_emitted_when_its_last_pair_completes_out_of_order(
+        caplog: pytest.LogCaptureFixture) -> None:
+    pairs = [(D1, "A"), (D1, "B"), (D2, "X")]
+    # D2's only pair finishes FIRST, then D1's two — so D2's line must precede D1's (completion order,
+    # not sorted), and both must precede the summary.
+    deps = _streaming_deps(pairs, [(D2, "X"), (D1, "A"), (D1, "B")])
+    with caplog.at_level(logging.INFO, logger="greeks.history"):
+        run(D1, D2, dry_run=False, deps=deps)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "greeks.history"]
+
+    def idx(prefix: str) -> int:
+        return next(i for i, m in enumerate(msgs) if m.startswith(prefix))
+
+    assert idx(f"[greeks] {D2}:") < idx(f"[greeks] {D1}:") < idx("[greeks] done:")
+
+
+def test_summary_totals_match_the_day_lines(caplog: pytest.LogCaptureFixture) -> None:
+    pairs = [(D1, "A"), (D1, "B"), (D2, "X")]  # rows/priced 2 each -> D1=4, D2=2
+    deps = _streaming_deps(pairs, [(D1, "A"), (D2, "X"), (D1, "B")], rows=2, priced=2)
+    with caplog.at_level(logging.INFO, logger="greeks.history"):
+        summary = run(D1, D2, dry_run=False, deps=deps)
+    day_lines = [r.getMessage() for r in caplog.records
+                 if r.name == "greeks.history" and " underlying(s), " in r.getMessage()]
+    day_rows = day_priced = 0
+    for line in day_lines:
+        m = re.search(r"(\d+) rows, (\d+) priced", line)
+        assert m is not None
+        day_rows += int(m.group(1))
+        day_priced += int(m.group(2))
+    assert summary.rows == day_rows == 6
+    assert summary.priced == day_priced == 6
+    assert summary.days == 2 and summary.pairs == 3

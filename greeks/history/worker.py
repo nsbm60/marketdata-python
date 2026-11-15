@@ -11,10 +11,10 @@ from __future__ import annotations
 import multiprocessing
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from datetime import date, datetime, timezone
-from typing import Any, Callable, List, Sequence
+from typing import Any, Callable, Iterable, Iterator, List, Sequence
 
 from greeks.config import load_config
 from greeks.domain import RowStatus
@@ -23,8 +23,8 @@ from greeks.history import COLUMNS, COLUMNS_NON_GREEKS, Deps, Pair, PairResult, 
 TABLE = "trading.option_trade"
 LEDGER = "trading.option_archive_ledger"
 
-# Mapper type: run a per-pair function over the pairs and return the results.
-Mapper = Callable[[Callable[[Pair], PairResult], List[Pair]], List[PairResult]]
+# Mapper type: run a per-pair function over the pairs and STREAM the results as they complete.
+Mapper = Callable[[Callable[[Pair], PairResult], List[Pair]], Iterable[PairResult]]
 
 # Set to "ok" / "die" to run the entry point against in-process fakes over the real forkserver pool
 # (the subprocess entry-point test), instead of touching ClickHouse.
@@ -122,19 +122,20 @@ def pool_mapper(processes: int) -> Mapper:
     # imports its task by module path — so the start method can't drift and break the import again.
     ctx = multiprocessing.get_context("forkserver")
 
-    def mapper(fn: Callable[[Pair], PairResult], items: List[Pair]) -> List[PairResult]:
+    def mapper(fn: Callable[[Pair], PairResult], items: List[Pair]) -> Iterator[PairResult]:
         if not items:
-            return []
-        results: List[PairResult] = []
+            return
+        # One executor for the whole run; yield each pair's result the moment it completes (as_completed,
+        # so possibly out of order) rather than waiting for all of them. A dead worker still raises
+        # BrokenProcessPool here, stopping the run with the specific error.
         with ProcessPoolExecutor(max_workers=processes, mp_context=ctx) as ex:
             futures = [ex.submit(fn, it) for it in items]
-            for f in futures:
+            for f in as_completed(futures):
                 try:
-                    results.append(f.result())
+                    yield f.result()
                 except BrokenProcessPool as e:
                     raise RuntimeError(
                         f"greeks.history worker process died — stopping the run: {e}") from e
-        return results
 
     return mapper
 
