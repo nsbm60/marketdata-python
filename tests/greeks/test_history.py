@@ -105,13 +105,25 @@ def test_every_non_greeks_column_is_copied_exactly() -> None:
     assert set(g.keys()) == set(COLUMNS)  # exactly the written columns, no more, no less
 
 
-# ── the column contract against the DDL ──────────────────────────────────────────────────────────
+# ── the column contract against the real DDL (system of record, per greeks/SCHEMA.md) ────────────
 
-def _ddl_columns(ddl: str) -> List[str]:
-    body = ddl.split("(", 1)[1]
+def _canonical_ddl_path() -> Path:
+    """The option_trade DDL path recorded in greeks/SCHEMA.md — the system of record is the Scala
+    repo, not a copy here (SCHEMA.md: "Do not maintain a second copy of CREATE TABLE")."""
+    schema_md = (Path(__file__).resolve().parents[2] / "greeks" / "SCHEMA.md").read_text(encoding="utf-8")
+    m = re.search(r"Canonical DDL\s*\|\s*`([^`]+database_schema\.sql)`", schema_md)
+    assert m is not None, "greeks/SCHEMA.md has no Canonical DDL path"
+    return Path(m.group(1)).expanduser()
+
+
+def _option_trade_columns(ddl: str) -> List[str]:
+    """The column names in the trading.option_trade CREATE block."""
+    start = ddl.find("CREATE TABLE IF NOT EXISTS trading.option_trade")
+    assert start != -1, "trading.option_trade CREATE not found in the DDL"
+    body = ddl[ddl.index("(", start) + 1:]
     cols: List[str] = []
     for line in body.splitlines():
-        if line.strip().startswith(")"):
+        if line.lstrip().startswith(")"):
             break
         m = re.match(r"\s+(\w+)\s+\w", line)  # a column definition: name followed by a type token
         if m:
@@ -120,8 +132,10 @@ def _ddl_columns(ddl: str) -> List[str]:
 
 
 def test_writer_columns_match_the_option_trade_ddl() -> None:
-    ddl = (Path(__file__).parent / "fixtures" / "database_schema.sql").read_text(encoding="utf-8")
-    ddl_cols = _ddl_columns(ddl)
+    path = _canonical_ddl_path()
+    if not path.exists():
+        pytest.fail(f"option_trade DDL not found at {path} (system of record per greeks/SCHEMA.md)")
+    ddl_cols = _option_trade_columns(path.read_text(encoding="utf-8"))
     # The writer writes every DDL column except ingested_at (the ReplacingMergeTree version DEFAULT).
     assert set(ddl_cols) - {"ingested_at"} == set(COLUMNS)
     assert "ingested_at" not in COLUMNS
