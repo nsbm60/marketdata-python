@@ -107,8 +107,10 @@ def _count_rows(client: Any, day: date, underlying: str) -> int:
 def _read_chunk(client: Any, day: date, underlying: str, limit: int, offset: int) -> List[Row]:
     """One chunk of a (day, underlying)'s rows, ordered by the table key so LIMIT/OFFSET paging is
     stable — the key (underlying, symbol, sip_timestamp_ns, ordinal) is unique after FINAL, so no row
-    is skipped or repeated across chunks."""
-    cols = ", ".join(COLUMNS_NON_GREEKS)
+    is skipped or repeated across chunks. ``price`` comes back as a float (toFloat64) rather than a
+    Python Decimal — pricing wants a float, and a Decimal64(4) value round-trips exactly through
+    float on re-insert."""
+    cols = ", ".join("toFloat64(price) AS price" if c == "price" else c for c in COLUMNS_NON_GREEKS)
     res = client.query(
         f"SELECT {cols} FROM {TABLE} FINAL WHERE underlying = %(u)s AND session_date = %(d)s "
         "ORDER BY symbol, sip_timestamp_ns, ordinal LIMIT %(lim)s OFFSET %(off)s",

@@ -26,6 +26,7 @@ from greeks.history import (
     PairResult,
     StopRequested,
     Summary,
+    _greeks_for,
     dataset_for,
     price_rows,
     run,
@@ -564,3 +565,44 @@ def test_workers_are_recycled_after_max_tasks_per_child() -> None:
     assert len(results) == n
     pids = {r.underlying for r in results}
     assert len(pids) > 2  # more worker pids than the 2 workers -> recycled
+
+
+# ── cached fast path produces identical results to the reference path ─────────────────────────────
+
+def test_cached_path_matches_the_reference_path() -> None:
+    # Several underlyings, both rights, a dividend inside the window (NVDA, ex 2026-11-05), a
+    # near-expiry contract, and each failure kind. The cached price_rows must match the uncached
+    # _greeks_for row for row — IV and greeks to 1e-9 relative, same status and reason.
+    div = Dividend(underlying="NVDA", amount=0.25, ex_date=date(2026, 11, 5))
+    inputs = SessionInputs(session_date=SESSION, sofr=_sofr(), dividends={"NVDA": (div,)})
+    rows = [
+        _row("NVDA261120C00180000", price=9.1, spot=181.0),                    # call, dividend in window
+        _row("NVDA261120P00180000", price=8.0, spot=181.0),                    # put, dividend in window
+        _row("AAPL261218C00230000", price=7.5, spot=232.0, underlying="AAPL"), # other underlying, no div
+        _row("NVDA261023C00180000", price=3.0, spot=181.0),                    # near expiry (dividend after it)
+        _row("B1VDA261120C00180000", price=9.1, spot=181.0),                   # nonstandard -> fail
+        _row("NVDA261120C00180000", price=9.1, spot=None),                     # missing spot -> fail
+        _row("NVDA260101C00180000", price=9.1, spot=181.0),                    # expired -> t_below_floor
+        _row("NVDA261120C00100000", price=1.0, spot=181.0),                    # below intrinsic -> fail
+    ]
+    reference = [_greeks_for(r, inputs, MV, TFLOOR, ETIME, NOW) for r in rows]
+    priced, _ = price_rows(rows, inputs, methodology_version=MV, t_floor_minutes=TFLOOR,
+                           expiry_time_et=ETIME, now=NOW)
+
+    grk = ("iv", "delta", "gamma", "theta", "vega", "rho",
+           "greeks_forward", "greeks_discount", "greeks_tte")
+    seen = set()
+    for ref, new in zip(reference, priced):
+        assert new["greeks_status"] == ref["greeks_status"]
+        assert new["greeks_reason"] == ref["greeks_reason"]
+        seen.add((ref["greeks_status"], ref["greeks_reason"]))
+        for k in grk:
+            a, b = ref[k], new[k]
+            if a is None or b is None:
+                assert a is None and b is None, (k, a, b)
+            else:
+                assert b == pytest.approx(a, rel=1e-9, abs=1e-12), (k, a, b)
+    # the sample really exercised a success plus each failure reason
+    assert ("success", None) in seen
+    assert {("failure", r) for r in
+            ("nonstandard_contract", "missing_spot", "t_below_floor", "below_intrinsic")} <= seen
