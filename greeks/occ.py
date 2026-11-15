@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import lru_cache
 
 from greeks.domain import OptionRight
 
@@ -37,6 +38,11 @@ def to_massive_ticker(osi: str) -> str:
     return f"O:{s}"
 
 
+# Memoized: the same OSI string recurs across every trade on a contract (millions of rows for a heavy
+# name on one day), and the parse — regex + strptime — is pure. The result (a frozen OccContract) is
+# immutable, so sharing it is safe. Size bounds the distinct contracts held per process; a worker is
+# recycled every 50 pairs, so the cache never grows without bound. Nothing trade-time-dependent here.
+@lru_cache(maxsize=131072)
 def parse_occ(symbol: str) -> OccContract:
     """Parse standard OCC/OSI symbol.
 

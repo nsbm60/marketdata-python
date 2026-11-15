@@ -15,22 +15,15 @@ processes (one (day, underlying) each) — no asyncio/threading under greeks/.
 from __future__ import annotations
 
 import logging
-import math
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
-from greeks.domain import Dividend, FailureReason, OptionRight, RowStatus, SolverInput
-from greeks.forwards.carry import ex_date_instant_utc
+from greeks.domain import Dividend, FailureReason, RowStatus
 from greeks.occ import parse_occ
-from greeks.pricing import PricedGreeks, price_option
-from greeks.solver.invert import invert
-from greeks.solver.time import expiry_instant_utc
-
-# ACT/365 seconds per year, matching greeks.solver.time / greeks.forwards.carry (kept identical).
-_SECONDS_PER_ACT365_YEAR = 365.0 * 86400.0
+from greeks.pricing import price_option
 
 log = logging.getLogger(__name__)
 
@@ -73,43 +66,30 @@ def _as_utc(ts: datetime) -> datetime:
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
-def _blank_greeks(methodology_version: str, now: datetime) -> Dict[str, Any]:
+def _greeks_for(row: Row, inputs: Inputs, methodology_version: str, t_floor_minutes: float,
+                expiry_time_et: str, now: datetime) -> Dict[str, Any]:
+    """The greeks columns for one trade row: the trade price inverted against spot_at_trade through
+    the one shared core (greeks.pricing.price_option). A non-standard OSI, an absent spot, or a solver
+    reason is a failure with the greeks left None — nothing defaulted. forward/discount/tte are filled
+    once the carry was computed. The per-row costs the profile flagged (parse_occ, the expiry and
+    ex-date instants) are memoized inside the core, so there is no second pricing path here."""
     g: Dict[str, Any] = {c: None for c in COLUMNS_GREEKS}
     g["greeks_methodology"] = methodology_version
     g["greeks_basis"] = BASIS_TRADE
     g["greeks_computed_at"] = now
-    return g
 
+    def fail(reason: FailureReason) -> Dict[str, Any]:
+        g["greeks_status"] = RowStatus.FAILURE.value
+        g["greeks_reason"] = reason.value
+        return g
 
-def _fail_greeks(g: Dict[str, Any], reason: FailureReason) -> Dict[str, Any]:
-    g["greeks_status"] = RowStatus.FAILURE.value
-    g["greeks_reason"] = reason.value
-    return g
-
-
-def _fill_from_priced(g: Dict[str, Any], p: PricedGreeks) -> Dict[str, Any]:
-    g["greeks_status"] = p.status.value
-    g["greeks_reason"] = None if p.reason is None else p.reason.value
-    g["greeks_forward"], g["greeks_discount"], g["greeks_tte"] = p.forward, p.discount, p.tte
-    g["iv"], g["delta"], g["gamma"] = p.iv, p.delta, p.gamma
-    g["theta"], g["vega"], g["rho"] = p.theta, p.vega, p.rho
-    return g
-
-
-def _greeks_for(row: Row, inputs: Inputs, methodology_version: str, t_floor_minutes: float,
-                expiry_time_et: str, now: datetime) -> Dict[str, Any]:
-    """Reference (uncached) per-row pricing: the trade price inverted against spot_at_trade through
-    the shared core. A non-standard OSI, an absent spot, or a solver reason is a failure with the
-    greeks left None — nothing defaulted. The cached fast path (``price_rows``) must match this row
-    for row — ``test_cached_path_matches_the_reference_path`` pins it."""
-    g = _blank_greeks(methodology_version, now)
     try:
         c = parse_occ(row["symbol"])
     except ValueError:
-        return _fail_greeks(g, FailureReason.NONSTANDARD_CONTRACT)
+        return fail(FailureReason.NONSTANDARD_CONTRACT)
     spot = row["spot_at_trade"]
     if spot is None:
-        return _fail_greeks(g, FailureReason.MISSING_SPOT)
+        return fail(FailureReason.MISSING_SPOT)
     try:
         p = price_option(
             expiry=c.expiry, right=c.right, strike=c.strike, price=float(row["price"]),
@@ -119,136 +99,25 @@ def _greeks_for(row: Row, inputs: Inputs, methodology_version: str, t_floor_minu
             expiry_time_et=expiry_time_et)
     except Exception as e:  # noqa: BLE001 — per-row isolation, like compute_or_fail
         log.debug("[greeks] %s: price_option raised %s: %s — solver_failed", row["symbol"], type(e).__name__, e)
-        return _fail_greeks(g, FailureReason.SOLVER_FAILED)
-    return _fill_from_priced(g, p)
+        return fail(FailureReason.SOLVER_FAILED)
 
-
-# ── cached fast path: the same math, the per-contract and per-(underlying,day) work done once ──────
-
-@dataclass(frozen=True)
-class _Contract:
-    """A symbol parsed once per pair, with its expiry instant precomputed (parse_occ and
-    expiry_instant_utc are otherwise per-row costs)."""
-    root: str
-    expiry: date
-    right: OptionRight
-    strike: float
-    expiry_instant: datetime
-    expired_before_session: bool
-
-
-def _build_contract(symbol: str, session_date: date, expiry_time_et: str) -> Optional[_Contract]:
-    try:
-        c = parse_occ(symbol)
-    except ValueError:
-        return None  # NONSTANDARD_CONTRACT, decided once per distinct symbol
-    return _Contract(
-        root=c.root, expiry=c.expiry, right=c.right, strike=c.strike,
-        expiry_instant=expiry_instant_utc(c.expiry, expiry_time_et),
-        expired_before_session=c.expiry < session_date)
-
-
-def _years(instant: datetime, as_of: datetime) -> float:
-    """ACT/365 years from ``as_of`` to ``instant`` — identical to greeks.solver.time.years_to_expiry
-    / years_to_ex_date (both aware, so the subtraction is timezone-independent)."""
-    seconds = (instant - as_of).total_seconds()
-    return seconds / _SECONDS_PER_ACT365_YEAR if seconds > 0 else 0.0
-
-
-def _price_cached(contract: _Contract, rate: float, dividends: Sequence[Tuple[Dividend, datetime]],
-                  price: float, spot: float, as_of: datetime, methodology_version: str,
-                  t_floor_minutes: float) -> PricedGreeks:
-    """price_option for a pre-parsed contract with a cached rate and cached dividend ex-date instants.
-    Mirrors greeks.pricing.price_option + greeks.forwards.carry exactly, computing only the trade-time-
-    dependent terms (T, D, F) per row."""
-    if contract.expired_before_session:
-        return PricedGreeks(RowStatus.FAILURE, FailureReason.T_BELOW_FLOOR,
-                            None, None, None, None, None, None, None, None, None)
-    # carry(): T, then D = exp(-rT), then escrowed forward F (each dividend future-valued from its own
-    # ex-date, only those strictly inside the remaining life).
-    t = _years(contract.expiry_instant, as_of)
-    d = 1.0 if t <= 0 else math.exp(-rate * t)
-    if spot <= 0:
-        raise ValueError("spot must be > 0")
-    if t == 0:
-        f = spot
-    else:
-        f = spot * math.exp(rate * t)
-        for div, ex_instant in dividends:
-            if div.amount < 0:
-                raise ValueError(f"dividend amount must be >= 0, got {div.amount}")
-            t_i = _years(ex_instant, as_of)
-            if t_i <= 0.0 or t_i >= t:
-                continue
-            f -= div.amount * math.exp(rate * (t - t_i))
-    res = invert(
-        SolverInput(trade_price=price, strike=contract.strike, right=contract.right,
-                    forward=f, discount=d, time_to_expiry=t, spot=spot),
-        methodology_version=methodology_version, t_floor_minutes=t_floor_minutes)
-    if res.status is not RowStatus.SUCCESS:
-        assert res.reason_code is not None
-        return PricedGreeks(RowStatus.FAILURE, res.reason_code,
-                            None, None, None, None, None, None, f, d, t)
-    return PricedGreeks(
-        status=RowStatus.SUCCESS, reason=None,
-        iv=res.iv, delta=res.delta, gamma=res.gamma, theta=res.theta, vega=res.vega, rho=res.rho,
-        forward=f, discount=d, tte=t, theta_limited=res.theta_interpretively_limited)
-
-
-def _greeks_for_cached(row: Row, contract: Optional[_Contract], rate: float,
-                       dividends: Sequence[Tuple[Dividend, datetime]], methodology_version: str,
-                       t_floor_minutes: float, now: datetime) -> Dict[str, Any]:
-    """The cached counterpart of _greeks_for — same failures, same order, same math."""
-    g = _blank_greeks(methodology_version, now)
-    if contract is None:
-        return _fail_greeks(g, FailureReason.NONSTANDARD_CONTRACT)
-    spot = row["spot_at_trade"]
-    if spot is None:
-        return _fail_greeks(g, FailureReason.MISSING_SPOT)
-    try:
-        p = _price_cached(contract, rate, dividends, float(row["price"]), float(spot),
-                          _as_utc(row["trade_ts"]), methodology_version, t_floor_minutes)
-    except Exception as e:  # noqa: BLE001 — per-row isolation, like _greeks_for
-        log.debug("[greeks] %s: cached price raised %s: %s — solver_failed", row["symbol"], type(e).__name__, e)
-        return _fail_greeks(g, FailureReason.SOLVER_FAILED)
-    return _fill_from_priced(g, p)
+    g["greeks_status"] = p.status.value
+    g["greeks_reason"] = None if p.reason is None else p.reason.value
+    g["greeks_forward"], g["greeks_discount"], g["greeks_tte"] = p.forward, p.discount, p.tte
+    g["iv"], g["delta"], g["gamma"] = p.iv, p.delta, p.gamma
+    g["theta"], g["vega"], g["rho"] = p.theta, p.vega, p.rho
+    return g
 
 
 def price_rows(rows: Sequence[Row], inputs: Inputs, *, methodology_version: str, t_floor_minutes: float,
                expiry_time_et: str, now: datetime) -> Tuple[List[Row], "Counter[str]"]:
     """Every row with its greeks columns filled: non-greeks columns copied EXACTLY (overlaying the
-    disjoint greeks columns), and a count of failures by reason. Pure.
-
-    Per pair: each distinct symbol is parsed once (with its expiry instant), each distinct expiry's
-    rate is looked up once, and each underlying's dividend ex-date instants are computed once; a row
-    then evaluates only what depends on its own trade time. Results are identical to _greeks_for."""
-    contracts: Dict[str, Optional[_Contract]] = {}
-    rates: Dict[date, float] = {}
-    div_instants: Dict[str, List[Tuple[Dividend, datetime]]] = {}
+    disjoint greeks columns), and a count of failures by reason. Pure."""
     out: List[Row] = []
     reasons: "Counter[str]" = Counter()
-    for row in rows:
-        symbol = str(row["symbol"])
-        if symbol in contracts:
-            contract = contracts[symbol]
-        else:
-            contract = _build_contract(symbol, row["session_date"], expiry_time_et)
-            contracts[symbol] = contract
-        # Only a priceable (parseable, not-yet-expired) contract needs a rate and dividends — and only
-        # then is rate_for called, exactly as price_option would (an expired contract never looks one up).
-        if contract is not None and not contract.expired_before_session:
-            rate = rates.get(contract.expiry)
-            if rate is None:
-                rate = inputs.rate_for(contract.expiry)
-                rates[contract.expiry] = rate
-            divs = div_instants.get(contract.root)
-            if divs is None:
-                divs = [(d, ex_date_instant_utc(d.ex_date)) for d in inputs.dividends_for(contract.root)]
-                div_instants[contract.root] = divs
-        else:
-            rate, divs = 0.0, []  # unused: contract is None or expired → fails before carry
-        g = _greeks_for_cached(row, contract, rate, divs, methodology_version, t_floor_minutes, now)
-        out.append({**row, **g})  # disjoint key sets: non-greeks + greeks
+    for r in rows:
+        g = _greeks_for(r, inputs, methodology_version, t_floor_minutes, expiry_time_et, now)
+        out.append({**r, **g})  # disjoint key sets: non-greeks + greeks
         if g["greeks_status"] == RowStatus.FAILURE.value:
             reasons[str(g["greeks_reason"])] += 1
     return out, reasons

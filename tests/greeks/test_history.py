@@ -26,7 +26,6 @@ from greeks.history import (
     PairResult,
     StopRequested,
     Summary,
-    _greeks_for,
     dataset_for,
     price_rows,
     run,
@@ -567,12 +566,14 @@ def test_workers_are_recycled_after_max_tasks_per_child() -> None:
     assert len(pids) > 2  # more worker pids than the 2 workers -> recycled
 
 
-# ── cached fast path produces identical results to the reference path ─────────────────────────────
+# ── the memoized core matches an un-memoized call ─────────────────────────────────────────────────
 
-def test_cached_path_matches_the_reference_path() -> None:
-    # Several underlyings, both rights, a dividend inside the window (NVDA, ex 2026-11-05), a
-    # near-expiry contract, and each failure kind. The cached price_rows must match the uncached
-    # _greeks_for row for row — IV and greeks to 1e-9 relative, same status and reason.
+def test_memoized_core_matches_unmemoized(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The per-row costs the profile flagged are now memoized in the shared core (parse_occ,
+    # expiry_instant_utc, ex_date_instant_utc). Pricing the same sample with those caches, then again
+    # with each replaced by its un-memoized __wrapped__, must agree — IV and greeks to 1e-9 relative,
+    # same status and reason. Several underlyings, both rights, a dividend in window, near-expiry, and
+    # each failure kind.
     div = Dividend(underlying="NVDA", amount=0.25, ex_date=date(2026, 11, 5))
     inputs = SessionInputs(session_date=SESSION, sofr=_sofr(), dividends={"NVDA": (div,)})
     rows = [
@@ -585,19 +586,37 @@ def test_cached_path_matches_the_reference_path() -> None:
         _row("NVDA260101C00180000", price=9.1, spot=181.0),                    # expired -> t_below_floor
         _row("NVDA261120C00100000", price=1.0, spot=181.0),                    # below intrinsic -> fail
     ]
-    reference = [_greeks_for(r, inputs, MV, TFLOOR, ETIME, NOW) for r in rows]
-    priced, _ = price_rows(rows, inputs, methodology_version=MV, t_floor_minutes=TFLOOR,
-                           expiry_time_et=ETIME, now=NOW)
+
+    def price() -> List[Dict[str, Any]]:
+        priced, _ = price_rows(rows, inputs, methodology_version=MV, t_floor_minutes=TFLOOR,
+                               expiry_time_et=ETIME, now=NOW)
+        return priced
+
+    memoized = price()
+
+    # Un-memoize: point each cached core function at its underlying __wrapped__ where it is called.
+    # Target the module objects via sys.modules — the greeks.forwards package re-exports the `carry`
+    # function, which shadows the `carry` submodule under attribute/importlib resolution.
+    import greeks.forwards.carry  # noqa: F401 — ensure the submodule is in sys.modules
+    import greeks.history         # noqa: F401
+    import greeks.solver.time     # noqa: F401
+    from greeks.forwards.carry import ex_date_instant_utc
+    from greeks.occ import parse_occ
+    from greeks.solver.time import expiry_instant_utc
+    monkeypatch.setattr(sys.modules["greeks.history"], "parse_occ", parse_occ.__wrapped__)
+    monkeypatch.setattr(sys.modules["greeks.solver.time"], "expiry_instant_utc", expiry_instant_utc.__wrapped__)
+    monkeypatch.setattr(sys.modules["greeks.forwards.carry"], "ex_date_instant_utc", ex_date_instant_utc.__wrapped__)
+    unmemoized = price()
 
     grk = ("iv", "delta", "gamma", "theta", "vega", "rho",
            "greeks_forward", "greeks_discount", "greeks_tte")
     seen = set()
-    for ref, new in zip(reference, priced):
-        assert new["greeks_status"] == ref["greeks_status"]
-        assert new["greeks_reason"] == ref["greeks_reason"]
-        seen.add((ref["greeks_status"], ref["greeks_reason"]))
+    for raw, cached in zip(unmemoized, memoized):
+        assert cached["greeks_status"] == raw["greeks_status"]
+        assert cached["greeks_reason"] == raw["greeks_reason"]
+        seen.add((raw["greeks_status"], raw["greeks_reason"]))
         for k in grk:
-            a, b = ref[k], new[k]
+            a, b = raw[k], cached[k]
             if a is None or b is None:
                 assert a is None and b is None, (k, a, b)
             else:

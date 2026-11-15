@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+from functools import lru_cache
 from typing import Sequence
 from zoneinfo import ZoneInfo
 
@@ -59,6 +60,11 @@ def discount_factor(continuous_rate: float, time_to_expiry: float) -> float:
     return math.exp(-continuous_rate * time_to_expiry)
 
 
+# Memoized: a dividend's ex-date is the same for every trade priced against it (the whole day's rows
+# for the underlying), and the ET datetime.combine + astimezone is pure in ex_date. Distinct ex-dates
+# are very few, so a small cache covers them. years_to_ex_date does the per-trade subtraction on top of
+# this, so nothing trade-time-dependent is cached (the profile's carry cost was this instant).
+@lru_cache(maxsize=8192)
 def ex_date_instant_utc(ex_date: date) -> datetime:
     """Dividend drop modeled at 00:00 America/New_York on the ex-date → UTC."""
     local = datetime.combine(ex_date, time(0, 0), tzinfo=_ET)

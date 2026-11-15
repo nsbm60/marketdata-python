@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
 _SECONDS_PER_ACT365_YEAR = 365.0 * 86400.0
 
 
+# Memoized: an expiry recurs on every trade of every contract sharing it (a whole chain), and the ET
+# datetime.combine + astimezone is pure in (expiry_date, expiry_time_et). Distinct expiries are few
+# (hundreds), so a small cache covers them. Trade time is NOT an argument, so nothing time-varying is
+# cached — years_to_expiry does the per-trade subtraction on top of this.
+@lru_cache(maxsize=8192)
 def expiry_instant_utc(expiry_date: date, expiry_time_et: str = "16:00") -> datetime:
     """Equity option expiry as UTC datetime (date at HH:MM America/New_York)."""
     hour_s, minute_s = expiry_time_et.split(":", 1)
