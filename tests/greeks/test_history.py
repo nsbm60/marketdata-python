@@ -5,7 +5,10 @@ ledgered pairs, writes nothing on a dry run, and parses its CLI. No live ClickHo
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -204,3 +207,28 @@ def test_processes_is_required_no_default() -> None:
 
 def test_dataset_name() -> None:
     assert dataset_for("v2") == "greeks_v2"
+
+
+# ── the REAL entry point spawns forkserver workers that import the task by module path ───────────
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_entry_point_starts_forkserver_workers_as_a_subprocess() -> None:
+    # `python -m greeks.history … --processes 2` with the self-test deps: real argparse → real
+    # forkserver ProcessPoolExecutor → workers import greeks.history.worker._selftest_pair by module
+    # path and run. Before the fix (worker in __main__) every worker raised AttributeError. No CH.
+    env = {**os.environ, "GREEKS_HISTORY_SELFTEST": "ok"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "greeks.history", "2016-01-04", "2016-01-05", "--processes", "2"],
+        cwd=str(_REPO_ROOT), env=env, capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+def test_a_dying_worker_stops_the_run_with_an_error() -> None:
+    # A worker that _exit()s mid-task is a dead worker, not a per-pair failure: ProcessPoolExecutor
+    # raises BrokenProcessPool and the mapper stops the run at once with a specific error.
+    from greeks.history.worker import _suicide_pair, pool_mapper
+    mapper = pool_mapper(2)
+    with pytest.raises(RuntimeError, match="worker process died"):
+        mapper(_suicide_pair, [(D1, "AAA"), (D2, "BBB")])
