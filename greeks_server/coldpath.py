@@ -89,9 +89,8 @@ class ColdPath:
             quotes, session_open_ms, as_of_ms = self._get_quotes(symbols, at)
         except Exception as e:  # noqa: BLE001 — MDS failure: every contract depended on this one call
             log.debug("cold path get_quotes failed for %d symbols (at=%s): %s", len(symbols), at, e)
-            results = [ColdResult(osi, None, _failure(contracts[osi], FailureReason.MDS_UNAVAILABLE, 0, self._m, None, None))
-                       for osi in osis]
-            return results, None
+            return [ColdResult(osi, None, _failure(contracts[osi], FailureReason.MDS_UNAVAILABLE, 0, self._m, None, None))
+                    for osi in osis], None
 
         as_of = datetime.fromtimestamp(as_of_ms / 1000.0, tz=timezone.utc)
         inputs = self._inputs.for_date(as_of.astimezone(ET).date())  # one pass, one inputs load

@@ -13,8 +13,8 @@ from datetime import date, datetime
 from typing import Optional
 
 from greeks.domain import FailureReason, OptionRight, RowStatus, SolverInput, SolverResult
-from greeks.forwards.carry import carry
 from greeks.occ import OccContract, parse_occ
+from greeks.pricing import price_option
 from greeks.solver.invert import invert
 from greeks_server.inputs import SessionInputs
 from greeks_server.message import OptionGreeksMessage
@@ -116,50 +116,34 @@ def compute(
     rate and dividends come from inputs loaded for as_of's date."""
     priced_as_of_ms = int(as_of.timestamp() * 1000)
     # Option first: with no current two-sided quote there is no market to price, and no stock is
-    # needed (the cold path doesn't even look one up).
+    # needed (the cold path doesn't even look one up). These two absences are the live price-selection
+    # layer's reasons; the inversion itself is the shared core (greeks.pricing.price_option).
     if option_px is None:
         return _failure(contract, FailureReason.NO_CURRENT_QUOTE, priced_as_of_ms, m, None, spot_px)
     if spot_px is None:
         return _failure(contract, FailureReason.MISSING_SPOT, priced_as_of_ms, m, option_px, None)
 
-    if contract.expiry < inputs.session_date:
-        # Expired before as_of's date: there is no rate for a negative term. The solver's floor
-        # (t_below_floor) is the reason it would give; the floor itself stays the solver's.
-        return _failure(contract, FailureReason.T_BELOW_FLOOR, priced_as_of_ms, m, option_px, spot_px)
-
-    r = inputs.rate_for(contract.expiry)
-    c = carry(
-        spot_px.value, r, as_of, contract.expiry,
-        inputs.dividends_for(contract.underlying), expiry_time_et=m.expiry_time_et,
+    p = price_option(
+        expiry=contract.expiry, right=contract.right, strike=contract.strike,
+        price=option_px.value, spot=spot_px.value, as_of=as_of, session_date=inputs.session_date,
+        rate_for=inputs.rate_for, dividends=inputs.dividends_for(contract.underlying),
+        methodology_version=m.methodology_version, t_floor_minutes=m.t_floor_minutes,
+        expiry_time_et=m.expiry_time_et,
     )
-    res = iv_for(contract, option_px.value, c.forward, c.discount, c.time_to_expiry, spot_px.value, m)
-    if res.status is not RowStatus.SUCCESS:
-        assert res.reason_code is not None  # SolverResult invariant
-        return _failure(
-            contract, res.reason_code, priced_as_of_ms, m, option_px, spot_px,
-            forward=c.forward, discount=c.discount, t=c.time_to_expiry,
-        )
+    if p.status is not RowStatus.SUCCESS:
+        assert p.reason is not None
+        return _failure(contract, p.reason, priced_as_of_ms, m, option_px, spot_px,
+                        forward=p.forward, discount=p.discount, t=p.tte)
     return OptionGreeksMessage(
         osi=contract.osi,
         status=RowStatus.SUCCESS,
         priced_as_of=priced_as_of_ms,
         methodology_version=m.methodology_version,
-        theta_limited=res.theta_interpretively_limited,
-        iv=res.iv,
-        delta=res.delta,
-        gamma=res.gamma,
-        theta=res.theta,
-        vega=res.vega,
-        rho=res.rho,
-        price=option_px.value,
-        price_kind=option_px.kind,
-        price_ts=option_px.ts_ms,
-        spot=spot_px.value,
-        spot_kind=spot_px.kind,
-        spot_ts=spot_px.ts_ms,
-        forward=c.forward,
-        discount=c.discount,
-        t_years=c.time_to_expiry,
+        theta_limited=p.theta_limited,
+        iv=p.iv, delta=p.delta, gamma=p.gamma, theta=p.theta, vega=p.vega, rho=p.rho,
+        price=option_px.value, price_kind=option_px.kind, price_ts=option_px.ts_ms,
+        spot=spot_px.value, spot_kind=spot_px.kind, spot_ts=spot_px.ts_ms,
+        forward=p.forward, discount=p.discount, t_years=p.tte,
     )
 
 
