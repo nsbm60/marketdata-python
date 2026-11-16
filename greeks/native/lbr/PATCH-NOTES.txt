@@ -1,0 +1,13 @@
+Local patch to Jäckel's vendored reference source
+=================================================
+
+The licence (LICENSE in this directory) permits modification provided the notice
+is preserved. One minimal, mechanical, semantics-preserving change was made so the
+source compiles on standard toolchains (Apple clang, g++):
+
+  normaldistribution.cpp: identifier 'inverse_norm_cdfm<U+00BD>_for_midrange_probabilities'
+  renamed to 'inverse_norm_cdfm_half_for_midrange_probabilities'. U+00BD (VULGAR FRACTION
+  ONE HALF) is not a valid C++ identifier character (not in XID_Continue); clang rejects it.
+  Only the identifier was changed; the <U+00BD> that appears in comments is left as-is.
+
+Nothing else is modified. lbr_batch.cpp is ours (the batch entry point), not Jäckel's.

@@ -41,3 +41,6 @@ out.jsonl
 tools/captured_requests/
 tests/solver_eval/results/
 *.html
+
+# C-extension build tree (setuptools)
+build/

@@ -1,0 +1,21 @@
+This directory vendors the reference C++ implementation of "Let's Be Rational" by
+Peter Jäckel (www.jaeckel.org/LetsBeRational.7z), under the notice below, which is
+preserved here as the licence requires. The algorithm is described in "Let's Be
+Rational", Peter Jäckel, Wilmott, pp 40-53, January 2015.
+
+Vendored, unmodified except for one portability rename recorded in PATCH-NOTES.txt:
+  erf_cody.cpp, lets_be_rational.cpp(.h), normaldistribution.cpp(.h),
+  rationalcubic.cpp(.h), dllmain.h
+Our own file (not Jäckel's): lbr_batch.cpp — the batch entry point.
+
+======================================================================================
+ Copyright © 2013-2024 Peter Jäckel.
+
+ Permission to use, copy, modify, and distribute this software is freely granted,
+ provided that this notice is preserved.
+
+ WARRANTY DISCLAIMER
+ The Software is provided "as is" without warranty of any kind, either express or implied,
+ including without limitation any implied warranties of condition, uninterrupted use,
+ merchantability, fitness for a particular purpose, or non-infringement.
+======================================================================================

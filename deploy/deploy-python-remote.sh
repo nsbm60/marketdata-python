@@ -54,7 +54,9 @@ echo "unpacking app.tar.gz -> ${APP_DIR}"
 tar -C "${APP_DIR}" -xzf "${staging}/app.tar.gz"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
 
-# Reinstall (editable against /opt) so a dependency change is picked up.
+# Reinstall (editable against /opt) so a dependency change is picked up. This also build_ext-compiles
+# the native "Let's Be Rational" C++ extension (greeks/native/lbr) — drogon needs a C++ toolchain:
+#   sudo apt-get install -y build-essential   # one-time; provides g++
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install -q -e "${APP_DIR}"
 
 # Refresh every managed unit from the freshly deployed copy, then reload definitions.
