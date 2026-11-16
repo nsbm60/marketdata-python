@@ -28,7 +28,7 @@ from discovery import ControlService, ServiceLocator
 from greeks.config import load_config
 from greeks.topic_builder import TopicBuilder
 from greeks_server.coldpath import ColdPath
-from greeks_server.handler import OP, OP_GET, make_get_handler, make_handler
+from greeks_server.handler import OP, OP_GET, OP_TRADES, make_get_handler, make_handler, make_trades_handler
 from greeks_server.inputs import InputsHolder, clickhouse_loader
 from greeks_server.loop import ComputeLoop, methodology
 from service import Service
@@ -109,6 +109,9 @@ def main() -> int:
     # loop under its lock; compute_greeks is pure and needs neither.
     service.register_handler(OP, make_handler(cfg, inputs))
     service.register_handler(OP_GET, make_get_handler(loop.get_greeks, methodology(cfg)))
+    # price_trades is pure (no book), like compute_greeks: the archive asks it for trade-basis greeks
+    # before inserting new option_trade rows, so they're written once, complete.
+    service.register_handler(OP_TRADES, make_trades_handler(cfg, inputs))
 
     def stop_loop() -> None:
         loop.stop()

@@ -598,12 +598,12 @@ def test_memoized_core_matches_unmemoized(monkeypatch: pytest.MonkeyPatch) -> No
     # Target the module objects via sys.modules — the greeks.forwards package re-exports the `carry`
     # function, which shadows the `carry` submodule under attribute/importlib resolution.
     import greeks.forwards.carry  # noqa: F401 — ensure the submodule is in sys.modules
-    import greeks.history         # noqa: F401
     import greeks.solver.time     # noqa: F401
+    import greeks.trades          # noqa: F401 — price_trade_rows calls parse_occ here now
     from greeks.forwards.carry import ex_date_instant_utc
     from greeks.occ import parse_occ
     from greeks.solver.time import expiry_instant_utc
-    monkeypatch.setattr(sys.modules["greeks.history"], "parse_occ", parse_occ.__wrapped__)
+    monkeypatch.setattr(sys.modules["greeks.trades"], "parse_occ", parse_occ.__wrapped__)
     monkeypatch.setattr(sys.modules["greeks.solver.time"], "expiry_instant_utc", expiry_instant_utc.__wrapped__)
     monkeypatch.setattr(sys.modules["greeks.forwards.carry"], "ex_date_instant_utc", ex_date_instant_utc.__wrapped__)
     unmemoized = price()
@@ -632,9 +632,9 @@ def test_memoized_core_matches_unmemoized(monkeypatch: pytest.MonkeyPatch) -> No
 def test_price_rows_matches_price_option_per_row() -> None:
     # price_rows must give the same greeks columns as price_option (the scalar core) called per row —
     # successes, a non-standard OSI, an absent spot, an expiry before the session, and a below-intrinsic.
-    from greeks.history import _as_utc
     from greeks.occ import parse_occ
     from greeks.pricing import price_option
+    from greeks.trades import _as_utc
 
     inputs = _inputs({"NVDA": (Dividend("NVDA", 0.25, date(2026, 11, 5)),)})
     rows = [
@@ -680,11 +680,15 @@ def test_price_rows_matches_price_option_per_row() -> None:
 
 
 def test_history_module_imports_no_pricing_logic() -> None:
-    # Static source grep (not a runtime check): greeks/history/ must not import the pricing-logic
-    # symbols — they live in greeks.pricing (the one core), which history calls via price_options.
+    # Static source grep (not a runtime check): greeks/history/ may import only greeks.trades (the
+    # trade-basis facade over the core) — plus greeks.occ / greeks.domain if it still needs them — and
+    # nothing that prices. Importing greeks.pricing, carry, invert(_batch), greeks(_batch), or
+    # price_options / OptionInput / PricedGreeks directly is a second pricing path and fails here.
     import greeks.history as gh
-    forbidden_names = {"carry", "invert", "invert_batch", "greeks", "greeks_batch"}
-    forbidden_modules = {"greeks.forwards.carry", "greeks.solver.invert", "greeks.solver.black76"}
+    forbidden_names = {"carry", "invert", "invert_batch", "greeks", "greeks_batch",
+                       "price_option", "price_options", "OptionInput", "PricedGreeks"}
+    forbidden_modules = {"greeks.pricing", "greeks.forwards.carry",
+                         "greeks.solver.invert", "greeks.solver.black76"}
     hist = Path(gh.__file__).resolve().parent
     offenders: List[str] = []
     for py in sorted(hist.rglob("*.py")):

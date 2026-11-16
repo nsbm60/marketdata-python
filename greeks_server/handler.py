@@ -50,12 +50,13 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Mapping, Optional, Union
 from zoneinfo import ZoneInfo
 
 from greeks.config import GreeksConfig
 from greeks.domain import FailureReason, RowStatus
+from greeks.trades import BASIS_TRADE, TradeRow, price_trade_rows
 from greeks_server.calendar import SessionCache
 from greeks_server.compute import Contract, Methodology, price_current
 from greeks_server.inputs import InputsHolder
@@ -67,6 +68,7 @@ log = logging.getLogger(__name__)
 
 OP = "compute_greeks"
 OP_GET = "get_greeks"
+OP_TRADES = "price_trades"
 ET = ZoneInfo("America/New_York")
 _CONTRACT_FIELDS = ("osi", "opt_quote", "opt_trade", "und_quote", "und_trade")
 _QUOTE_FIELDS = ("bid", "ask", "quote_ts")
@@ -270,5 +272,82 @@ def make_get_handler(
         if as_of is not None:
             reply["priced_as_of"] = as_of
         return reply
+
+    return handle
+
+
+# ── price_trades: trade-basis greeks for a batch, the Scala archive's insert-time path ────────────
+
+_TRADE_PRICE_FIELDS = ("osi", "price", "spot", "trade_ts")
+
+
+def _spot_or_null(where: str, v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    return _finite(where, v)
+
+
+def parse_trades_request(payload: Mapping[str, Any]) -> tuple[date, list[TradeRow]]:
+    """Validate the whole price_trades request at the edge; a bad field names itself and its index and
+    rejects the request. A non-standard OSI, a null spot and any solver reason are NOT request errors —
+    the core returns those as per-row failures."""
+    sd = payload.get("session_date")
+    if not isinstance(sd, str):
+        raise ValueError(f"'session_date' must be a string YYYY-MM-DD, got {sd!r}")
+    try:
+        session_date = date.fromisoformat(sd)
+    except ValueError:
+        raise ValueError(f"'session_date' must be YYYY-MM-DD, got {sd!r}")
+    trades = payload.get("trades")
+    if not isinstance(trades, list):
+        raise ValueError("'trades' must be a list")
+    out: list[TradeRow] = []
+    for i, item in enumerate(trades):
+        if not isinstance(item, dict):
+            raise ValueError(f"trades[{i}] must be an object")
+        _known(f"trades[{i}]", item, _TRADE_PRICE_FIELDS)
+        osi = item["osi"]
+        if not isinstance(osi, str):
+            raise ValueError(f"trades[{i}].osi must be a string, got {osi!r}")
+        price = _finite(f"trades[{i}].price", item["price"])
+        spot = _spot_or_null(f"trades[{i}].spot", item["spot"])
+        ts_ms = _ts(f"trades[{i}].trade_ts", item["trade_ts"])
+        as_of = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        out.append(TradeRow(osi=osi, price=price, spot=spot, as_of=as_of))
+    return session_date, out
+
+
+def _trade_result(col: Mapping[str, Any]) -> dict[str, Any]:
+    """One wire result from a greeks-column dict — methodology/basis/computed_at are top-level, so a
+    result carries only status/reason and the per-row greeks (unprefixed on the wire)."""
+    return {
+        "status": col["greeks_status"], "reason": col["greeks_reason"],
+        "forward": col["greeks_forward"], "discount": col["greeks_discount"], "tte": col["greeks_tte"],
+        "iv": col["iv"], "delta": col["delta"], "gamma": col["gamma"],
+        "theta": col["theta"], "vega": col["vega"], "rho": col["rho"],
+    }
+
+
+def make_trades_handler(cfg: GreeksConfig,
+                        inputs: InputsHolder) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    """price_trades: pure, trade-basis. Prices each (osi, price, spot, trade_ts) for session_date
+    through the SAME core greeks.history uses (greeks.trades.price_trade_rows), off the day's inputs
+    from the holder. If those inputs can't be loaded the request fails with the loader's error — it
+    never returns empty greeks. No book, no publish; DEBUG only, no per-request INFO."""
+    mv = cfg.methodology_version
+    t_floor = float(cfg.t_floor_minutes)
+    expiry_time_et = cfg.expiry_time_et
+
+    def handle(payload: Mapping[str, Any]) -> dict[str, Any]:
+        session_date, trades = parse_trades_request(payload)  # validate before any work
+        day_inputs = inputs.for_date(session_date)            # raises if SOFR/T-bill/ClickHouse is down
+        now = datetime.now(timezone.utc)
+        cols, _reasons = price_trade_rows(
+            trades, day_inputs, session_date=session_date, methodology_version=mv,
+            t_floor_minutes=t_floor, expiry_time_et=expiry_time_et, now=now)
+        return {
+            "methodology": mv, "basis": BASIS_TRADE, "computed_at": int(now.timestamp() * 1000),
+            "results": [_trade_result(c) for c in cols],
+        }
 
     return handle

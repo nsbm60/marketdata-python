@@ -16,15 +16,12 @@ processes (one (day, underlying) each) — no asyncio/threading under greeks/.
 from __future__ import annotations
 
 import logging
-import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
+from datetime import date, datetime
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from greeks.domain import Dividend, FailureReason, RowStatus
-from greeks.occ import parse_occ
-from greeks.pricing import OptionInput, PricedGreeks, price_options
+from greeks.trades import GREEKS_COLUMNS, Inputs, TradeRow, price_trade_rows
 
 log = logging.getLogger(__name__)
 
@@ -39,14 +36,8 @@ COLUMNS_NON_GREEKS: Tuple[str, ...] = (
     "spot_at_trade", "spot_trade_ts", "quote_ts", "bid", "ask", "bid_size", "ask_size",
     "quote_lag_ms", "source",
 )
-COLUMNS_GREEKS: Tuple[str, ...] = (
-    "greeks_methodology", "greeks_basis", "greeks_status", "greeks_reason",
-    "greeks_forward", "greeks_discount", "greeks_tte", "iv", "delta", "gamma", "theta", "vega", "rho",
-    "greeks_computed_at",
-)
+COLUMNS_GREEKS: Tuple[str, ...] = GREEKS_COLUMNS  # the greeks columns the core fills
 COLUMNS: Tuple[str, ...] = COLUMNS_NON_GREEKS + COLUMNS_GREEKS
-
-BASIS_TRADE = "trade"
 
 
 def dataset_for(methodology_version: str) -> str:
@@ -55,89 +46,27 @@ def dataset_for(methodology_version: str) -> str:
 
 # ── pricing one (day, underlying)'s rows ─────────────────────────────────────────────────────────
 
-# The per-day inputs this job needs: the SOFR→rate lookup and the dividends for an underlying. Live
-# code's SessionInputs satisfies this structurally (its rate_for / dividends_for), so the pure pricer
-# stays independent of greeks_server/ — only the production wiring loads a concrete SessionInputs.
-class Inputs(Protocol):
-    def rate_for(self, expiry: date) -> float: ...
-    def dividends_for(self, underlying: str) -> Sequence[Dividend]: ...
-
-
-def _as_utc(ts: datetime) -> datetime:
-    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
-
-
-# The greeks columns as a single dict literal (faster than a comprehension over COLUMNS_GREEKS then
-# overwrites). Both builders produce exactly the COLUMNS_GREEKS key set.
-def _priced_cols(p: PricedGreeks, methodology_version: str, now: datetime) -> Dict[str, Any]:
-    return {
-        "greeks_methodology": methodology_version, "greeks_basis": BASIS_TRADE,
-        "greeks_computed_at": now,
-        "greeks_status": p.status.value,
-        "greeks_reason": None if p.reason is None else p.reason.value,
-        "greeks_forward": p.forward, "greeks_discount": p.discount, "greeks_tte": p.tte,
-        "iv": p.iv, "delta": p.delta, "gamma": p.gamma, "theta": p.theta, "vega": p.vega, "rho": p.rho,
-    }
-
-
-def _failed_cols(reason: FailureReason, methodology_version: str, now: datetime) -> Dict[str, Any]:
-    return {
-        "greeks_methodology": methodology_version, "greeks_basis": BASIS_TRADE,
-        "greeks_computed_at": now,
-        "greeks_status": RowStatus.FAILURE.value, "greeks_reason": reason.value,
-        "greeks_forward": None, "greeks_discount": None, "greeks_tte": None,
-        "iv": None, "delta": None, "gamma": None, "theta": None, "vega": None, "rho": None,
-    }
-
-
 def price_rows(rows: Sequence[Row], inputs: Inputs, *, methodology_version: str, t_floor_minutes: float,
                expiry_time_et: str, now: datetime) -> Tuple[List[Row], "Counter[str]"]:
     """Every row with its greeks columns filled: non-greeks columns copied EXACTLY (overlaying the
     disjoint greeks columns), and a count of failures by reason. Pure.
 
-    Only the history-specific work is here — parse the OSI (non-standard → NONSTANDARD_CONTRACT), check
-    spot_at_trade (absent → MISSING_SPOT), build the per-option inputs, then hand the whole chunk to the
-    shared core's ``price_options`` for one batch solve, and map each PricedGreeks into the columns.
-    There is no pricing logic in this module."""
-    out: List[Optional[Row]] = [None] * len(rows)
-    reasons: "Counter[str]" = Counter()
-
-    opt_inputs: List[OptionInput] = []
-    staged: List[int] = []
-    session_date: Optional[date] = None  # the pair's session date, shared across the chunk
-
-    for i, row in enumerate(rows):
-        try:
-            c = parse_occ(row["symbol"])  # memoized
-        except ValueError:
-            out[i] = {**row, **_failed_cols(FailureReason.NONSTANDARD_CONTRACT, methodology_version, now)}
-            reasons[FailureReason.NONSTANDARD_CONTRACT.value] += 1
-            continue
-        spot = row["spot_at_trade"]
-        if spot is None:
-            out[i] = {**row, **_failed_cols(FailureReason.MISSING_SPOT, methodology_version, now)}
-            reasons[FailureReason.MISSING_SPOT.value] += 1
-            continue
-        session_date = row["session_date"]
-        opt_inputs.append(OptionInput(
-            expiry=c.expiry, right=c.right, strike=c.strike, price=float(row["price"]),
-            spot=float(spot), as_of=_as_utc(row["trade_ts"]),
-            rate_for=inputs.rate_for, dividends=inputs.dividends_for(c.root)))
-        staged.append(i)
-
-    if opt_inputs:
-        assert session_date is not None
-        priced = price_options(opt_inputs, session_date=session_date,
-                               methodology_version=methodology_version,
-                               t_floor_minutes=t_floor_minutes, expiry_time_et=expiry_time_et)
-        for j, i in enumerate(staged):
-            p = priced[j]
-            out[i] = {**rows[i], **_priced_cols(p, methodology_version, now)}
-            if p.status is RowStatus.FAILURE:
-                assert p.reason is not None
-                reasons[p.reason.value] += 1
-
-    return [r for r in out if r is not None], reasons
+    All pricing lives in the shared core: this builds a TradeRow per option_trade row (symbol, price,
+    spot_at_trade, trade_ts), calls greeks.trades.price_trade_rows for the whole chunk, and overlays
+    the greeks columns it returns onto each row. There is no pricing logic in greeks/history/."""
+    if not rows:
+        return [], Counter()
+    trades = [
+        TradeRow(osi=row["symbol"], price=float(row["price"]),
+                 spot=None if row["spot_at_trade"] is None else float(row["spot_at_trade"]),
+                 as_of=row["trade_ts"])
+        for row in rows
+    ]
+    cols, reasons = price_trade_rows(
+        trades, inputs, session_date=rows[0]["session_date"],
+        methodology_version=methodology_version, t_floor_minutes=t_floor_minutes,
+        expiry_time_et=expiry_time_et, now=now)
+    return [{**row, **col} for row, col in zip(rows, cols)], reasons
 
 
 # ── orchestration ────────────────────────────────────────────────────────────────────────────────
