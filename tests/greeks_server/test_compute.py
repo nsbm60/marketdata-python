@@ -105,7 +105,9 @@ def test_expired_contract() -> None:
 def test_unexpected_error_is_one_contracts_solver_failed() -> None:
     bad_div = {"NVDA": (Dividend("NVDA", -1.0, date(2026, 11, 5)),)}  # carry() raises
     px = SelectedPrice(9.0, PriceKind.MID, NOW_MS)
-    with pytest.raises(ValueError):
-        compute(C, px, SPOT, inputs(bad_div), NOW, M)
-    msg = compute_or_fail(C, px, SPOT, inputs(bad_div), NOW, M)
+    # The shared core (price_options) isolates a carry exception to that one option as SOLVER_FAILED,
+    # so compute no longer raises — it returns the failure directly; compute_or_fail agrees.
+    msg = compute(C, px, SPOT, inputs(bad_div), NOW, M)
     assert msg.reason is FailureReason.SOLVER_FAILED and msg.price == 9.0
+    msg2 = compute_or_fail(C, px, SPOT, inputs(bad_div), NOW, M)
+    assert msg2.reason is FailureReason.SOLVER_FAILED and msg2.price == 9.0

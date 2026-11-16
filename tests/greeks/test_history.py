@@ -625,3 +625,78 @@ def test_memoized_core_matches_unmemoized(monkeypatch: pytest.MonkeyPatch) -> No
     assert ("success", None) in seen
     assert {("failure", r) for r in
             ("nonstandard_contract", "missing_spot", "t_below_floor", "below_intrinsic")} <= seen
+
+
+# ── price_rows pins to the scalar core, and history holds no pricing logic ─────────────────────────
+
+def test_price_rows_matches_price_option_per_row() -> None:
+    # price_rows must give the same greeks columns as price_option (the scalar core) called per row —
+    # successes, a non-standard OSI, an absent spot, an expiry before the session, and a below-intrinsic.
+    from greeks.history import _as_utc
+    from greeks.occ import parse_occ
+    from greeks.pricing import price_option
+
+    inputs = _inputs({"NVDA": (Dividend("NVDA", 0.25, date(2026, 11, 5)),)})
+    rows = [
+        _row("NVDA261120C00180000", price=9.1, spot=181.0),
+        _row("NVDA261120P00180000", price=8.0, spot=181.0),
+        _row("AAPL261218C00230000", price=7.5, spot=232.0, underlying="AAPL"),
+        _row("B1VDA261120C00180000", price=9.1, spot=181.0),   # non-standard OSI
+        _row("NVDA261120C00180000", price=9.1, spot=None),     # missing spot
+        _row("NVDA260101C00180000", price=9.1, spot=181.0),    # expired -> t_below_floor
+        _row("NVDA261120C00100000", price=1.0, spot=181.0),    # below intrinsic
+    ]
+    keys = ("greeks_status", "greeks_reason", "iv", "delta", "gamma", "theta", "vega", "rho",
+            "greeks_forward", "greeks_discount", "greeks_tte")
+
+    def ref(row: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {k: None for k in keys}
+        try:
+            c = parse_occ(row["symbol"])
+        except ValueError:
+            out["greeks_status"], out["greeks_reason"] = "failure", "nonstandard_contract"
+            return out
+        spot = row["spot_at_trade"]
+        if spot is None:
+            out["greeks_status"], out["greeks_reason"] = "failure", "missing_spot"
+            return out
+        p = price_option(expiry=c.expiry, right=c.right, strike=c.strike, price=float(row["price"]),
+                         spot=float(spot), as_of=_as_utc(row["trade_ts"]), session_date=row["session_date"],
+                         rate_for=inputs.rate_for, dividends=inputs.dividends_for(c.root),
+                         methodology_version=MV, t_floor_minutes=TFLOOR, expiry_time_et=ETIME)
+        out["greeks_status"] = p.status.value
+        out["greeks_reason"] = None if p.reason is None else p.reason.value
+        out["greeks_forward"], out["greeks_discount"], out["greeks_tte"] = p.forward, p.discount, p.tte
+        out["iv"], out["delta"], out["gamma"] = p.iv, p.delta, p.gamma
+        out["theta"], out["vega"], out["rho"] = p.theta, p.vega, p.rho
+        return out
+
+    priced, _ = price_rows(rows, inputs, methodology_version=MV, t_floor_minutes=TFLOOR,
+                           expiry_time_et=ETIME, now=NOW)
+    for pr, row in zip(priced, rows):
+        r = ref(row)
+        for k in keys:
+            assert pr[k] == r[k], (k, pr[k], r[k])
+
+
+def test_history_module_imports_no_pricing_logic() -> None:
+    # Static source grep (not a runtime check): greeks/history/ must not import the pricing-logic
+    # symbols — they live in greeks.pricing (the one core), which history calls via price_options.
+    import greeks.history as gh
+    forbidden_names = {"carry", "invert", "invert_batch", "greeks", "greeks_batch"}
+    forbidden_modules = {"greeks.forwards.carry", "greeks.solver.invert", "greeks.solver.black76"}
+    hist = Path(gh.__file__).resolve().parent
+    offenders: List[str] = []
+    for py in sorted(hist.rglob("*.py")):
+        for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            s = line.strip()
+            mf = re.match(r"from\s+([\w.]+)\s+import\s+(.+)", s)
+            if mf:
+                names = {re.split(r"\s+as\s+", n.strip().strip("()"))[0].strip()
+                         for n in mf.group(2).split(",")}
+                if mf.group(1) in forbidden_modules or (names & forbidden_names):
+                    offenders.append(f"{py.name}:{lineno}: {s}")
+            mi = re.match(r"import\s+([\w.]+)", s)
+            if mi and (mi.group(1) in forbidden_modules or mi.group(1).split(".")[-1] in forbidden_names):
+                offenders.append(f"{py.name}:{lineno}: {s}")
+    assert not offenders, "greeks/history/ imports pricing logic:\n" + "\n".join(offenders)

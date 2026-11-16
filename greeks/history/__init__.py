@@ -1,8 +1,9 @@
 """Historical greeks on every option_trade row (trade basis), written back into option_trade.
 
-Every row's IV + greeks come from the ONE shared core (greeks.pricing.price_option): the trade price
+Every row's IV + greeks come from the ONE shared core (greeks.pricing.price_options): the trade price
 inverted at trade_ts against spot_at_trade (the respot corrected it). Live greeks price the same way
-off a quote mid — only the basis differs, recorded per row (greeks_basis='trade' here).
+off a quote mid — only the basis differs, recorded per row (greeks_basis='trade' here). This module
+has no pricing logic of its own; it parses the OSI, checks spot, and hands the chunk to the core.
 
 The rewrite follows RespotJob, per (day, underlying): read the day's rows (FINAL), load the day's
 inputs once, price, re-insert the FULL rows with the greeks columns filled and a fresh ingested_at
@@ -21,14 +22,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
-import numpy as np
-
-from greeks.domain import Dividend, FailureReason, OptionRight, RowStatus
-from greeks.forwards.carry import carry
+from greeks.domain import Dividend, FailureReason, RowStatus
 from greeks.occ import parse_occ
-from greeks.pricing import price_option
-from greeks.solver.black76 import greeks_batch
-from greeks.solver.invert import invert_batch
+from greeks.pricing import OptionInput, PricedGreeks, price_options
 
 log = logging.getLogger(__name__)
 
@@ -71,49 +67,27 @@ def _as_utc(ts: datetime) -> datetime:
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
-def _blank_greeks(methodology_version: str, now: datetime) -> Dict[str, Any]:
-    g: Dict[str, Any] = {c: None for c in COLUMNS_GREEKS}
-    g["greeks_methodology"] = methodology_version
-    g["greeks_basis"] = BASIS_TRADE
-    g["greeks_computed_at"] = now
-    return g
+# The greeks columns as a single dict literal (faster than a comprehension over COLUMNS_GREEKS then
+# overwrites). Both builders produce exactly the COLUMNS_GREEKS key set.
+def _priced_cols(p: PricedGreeks, methodology_version: str, now: datetime) -> Dict[str, Any]:
+    return {
+        "greeks_methodology": methodology_version, "greeks_basis": BASIS_TRADE,
+        "greeks_computed_at": now,
+        "greeks_status": p.status.value,
+        "greeks_reason": None if p.reason is None else p.reason.value,
+        "greeks_forward": p.forward, "greeks_discount": p.discount, "greeks_tte": p.tte,
+        "iv": p.iv, "delta": p.delta, "gamma": p.gamma, "theta": p.theta, "vega": p.vega, "rho": p.rho,
+    }
 
 
-def _fail_greeks(g: Dict[str, Any], reason: FailureReason) -> Dict[str, Any]:
-    g["greeks_status"] = RowStatus.FAILURE.value
-    g["greeks_reason"] = reason.value
-    return g
-
-
-def _greeks_for(row: Row, inputs: Inputs, methodology_version: str, t_floor_minutes: float,
-                expiry_time_et: str, now: datetime) -> Dict[str, Any]:
-    """Scalar reference: one trade row priced through the shared core (greeks.pricing.price_option).
-    The batch ``price_rows`` must match this row for row (pinned by a test). A non-standard OSI, an
-    absent spot, or a solver reason is a failure with the greeks left None — nothing defaulted."""
-    g = _blank_greeks(methodology_version, now)
-    try:
-        c = parse_occ(row["symbol"])
-    except ValueError:
-        return _fail_greeks(g, FailureReason.NONSTANDARD_CONTRACT)
-    spot = row["spot_at_trade"]
-    if spot is None:
-        return _fail_greeks(g, FailureReason.MISSING_SPOT)
-    try:
-        p = price_option(
-            expiry=c.expiry, right=c.right, strike=c.strike, price=float(row["price"]),
-            spot=float(spot), as_of=_as_utc(row["trade_ts"]), session_date=row["session_date"],
-            rate_for=inputs.rate_for, dividends=inputs.dividends_for(c.root),
-            methodology_version=methodology_version, t_floor_minutes=t_floor_minutes,
-            expiry_time_et=expiry_time_et)
-    except Exception as e:  # noqa: BLE001 — per-row isolation, like compute_or_fail
-        log.debug("[greeks] %s: price_option raised %s: %s — solver_failed", row["symbol"], type(e).__name__, e)
-        return _fail_greeks(g, FailureReason.SOLVER_FAILED)
-    g["greeks_status"] = p.status.value
-    g["greeks_reason"] = None if p.reason is None else p.reason.value
-    g["greeks_forward"], g["greeks_discount"], g["greeks_tte"] = p.forward, p.discount, p.tte
-    g["iv"], g["delta"], g["gamma"] = p.iv, p.delta, p.gamma
-    g["theta"], g["vega"], g["rho"] = p.theta, p.vega, p.rho
-    return g
+def _failed_cols(reason: FailureReason, methodology_version: str, now: datetime) -> Dict[str, Any]:
+    return {
+        "greeks_methodology": methodology_version, "greeks_basis": BASIS_TRADE,
+        "greeks_computed_at": now,
+        "greeks_status": RowStatus.FAILURE.value, "greeks_reason": reason.value,
+        "greeks_forward": None, "greeks_discount": None, "greeks_tte": None,
+        "iv": None, "delta": None, "gamma": None, "theta": None, "vega": None, "rho": None,
+    }
 
 
 def price_rows(rows: Sequence[Row], inputs: Inputs, *, methodology_version: str, t_floor_minutes: float,
@@ -121,84 +95,47 @@ def price_rows(rows: Sequence[Row], inputs: Inputs, *, methodology_version: str,
     """Every row with its greeks columns filled: non-greeks columns copied EXACTLY (overlaying the
     disjoint greeks columns), and a count of failures by reason. Pure.
 
-    One pass does the per-row carry through the shared carry (its instants memoized by the previous
-    set); the trade-price inversion and the greeks then run as a single batch over the whole chunk —
-    one native IV call and one vectorized greeks pass — through the same core as the live server's
-    scalar path. Results are identical to _greeks_for row for row."""
+    Only the history-specific work is here — parse the OSI (non-standard → NONSTANDARD_CONTRACT), check
+    spot_at_trade (absent → MISSING_SPOT), build the per-option inputs, then hand the whole chunk to the
+    shared core's ``price_options`` for one batch solve, and map each PricedGreeks into the columns.
+    There is no pricing logic in this module."""
     out: List[Optional[Row]] = [None] * len(rows)
     reasons: "Counter[str]" = Counter()
 
-    # Rows that reach the solver, staged into parallel arrays for one batch call.
-    prices: List[float] = []
-    strikes: List[float] = []
-    calls: List[bool] = []
-    forwards: List[float] = []
-    discounts: List[float] = []
-    ttes: List[float] = []
-    spots: List[float] = []
+    opt_inputs: List[OptionInput] = []
     staged: List[int] = []
+    session_date: Optional[date] = None  # the pair's session date, shared across the chunk
 
     for i, row in enumerate(rows):
-        g = _blank_greeks(methodology_version, now)
         try:
             c = parse_occ(row["symbol"])  # memoized
         except ValueError:
-            out[i] = {**row, **_fail_greeks(g, FailureReason.NONSTANDARD_CONTRACT)}
+            out[i] = {**row, **_failed_cols(FailureReason.NONSTANDARD_CONTRACT, methodology_version, now)}
             reasons[FailureReason.NONSTANDARD_CONTRACT.value] += 1
             continue
         spot = row["spot_at_trade"]
         if spot is None:
-            out[i] = {**row, **_fail_greeks(g, FailureReason.MISSING_SPOT)}
+            out[i] = {**row, **_failed_cols(FailureReason.MISSING_SPOT, methodology_version, now)}
             reasons[FailureReason.MISSING_SPOT.value] += 1
             continue
-        if c.expiry < row["session_date"]:  # expired before the session: no carry, like price_option
-            out[i] = {**row, **_fail_greeks(g, FailureReason.T_BELOW_FLOOR)}
-            reasons[FailureReason.T_BELOW_FLOOR.value] += 1
-            continue
-        try:
-            cr = carry(float(spot), inputs.rate_for(c.expiry), _as_utc(row["trade_ts"]), c.expiry,
-                       inputs.dividends_for(c.root), expiry_time_et=expiry_time_et)
-        except Exception as e:  # noqa: BLE001 — per-row isolation, like compute_or_fail
-            log.debug("[greeks] %s: carry raised %s: %s — solver_failed", row["symbol"], type(e).__name__, e)
-            out[i] = {**row, **_fail_greeks(g, FailureReason.SOLVER_FAILED)}
-            reasons[FailureReason.SOLVER_FAILED.value] += 1
-            continue
-        prices.append(float(row["price"]))
-        strikes.append(c.strike)
-        calls.append(c.right is OptionRight.CALL)
-        forwards.append(cr.forward)
-        discounts.append(cr.discount)
-        ttes.append(cr.time_to_expiry)
-        spots.append(float(spot))
+        session_date = row["session_date"]
+        opt_inputs.append(OptionInput(
+            expiry=c.expiry, right=c.right, strike=c.strike, price=float(row["price"]),
+            spot=float(spot), as_of=_as_utc(row["trade_ts"]),
+            rate_for=inputs.rate_for, dividends=inputs.dividends_for(c.root)))
         staged.append(i)
 
-    if staged:
-        price = np.array(prices, dtype=np.float64)
-        strike = np.array(strikes, dtype=np.float64)
-        is_call = np.array(calls, dtype=bool)
-        fwd = np.array(forwards, dtype=np.float64)
-        disc = np.array(discounts, dtype=np.float64)
-        tte = np.array(ttes, dtype=np.float64)
-        spot_arr = np.array(spots, dtype=np.float64)
-        iv, status, reason = invert_batch(
-            price, strike, is_call, fwd, disc, tte,
-            methodology_version=methodology_version, t_floor_minutes=t_floor_minutes)
-        # greeks for every staged row at its IV (failed rows get a dummy sigma; their greeks are unused).
-        sigma = np.where(np.isfinite(iv) & (iv > 0), iv, 1.0)
-        bg = greeks_batch(fwd, strike, tte, disc, sigma, is_call, spot_arr)
+    if opt_inputs:
+        assert session_date is not None
+        priced = price_options(opt_inputs, session_date=session_date,
+                               methodology_version=methodology_version,
+                               t_floor_minutes=t_floor_minutes, expiry_time_et=expiry_time_et)
         for j, i in enumerate(staged):
-            g = _blank_greeks(methodology_version, now)
-            g["greeks_forward"], g["greeks_discount"], g["greeks_tte"] = forwards[j], discounts[j], ttes[j]
-            if status[j] is RowStatus.SUCCESS:
-                g["greeks_status"] = RowStatus.SUCCESS.value
-                g["iv"] = float(iv[j])
-                g["delta"], g["gamma"] = float(bg.delta[j]), float(bg.gamma[j])
-                g["theta"], g["vega"], g["rho"] = float(bg.theta[j]), float(bg.vega[j]), float(bg.rho[j])
-            else:
-                g["greeks_status"] = RowStatus.FAILURE.value
-                g["greeks_reason"] = reason[j].value
-                reasons[reason[j].value] += 1
-            out[i] = {**rows[i], **g}
+            p = priced[j]
+            out[i] = {**rows[i], **_priced_cols(p, methodology_version, now)}
+            if p.status is RowStatus.FAILURE:
+                assert p.reason is not None
+                reasons[p.reason.value] += 1
 
     return [r for r in out if r is not None], reasons
 
