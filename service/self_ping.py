@@ -15,7 +15,14 @@ import threading
 import zmq
 
 from control_client import ControlSocket, ControlTimeout
-from service.constants import PING_JSON, PONG_JSON, SELF_PING_INTERVAL_SEC, SELF_PING_MAX_MISSED, SELF_PING_TIMEOUT_MS
+from service.constants import (
+    OP_FIELD,
+    OP_PONG,
+    PING_JSON,
+    SELF_PING_INTERVAL_SEC,
+    SELF_PING_MAX_MISSED,
+    SELF_PING_TIMEOUT_MS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -93,13 +100,17 @@ class SelfPingMonitor:
                     consecutive_missed = 0
 
     def _ping(self) -> bool:
-        """Send a ping to our own ROUTER, return True if pong received.
+        """Send a ping to our own ROUTER, return True if a pong came back.
 
-        No drain: the pong carries the id of the ping it answers, so a stale one
-        cannot be mistaken for this cycle's and mask a current failure.
+        Match on the op field only, not the whole reply: the pong now also carries this process's
+        instance id, so a full-string equality check against a bare pong would always fail.
+
+        No drain: the pong carries the id of the ping it answers, so a stale one cannot be mistaken
+        for this cycle's and mask a current failure.
         """
         try:
-            return self._dealer.request(json.loads(PING_JSON)) == json.loads(PONG_JSON)
+            reply = self._dealer.request(json.loads(PING_JSON))
+            return isinstance(reply, dict) and reply.get(OP_FIELD) == OP_PONG
         except ControlTimeout:
             return False
         except Exception as e:

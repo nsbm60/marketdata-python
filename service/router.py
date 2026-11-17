@@ -29,7 +29,7 @@ from service.constants import (
     OK_FIELD,
     DATA_FIELD,
     ERROR_FIELD,
-    PONG_JSON,
+    PONG_WITH_INSTANCE,
 )
 
 log = logging.getLogger(__name__)
@@ -130,7 +130,8 @@ class Router:
         identity, rid, payload_str, recv_gen = recvd
         if _is_ping(payload_str):
             # Answered on the main thread so a full worker pool can never delay a liveness ping.
-            self._send(identity, rid, recv_gen, PONG_JSON)
+            # The pong carries this process's instance id so a client dealer can detect a restart.
+            self._send(identity, rid, recv_gen, PONG_WITH_INSTANCE)
         else:
             assert self._pool is not None
             self._pool.submit(self._run_op, identity, rid, recv_gen, payload_str)
@@ -195,7 +196,7 @@ class Router:
 
         op = payload.get(OP_FIELD, "")
         if op == OP_PING:
-            return PONG_JSON
+            return PONG_WITH_INSTANCE
 
         if not op or not op.strip():
             truncated = payload_str[:_MAX_PAYLOAD_IN_ERROR]
