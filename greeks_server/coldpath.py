@@ -8,9 +8,10 @@ whatever it is asked for, as of whatever time the caller gave, using the reply's
 
 From the one reply:
 
-  - an option is *current* if it is in ``quotes`` (MDS only returns two-sided quotes there) and its
-    ``quote_ts`` is at or after ``session_open_ts`` + 1 minute, using the ``session_open_ts`` the
-    reply carries. Otherwise the contract fails no_current_quote;
+  - an option is *current* if it is in ``quotes`` and its ``quote_ts`` is at or after
+    ``session_open_ts`` + 1 minute, using the ``session_open_ts`` the reply carries. MDS returns
+    every quote it has, of any shape; the server applies its own rule here (``current_option_mid`` /
+    ``quote_mid``, which require bid > 0). Otherwise the contract fails no_current_quote;
   - the spot is the underlying's quote mid from the same reply. An underlying that came back in
     ``missing`` fails its contracts with missing_spot;
   - every contract is priced (price_current) as of the reply's ``as_of`` — used only for time to
@@ -97,7 +98,7 @@ class ColdPath:
         results: list[ColdResult] = []
         for osi in osis:
             c = contracts[osi]
-            opt_q = quotes.get(osi)            # two-sided or absent; current_option_mid gates on session_open
+            opt_q = quotes.get(osi)            # a quote of any shape, or absent; current_option_mid applies bid>0 + session_open
             und_q = quotes.get(c.underlying)   # the spot: absent (in `missing`) -> missing_spot
             results.append(ColdResult(osi, opt_q, price_current(c, opt_q, und_q, as_of, session_open_ms, inputs, self._m)))
 
@@ -120,7 +121,7 @@ class ColdPath:
     # ── MDS call ─────────────────────────────────────────────────────────────────────────────────
 
     def _get_quotes(self, symbols: list[str], at: At) -> tuple[dict[str, Quote], Optional[int], int]:
-        """One get_quotes call. Returns (per-symbol two-sided quote, session_open_ts, as_of). The
+        """One get_quotes call. Returns (per-symbol quote of any shape, session_open_ts, as_of). The
         ``at`` is passed through unchanged. session_open_ts is None when the reply omits it (no
         session can be placed -> every option is no_current_quote); as_of must be present and valid
         (a reply without it is malformed — never price as of 1970)."""
@@ -170,8 +171,9 @@ class ColdPath:
 
 
 def _quote_of(v: Any) -> Optional[Quote]:
-    """Parse a get_quotes entry {"bid","ask","bid_size","ask_size","quote_ts"} into a Quote. MDS only
-    puts two-sided quotes in `quotes`; quote_mid decides the mid."""
+    """Parse a get_quotes entry {"bid","ask","bid_size","ask_size","quote_ts"} into a Quote. MDS puts
+    every quote in `quotes`, of any shape; quote_mid applies the server's rule (bid > 0) and decides
+    the mid."""
     if not isinstance(v, dict):
         return None
     ts = v.get("quote_ts")
