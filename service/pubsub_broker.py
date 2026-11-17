@@ -485,6 +485,7 @@ class PubSubBroker:
                         if self._bus_stall_open:
                             log.info("pubsub broker: mds.heartbeat resumed")
                             self._bus_stall_open = False
+                            self._resolve_bus_stall()   # the condition cleared — resolve the open item(s)
                 except zmq.Again:
                     pass
                 except zmq.ZMQError:
@@ -541,6 +542,34 @@ class PubSubBroker:
             self._ch_unavailable = True
             log.warning("pubsub broker: could not raise bus_stall attention_item (%s); "
                         "is CLICKHOUSE_PASSWORD set for this unit?", exc)
+
+    def _resolve_bus_stall(self) -> None:
+        """Best-effort: the bus recovered, so resolve every OPEN bus_stall item (there may be more
+        than one, raised in different hour-subjects during a long outage). Preserves each item's
+        raised_at; a resolved item is never reopened. Non-fatal — must never crash the broker."""
+        try:
+            if self._ch is None:
+                if self._ch_unavailable:
+                    return
+                from ml.shared.clickhouse import get_ch_client  # lazy: needs CLICKHOUSE_PASSWORD
+                self._ch = get_ch_client()
+            rows = self._ch.query(
+                "SELECT item_id, symbol, detail, toUnixTimestamp64Milli(raised_at) "
+                "FROM trading.attention_item FINAL "
+                "WHERE kind='bus_stall' AND status='open'").result_rows
+            for item_id, symbol, detail, raised_ms in rows:
+                symv = "NULL" if symbol is None else f"'{str(symbol).replace(chr(39), chr(39) * 2)}'"
+                self._ch.command(
+                    "INSERT INTO trading.attention_item "
+                    "(item_id,kind,symbol,detail,raised_at,status,updated_at) "
+                    f"VALUES ('{item_id}','bus_stall',{symv},'{detail.replace(chr(39), chr(39) * 2)}', "
+                    f"fromUnixTimestamp64Milli({int(raised_ms)}),'resolved',now64(3))")
+            if rows:
+                log.info("pubsub broker: resolved %d open bus_stall attention_item(s) on recovery", len(rows))
+        except Exception as exc:  # noqa: BLE001 — instrumentation must never crash the broker
+            self._ch = None
+            self._ch_unavailable = True
+            log.warning("pubsub broker: could not resolve bus_stall attention_item (%s)", exc)
 
     def run(self) -> None:
         """Forward frames until TERMINATE. Blocks the calling thread."""
