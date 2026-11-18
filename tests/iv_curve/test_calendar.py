@@ -3,9 +3,48 @@ the Juneteenth ≥2022 gate, and trading_days_between."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time
 
-from ml.shared.calendar import is_trading_day, trading_days_between
+from ml.shared.calendar import is_early_close, is_trading_day, session_close_et, trading_days_between
+
+# Every NYSE early-close day 2016–2026, derived by hand from the rule (day after Thanksgiving; July 3
+# and Dec 24 when Mon–Thu). The same list the Scala USMarketCalendarSpec pins. Includes 2026-11-27
+# and 2026-12-24.
+_EARLY_CLOSE_DAYS = [
+    date.fromisoformat(s) for s in (
+        "2016-11-25",
+        "2017-07-03", "2017-11-24",
+        "2018-07-03", "2018-11-23", "2018-12-24",
+        "2019-07-03", "2019-11-29", "2019-12-24",
+        "2020-11-27", "2020-12-24",
+        "2021-11-26",
+        "2022-11-25",
+        "2023-07-03", "2023-11-24",
+        "2024-07-03", "2024-11-29", "2024-12-24",
+        "2025-07-03", "2025-11-28", "2025-12-24",
+        "2026-11-27", "2026-12-24",
+    )
+]
+
+
+def test_every_early_close_day_closes_at_1300() -> None:
+    for d in _EARLY_CLOSE_DAYS:
+        assert is_early_close(d), f"{d} should be an early close"
+        assert session_close_et(d) == time(13, 0), f"{d} close"
+
+
+def test_ordinary_days_close_at_1600_and_are_not_early_closes() -> None:
+    for s in ("2020-07-02", "2021-12-23", "2026-07-02", "2024-11-27", "2024-12-23"):
+        d = date.fromisoformat(s)
+        assert is_trading_day(d), f"{d} should be a trading day"
+        assert not is_early_close(d), f"{d} should not be an early close"
+        assert session_close_et(d) == time(16, 0), f"{d} close"
+
+
+def test_thanksgiving_day_itself_is_a_holiday_not_an_early_close() -> None:
+    thanksgiving2026 = date(2026, 11, 26)
+    assert not is_trading_day(thanksgiving2026)
+    assert not is_early_close(thanksgiving2026)
 
 
 def test_juneteenth_is_a_holiday_only_from_2022() -> None:

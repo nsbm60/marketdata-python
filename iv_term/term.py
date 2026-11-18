@@ -22,10 +22,12 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set, 
 
 from clickhouse_connect.driver.exceptions import OperationalError
 
+from ml.shared.calendar import EARLY_CLOSE_ET, REGULAR_CLOSE_ET, is_early_close
+
 from . import (
     DELTA_HIGH, DELTA_LOW, GREEKS_METHODOLOGY, IV_TERM_TABLE, LEDGER_DATASET, LEDGER_TABLE, METHOD,
     OPTION_TRADE_TABLE, STATUS_FIT_FAILED, STATUS_FIT_OUT_OF_RANGE, STATUS_OK, STATUS_ONE_SIDED,
-    STATUS_TOO_FEW_STRIKES, STATUS_TOO_FEW_TRADES, WINDOW_ET_HOUR,
+    STATUS_TOO_FEW_STRIKES, STATUS_TOO_FEW_TRADES, WINDOW_HOURS_BEFORE_CLOSE,
 )
 from .fit import SmileAgg, SmileFit, classify
 
@@ -82,14 +84,35 @@ def symbol_parse_exprs(col: str) -> Dict[str, str]:
     return {"expiry": expiry, "strike": strike, "right": right}
 
 
+def _window_hour_sql(start: dt.date, end: dt.date) -> str:
+    """The ET hour the trade window selects per session_date: close_hour - WINDOW_HOURS_BEFORE_CLOSE
+    (15 on a normal day, 12 on a NYSE early-close day). A plain `15` when [start, end] has no
+    early-close day, else `if(session_date IN (…), 12, 15)` over the shared calendar's early-close
+    days in the range."""
+    reg = REGULAR_CLOSE_ET.hour - WINDOW_HOURS_BEFORE_CLOSE
+    early = EARLY_CLOSE_ET.hour - WINDOW_HOURS_BEFORE_CLOSE
+    early_days: List[dt.date] = []
+    d = start
+    while d <= end:
+        if is_early_close(d):
+            early_days.append(d)
+        d += dt.timedelta(days=1)
+    if not early_days:
+        return str(reg)
+    in_list = ", ".join(f"toDate('{d.isoformat()}')" for d in early_days)
+    return f"if(session_date IN ({in_list}), {early}, {reg})"
+
+
 def _aggregate(ch: Any, start: dt.date, end: dt.date) -> List[Tuple[str, dt.date, dt.date, SmileAgg]]:
     """One aggregation over option_trade for session_date in [start, end]: the size-weighted moments
     and summary stats of each (underlying, session_date, expiry) group, over the qualifying rows.
 
     Qualifying row: v2 trade-basis greeks that succeeded; a standard OSI symbol (so the parse matches
-    parse_occ's domain); the 15:00–16:00 ET window (ET hour == 15, i.e. 15:00 inclusive to 16:00
-    exclusive); |delta| in the band; positive size; and a later expiry (same-day expiries excluded)."""
+    parse_occ's domain); the hour before that day's close (15:00–16:00 ET normally, 12:00–13:00 ET on
+    a NYSE early-close day); |delta| in the band; positive size; and a later expiry (same-day
+    expiries excluded)."""
     e = symbol_parse_exprs("symbol")
+    window = _window_hour_sql(start, end)
     sql = f"""
 WITH parsed AS (
     SELECT
@@ -107,7 +130,7 @@ WITH parsed AS (
       AND greeks_status = 'success'
       AND greeks_methodology = %(m)s
       AND match(symbol, '^[A-Z]{{1,6}}[0-9]{{6}}[CP][0-9]{{8}}$')
-      AND toHour(toTimezone(trade_ts, 'America/New_York')) = {WINDOW_ET_HOUR}
+      AND toHour(toTimezone(trade_ts, 'America/New_York')) = {window}
       AND abs(delta) BETWEEN %(dlo)s AND %(dhi)s
       AND size > 0
 )

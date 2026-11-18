@@ -8,14 +8,22 @@ Good Friday and the national-mourning special closures). Mirrors the Scala USMar
 Juneteenth became a NYSE market holiday only in 2022 (first observed on Monday 2022-06-20); it is a
 holiday only for years >= 2022. The data starts in 2016, so the earlier one-off closures (9/11 2001,
 Sandy 2012) are deliberately not represented.
+
+NYSE half days close at 13:00 ET (session_close_et / is_early_close): the day after Thanksgiving, and
+July 3 / December 24 when Mon–Thu.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 
 _MONDAY, _THURSDAY = 0, 3  # date.weekday(): Mon=0 … Sun=6
 _JUNETEENTH_FIRST_YEAR = 2022
+
+# NYSE regular-session close, and the early (13:00 ET) close on half days. Mirrors
+# USMarketCalendar.closeFor / isEarlyClose in the Scala repo.
+REGULAR_CLOSE_ET = time(16, 0)
+EARLY_CLOSE_ET = time(13, 0)
 
 # National days of mourning — full closures no recurring rule produces (from the Scala calendar).
 _SPECIAL_CLOSURES = frozenset({date(2018, 12, 5), date(2025, 1, 9)})
@@ -92,6 +100,25 @@ def is_trading_day(d: date) -> bool:
     """A US equity regular session trades on `d`: a weekday that is neither a special closure nor a
     recurring/observed market holiday for its year."""
     return d.weekday() < 5 and d not in _SPECIAL_CLOSURES and d not in _holiday_set(d.year)
+
+
+def is_early_close(d: date) -> bool:
+    """A NYSE early close (regular session ends 13:00 ET): the day after Thanksgiving, and July 3 /
+    December 24 when they fall Monday–Thursday (the Mon–Thu guard excludes the Fridays those dates
+    take when the adjacent holiday is observed on them). Only on a trading day. Mirrors
+    USMarketCalendar.isEarlyClose."""
+    if not is_trading_day(d):
+        return False
+    mon_thu = d.weekday() <= _THURSDAY  # Mon=0 … Thu=3
+    day_after_thanksgiving = d == _nth_weekday(d.year, 11, _THURSDAY, 4) + timedelta(days=1)
+    july3 = d.month == 7 and d.day == 3 and mon_thu
+    dec24 = d.month == 12 and d.day == 24 and mon_thu
+    return day_after_thanksgiving or july3 or dec24
+
+
+def session_close_et(d: date) -> time:
+    """The regular-session close for `d`: 13:00 ET on an early-close day, else 16:00 ET."""
+    return EARLY_CLOSE_ET if is_early_close(d) else REGULAR_CLOSE_ET
 
 
 def trading_days_between(start_exclusive: date, end_inclusive: date) -> int:
