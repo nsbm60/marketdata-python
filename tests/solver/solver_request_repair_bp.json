@@ -16,11 +16,12 @@
       "closeable_only": true,
       "delta_per_unit": 45.0,
       "theta_per_unit": 50.0,
-      "gamma_per_unit": 0.0,
+      "gamma_per_unit": -2.0,
       "margin_per_unit": 550.0,
       "premium_per_unit": 150.0,
       "exec_cost_per_unit": 0.0,
       "iv": 0.3,
+      "rv_forecast": 0.22,
       "days_to_expiry": 3.235,
       "strike": 100.0,
       "expiry": "2026-05-15"
@@ -34,11 +35,12 @@
       "closeable_only": true,
       "delta_per_unit": -45.0,
       "theta_per_unit": 50.0,
-      "gamma_per_unit": 0.0,
+      "gamma_per_unit": -2.0,
       "margin_per_unit": 550.0,
       "premium_per_unit": 150.0,
       "exec_cost_per_unit": 0.0,
       "iv": 0.3,
+      "rv_forecast": 0.22,
       "days_to_expiry": 3.235,
       "strike": 100.0,
       "expiry": "2026-05-15"
@@ -77,7 +79,8 @@
       "delta_target_pct": 0.0,
       "delta_tolerance_pct": 5.0,
       "max_positions": 1,
-      "tradeable": true
+      "tradeable": true,
+      "sigma_rv": 0.3
     }
   ],
   "policy": {

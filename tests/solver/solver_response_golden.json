@@ -3,7 +3,7 @@
   "request_id": "golden-run-1",
   "policy_version": 2,
   "request_timestamp": "2026-05-12T14:22:37Z",
-  "response_timestamp": "2026-10-28T15:19:30.555938+00:00",
+  "response_timestamp": "2026-11-19T23:17:47.482669+00:00",
   "status": "optimal",
   "action": "trade",
   "recommendations": [
@@ -37,9 +37,9 @@
       "target_quantity": 2,
       "optimal_quantity": 2,
       "objective_contribution": {
-        "total": 9.305629618014688,
+        "total": 8.631785314212495,
         "theta": 80.85734953703704,
-        "edge": 9.345066262174058,
+        "edge": 8.671221958371865,
         "exec_cost": -0.0,
         "risk": -0.039436644159370406
       },
@@ -144,7 +144,7 @@
       "objective_contribution": {
         "total": -1.0,
         "theta": 0.0,
-        "edge": 0.0,
+        "edge": -0.0,
         "exec_cost": -1.0,
         "risk": -0.0
       }
@@ -160,7 +160,7 @@
       "objective_contribution": {
         "total": -0.42,
         "theta": 0.0,
-        "edge": 0.0,
+        "edge": -0.0,
         "exec_cost": -0.42,
         "risk": -0.0
       }
@@ -174,9 +174,9 @@
       "target_quantity": 0,
       "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 0.0,
+        "total": -0.0,
         "theta": 0.0,
-        "edge": 0.0,
+        "edge": -0.0,
         "exec_cost": -0.0,
         "risk": -0.0
       }
@@ -190,9 +190,9 @@
       "target_quantity": 0,
       "optimal_quantity": 0,
       "objective_contribution": {
-        "total": 0.0,
+        "total": -0.0,
         "theta": 0.0,
-        "edge": 0.0,
+        "edge": -0.0,
         "exec_cost": -0.0,
         "risk": -0.0
       }
@@ -206,9 +206,9 @@
       "target_quantity": 1,
       "optimal_quantity": 1,
       "objective_contribution": {
-        "total": 6.854764799655543,
+        "total": 5.980590495602564,
         "theta": 25.874351851851852,
-        "edge": 6.864623960695385,
+        "edge": 5.990449656642406,
         "exec_cost": -0.0,
         "risk": -0.009859161039842601
       },
@@ -227,9 +227,9 @@
       "target_quantity": 1,
       "optimal_quantity": 1,
       "objective_contribution": {
-        "total": -3.4606955687250935,
+        "total": -1.7824154825324565,
         "theta": 27.168069444444445,
-        "edge": 1.559558327049355,
+        "edge": 3.2378384132419917,
         "exec_cost": -5.000000000000004,
         "risk": -0.020253895774443725
       },
@@ -241,9 +241,9 @@
     }
   ],
   "score": {
-    "objective_value": 11.279698848945138,
-    "optimal_objective_value": 11.279698848945138,
-    "current_objective_value": 19.198495488671167,
+    "objective_value": 11.409960327282601,
+    "optimal_objective_value": 11.409960327282601,
+    "current_objective_value": 21.007037053201266,
     "components": {
       "theta_total": 133.89977083333335,
       "exec_cost_total": -6.420000000000004,
@@ -254,8 +254,8 @@
   "solver_meta": {
     "solver_name": "clarabel",
     "solver_status": "optimal",
-    "iterations": 13,
-    "wall_clock_seconds": 0.0399,
+    "iterations": 12,
+    "wall_clock_seconds": 0.0195,
     "problem_size": {
       "decision_variables": 12,
       "constraints": 9

@@ -2,7 +2,8 @@
 
 These check the mechanism, not the book: raw theta is not the real objective, so the portfolio
 the solver produces here is not judged. What is checked: the variance scales as σ⁴ in the
-underlying's ATM IV, and the problem stays a convex QP that Clarabel solves.
+underlying's forecast vol σ_u (per_underlying.sigma_rv), and the problem stays a convex QP that
+Clarabel solves.
 """
 from __future__ import annotations
 
@@ -16,20 +17,23 @@ import optimizer  # noqa: E402
 
 
 def _option(uid: str, iv: float, gamma: float = 0.5) -> dict:
-    """One ATM short option on its own underlying: strike = spot = 100, so the derived ATM IV
-    is this contract's iv; delta 0 keeps it out of the band; theta 0 isolates the risk term."""
+    """One ATM short option on its own underlying: strike = spot = 100; delta 0 keeps it out of
+    the band; theta 0 and rv_forecast = iv (so the gamma-form edge −½γS²(iv²−rv²) is exactly 0)
+    isolate the risk term."""
     return {
         "id": f"{uid}260101C00100000-short", "underlying": uid, "type": "option",
         "direction": "short", "current_quantity": 0,
         "theta_per_unit": 0.0, "exec_cost_per_unit": 0.0,
         "delta_per_unit": 0.0, "gamma_per_unit": gamma, "margin_per_unit": 100.0,
-        "iv": iv, "days_to_expiry": 5.0, "strike": 100.0, "expiry": "2026-01-01",
+        "iv": iv, "rv_forecast": iv, "days_to_expiry": 5.0, "strike": 100.0, "expiry": "2026-01-01",
     }
 
 
-def _underlying(uid: str) -> dict:
+def _underlying(uid: str, sigma_rv: float) -> dict:
+    """The risk term reads the underlying's forecast vol from per_underlying.sigma_rv; the σ⁴
+    scaling tested here is in this value."""
     return {"underlying": uid, "spot": 100.0, "delta_target_pct": 0.0,
-            "delta_tolerance_pct": 10.0, "tradeable": True}
+            "delta_tolerance_pct": 10.0, "tradeable": True, "sigma_rv": sigma_rv}
 
 
 _POLICY = {"bp_limit_pct": 60, "bp_reserve_pct": 0, "risk_aversion": 4.0, "hedge_interval_days": 1.0,
@@ -38,11 +42,11 @@ _CAPITAL = {"net_liq": 100000.0}
 
 
 def test_variance_ratio_is_iv_to_the_fourth() -> None:
-    """Two names with the same dollar gamma (same γ, same spot) but IV 1.2 and 0.5: the risk
-    contribution ratio is (1.2/0.5)⁴, because the variance goes as σ⁴."""
+    """Two names with the same dollar gamma (same γ, same spot) but forecast vol σ_u 1.2 and 0.5:
+    the risk contribution ratio is (1.2/0.5)⁴, because the variance goes as σ⁴."""
     dvs = [_option("AAA", iv=1.2), _option("BBB", iv=0.5)]
     groups = optimizer._group_by_underlying(dvs)
-    bundle = optimizer._extract_inputs(dvs, [_underlying("AAA"), _underlying("BBB")],
+    bundle = optimizer._extract_inputs(dvs, [_underlying("AAA", 1.2), _underlying("BBB", 0.5)],
                                        _POLICY, _CAPITAL, groups, horizon_days=5.0)
     contribs = optimizer._compute_contributions(bundle, [1, 1])
     risk = contribs[optimizer.OC_RISK]
@@ -55,7 +59,7 @@ def test_problem_is_convex_qp_and_solves() -> None:
     """The risk term keeps the problem a DCP-convex QP; Clarabel solves it. Solve time printed."""
     dvs = [_option("AAA", iv=1.2), _option("BBB", iv=0.5)]
     groups = optimizer._group_by_underlying(dvs)
-    bundle = optimizer._extract_inputs(dvs, [_underlying("AAA"), _underlying("BBB")],
+    bundle = optimizer._extract_inputs(dvs, [_underlying("AAA", 1.2), _underlying("BBB", 0.5)],
                                        _POLICY, _CAPITAL, groups, horizon_days=5.0)
     t0 = time.monotonic()
     _target, problem, _n = optimizer._build_and_solve(len(dvs), bundle)

@@ -409,7 +409,8 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
 
     n = len(dvs)
     theta = np.empty(n)
-    edge = np.empty(n)
+    iv_arr = np.zeros(n)   # option IV; 0 for equity (edge formula gives 0 there)
+    rv_arr = np.zeros(n)   # option RV forecast; 0 for equity
     exec_cost = np.empty(n)
     delta = np.empty(n)
     gamma = np.empty(n)
@@ -432,18 +433,20 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
         h[i] = _horizon(dv, horizon)
         closeable[i] = bool(dv.get(F_CLOSEABLE_ONLY))
         is_equity[i] = dv[F_TYPE] == TYPE_EQUITY
-        # Edge replaces theta in the maximize term (§7): edge = theta × (1 − (rv_forecast/iv)²).
-        # iv and rv_forecast are required on option records; equity has theta 0, so edge 0.
+        # iv and rv_forecast are required on option records (objective spec §2); edge itself is
+        # computed from gamma below, once each option's spot is known.
         if dv[F_TYPE] == TYPE_OPTION:
             if F_IV not in dv or F_RV_FORECAST not in dv:
-                raise ValueError(f"{dv[F_ID]}: option record requires {F_IV} and {F_RV_FORECAST} (§7)")
+                raise ValueError(
+                    f"{dv[F_ID]}: option record requires {F_IV} and {F_RV_FORECAST} (objective spec §2)")
             iv_i = float(dv[F_IV])
             rv_i = float(dv[F_RV_FORECAST])
             if not iv_i > 0:
                 raise ValueError(f"{dv[F_ID]}: iv must be positive, got {iv_i!r}")
-            edge[i] = theta[i] * (1.0 - (rv_i / iv_i) ** 2)
-        else:
-            edge[i] = theta[i]
+            if not rv_i >= 0:
+                raise ValueError(f"{dv[F_ID]}: rv_forecast must be >= 0, got {rv_i!r}")
+            iv_arr[i] = iv_i
+            rv_arr[i] = rv_i
 
     net_liq = float(capital[F_NET_LIQ])
     if not net_liq > 0:
@@ -511,6 +514,15 @@ def _extract_inputs(dvs: list, per_underlying: list, policy: dict, capital: dict
     sigma_vec = np.array([sigma_rv[u] for u in und])
     risk_coef = np.sqrt(2.0 * delta_years) * (sigma_vec ** 2) * 0.5 * gamma * (spot_vec ** 2)
     h_years = h / CALENDAR_DAYS_PER_YEAR
+
+    # Edge — the delta-hedged carry a position earns, the gamma form of the objective spec §2
+    # ("Refined 2026-11-19" + validation note): edge = −½·γ·S²·(σ_IV² − σ_RV²) per year, /365 →
+    # dollars/calendar-day per unit (same units as theta, so h and the objective are unchanged).
+    # γ is position-signed (short negative), so a short with iv>rv earns positive edge and a long
+    # the negative — the same sign convention as the old theta form. Equity has iv=rv=0 → edge 0.
+    # Theta is no longer an input here: Black-76 theta holds the forward fixed and carries a rate
+    # term a delta-hedged book does not earn (objective spec §2); it is still reported raw (theta_c).
+    edge = -0.5 * gamma * (spot_vec ** 2) * (iv_arr ** 2 - rv_arr ** 2) / CALENDAR_DAYS_PER_YEAR
 
     return {
         "theta": theta, "edge": edge, "exec_cost": exec_cost, "delta": delta, "gamma": gamma,
@@ -593,7 +605,7 @@ def _build_and_solve(n: int, bundle: dict, fixed: dict | None = None):
 
     # Objective over the holding horizon (§3.2): theta × h, exec cost on the
     # trade (one-off, full dollar value), gamma over overlapping horizons.
-    obj = (bundle["edge"] * bundle["h"]) @ target   # edge = theta × (1 − (rv/iv)²), §7
+    obj = (bundle["edge"] * bundle["h"]) @ target   # edge = −½γS²(σ_IV²−σ_RV²)/365, objective spec §2
     obj = obj - bundle["exec_cost"] @ cp.abs(target - current)
     # Dollar P&L-variance risk term: (risk_aversion/2)·Σ_U R_U / net_liq = that scalar · ‖M′q‖²
     # (G_risk_slices already carries √(2δ)·σ_u²·½γS² per record, so ‖·‖² = Σ_U R_U).
@@ -766,7 +778,7 @@ def _compute_contributions(bundle: dict, q) -> dict:
     Recomputed from the q passed in, serving the reporting pass and the current book.
     """
     q = np.asarray(q, dtype=float)
-    theta_c = bundle["theta"] * bundle["h"] * q   # raw theta, reported alongside edge (§7)
+    theta_c = bundle["theta"] * bundle["h"] * q   # raw theta, reported alongside edge (objective spec §2)
     edge_c = bundle["edge"] * bundle["h"] * q      # the maximize term
     exec_c = -bundle["exec_cost"] * np.abs(q - bundle["current_qty"])  # full dollar value
     m = bundle["G_risk_slices"]

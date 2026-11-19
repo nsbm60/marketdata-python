@@ -14,13 +14,14 @@ import optimizer  # noqa: E402
 
 
 def _opt(uid: str, theta: float, iv: float, rv: float, margin: float) -> dict:
-    """One short ATM option (delta 0, gamma 0 -> no band or risk pressure) whose positive edge
-    makes the solver sell as many as buying power allows."""
+    """One short ATM option whose positive edge makes the solver sell as many as buying power
+    allows. delta 0 -> no band pressure; POLICY risk_aversion 0 -> no risk pressure; the short
+    (negative) gamma with iv>rv gives positive gamma-form edge (objective spec §2)."""
     return {
         "id": f"{uid}260101C00100000-short", "underlying": uid, "type": "option",
         "direction": "short", "current_quantity": 0,
         "theta_per_unit": theta, "exec_cost_per_unit": 0.0,
-        "delta_per_unit": 0.0, "gamma_per_unit": 0.0, "margin_per_unit": margin,
+        "delta_per_unit": 0.0, "gamma_per_unit": -5.0, "margin_per_unit": margin,
         "iv": iv, "rv_forecast": rv, "days_to_expiry": 5.0, "strike": 100.0, "expiry": "2026-01-01",
     }
 
@@ -45,7 +46,7 @@ def _bundle(dvs: list, policy: dict = POLICY) -> dict:
 # ── the solve respects bp_solve_limit, not the full bp_limit ────────────────────────────────────
 
 def test_solve_stays_within_bp_solve_limit() -> None:
-    dvs = [_opt("AAA", theta=1.0, iv=1.0, rv=0.5, margin=100.0)]  # edge = 1·(1−0.25) > 0
+    dvs = [_opt("AAA", theta=1.0, iv=1.0, rv=0.5, margin=100.0)]  # short γ, iv>rv -> edge > 0
     bundle = _bundle(dvs)
     assert bundle["bp_solve_limit"] == 50_000.0 and bundle["bp_limit"] == 60_000.0
     target, problem, _ = optimizer._build_and_solve(len(dvs), bundle)
