@@ -6,6 +6,8 @@ import math
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
+import pytest
+
 from ml.shared.calendar import is_trading_day, next_trading_day, session_close_et
 
 from iv_event import (
@@ -34,11 +36,43 @@ def test_pooled_block_keeps_only_its_last_expiry_and_drops_thin_support() -> Non
     e_e = _node(9, 0.05, 100)
     e_tiny = _node(0, 0.001, 10)  # support < 50 → dropped
 
-    nodes = select_nodes([e_e, e_c, e_a, e_thin, e_b, e_tiny])  # unordered input
+    nodes, dropped_tau0 = select_nodes([e_e, e_c, e_a, e_thin, e_b, e_tiny])  # unordered input
 
     assert [n.tau for n in nodes] == [1, 5, 9]           # e_b collapsed into e_c (the block's last)
     assert [n.expiry for n in nodes] == [e_a.expiry, e_c.expiry, e_e.expiry]
     assert [n.fit_total_var for n in nodes] == [0.01, 0.02, 0.05]
+    assert dropped_tau0 == 0
+
+
+def test_tau0_expiries_are_dropped_and_windows_start_from_the_next_node() -> None:
+    # An expiry dated on/before the next session (τ=0, e.g. an unscheduled closure) is not a node: the
+    # anchor already represents τ=0. Windows build from the first τ>0 node, never a zero-length window.
+    e0 = _node(0, 0.001, 100)   # τ=0 — dropped
+    e1, e2, e3 = _node(5, 0.05, 100), _node(10, 0.10, 100), _node(15, 0.15, 100)
+
+    nodes, dropped_tau0 = select_nodes([e0, e1, e2, e3])
+    assert dropped_tau0 == 1
+    assert [n.tau for n in nodes] == [5, 10, 15]
+    assert e0.expiry not in {n.expiry for n in nodes}
+
+    windows = build_day("TEST", date(2026, 2, 1), nodes, day_weight=lambda _d: 1.0,
+                        list_days=_fixed_days({e1.expiry: 5, e2.expiry: 5, e3.expiry: 5}),
+                        own_earnings=_no_earnings)
+    assert [w.status for w in windows] == [STATUS_OK] * 3
+    assert windows[0].start_expiry is None and windows[0].end_expiry == e1.expiry  # anchor → first τ>0 node
+
+
+def test_zero_effective_days_raises_naming_the_window() -> None:
+    # Unreachable once τ=0 nodes are dropped, but it must never be a silent division: a window with no
+    # trading day (list_days returns nothing) raises, naming the underlying, day, expiries and taus.
+    e1 = _node(5, 0.05, 100)
+    with pytest.raises(ValueError) as excinfo:
+        build_day("ACME", date(2026, 3, 2), [e1], day_weight=lambda _d: 1.0,
+                  list_days=_fixed_days({e1.expiry: 0}), own_earnings=_no_earnings)
+    msg = str(excinfo.value)
+    assert "ACME" in msg and "2026-03-02" in msg
+    assert "anchor" in msg and str(e1.expiry) in msg
+    assert "tau 0->5" in msg and "eff_days" in msg
 
 
 # ── effective days with a weekend and a holiday (real calendar) ────────────────────────────────────
@@ -65,7 +99,7 @@ def test_effective_days_fold_in_a_weekend_and_a_holiday() -> None:
     e1, e2, e3 = date(2021, 1, 15), date(2021, 1, 22), date(2021, 1, 29)
     nodes = [ExpiryNode(e1, 5, 0.05, 100), ExpiryNode(e2, 9, 0.10, 100), ExpiryNode(e3, 14, 0.15, 100)]
 
-    windows = build_day(session, nodes, day_weight=_weight, list_days=_list_days,
+    windows = build_day("EWZ", session, nodes, day_weight=_weight, list_days=_list_days,
                         own_earnings=_no_earnings)
     by_end = {w.end_expiry: w for w in windows}
 
@@ -91,8 +125,8 @@ def test_normal_is_the_window_median_and_excess_arithmetic_incl_negative() -> No
              ExpiryNode(e3, 30, 0.60, 100), ExpiryNode(e4, 40, 0.65, 100)]
     list_days = _fixed_days({e1: 10, e2: 10, e3: 10, e4: 10})
 
-    windows = build_day(date(2026, 2, 1), nodes, day_weight=lambda _d: 1.0, list_days=list_days,
-                        own_earnings=_no_earnings)
+    windows = build_day("TEST", date(2026, 2, 1), nodes, day_weight=lambda _d: 1.0,
+                        list_days=list_days, own_earnings=_no_earnings)
     assert [w.status for w in windows] == [STATUS_OK] * 4
     by_end = {w.end_expiry: w for w in windows}
 
@@ -119,7 +153,7 @@ def test_normal_is_the_window_median_and_excess_arithmetic_incl_negative() -> No
 def test_fewer_than_three_windows_is_one_insufficient_row() -> None:
     e1, e2 = date(2026, 2, 2), date(2026, 2, 3)
     nodes = [ExpiryNode(e1, 10, 0.10, 100), ExpiryNode(e2, 20, 0.20, 100)]
-    windows = build_day(date(2026, 2, 1), nodes, day_weight=lambda _d: 1.0,
+    windows = build_day("TEST", date(2026, 2, 1), nodes, day_weight=lambda _d: 1.0,
                         list_days=_fixed_days({e1: 10, e2: 10}), own_earnings=_no_earnings)
     assert len(windows) == 1
     w = windows[0]
@@ -130,7 +164,7 @@ def test_fewer_than_three_windows_is_one_insufficient_row() -> None:
 
 
 def test_no_nodes_is_insufficient() -> None:
-    windows = build_day(date(2026, 2, 1), [], day_weight=lambda _d: 1.0,
+    windows = build_day("TEST", date(2026, 2, 1), [], day_weight=lambda _d: 1.0,
                         list_days=_fixed_days({}), own_earnings=_no_earnings)
     assert len(windows) == 1 and windows[0].status == STATUS_INSUFFICIENT_WINDOWS
 

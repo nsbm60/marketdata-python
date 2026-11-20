@@ -59,8 +59,11 @@ COLUMNS: Tuple[str, ...] = (
 _LEDGER_COLUMNS = ["session_date", "ticker", "rows_inserted", "quote_failures", "dataset",
                    "gap_reason", "claimed_by"]
 
-# Status display order, for the one-line summary.
+# The written-row statuses (summed into "wrote N rows"), and a diagnostic count of τ=0 expiries
+# dropped per day (not a written row) — both shown on the one-line-per-month/day summary.
 _STATUS_ORDER = (STATUS_OK, STATUS_INSUFFICIENT_WINDOWS)
+_DROPPED_TAU0 = "dropped_tau0"
+_SUMMARY_KEYS = (*_STATUS_ORDER, _DROPPED_TAU0)
 
 # Clean-stop flag: __main__ installs a SIGINT handler that sets it; backfill polls it at each month
 # boundary and stops after the current month (a plain flag set from a signal handler — no threading).
@@ -254,12 +257,14 @@ def process_range(ch: Any, start: dt.date, end: dt.date,
     counts: "Counter[str]" = Counter()
     per_pair: "Counter[Pair]" = Counter()
     for underlying, session_date, exps in groups:
-        nodes = select_nodes(exps)
+        nodes, dropped_tau0 = select_nodes(exps)
+        if dropped_tau0:
+            counts[_DROPPED_TAU0] += dropped_tau0
         day_weight = _day_weight_fn(weights, underlying, session_date)
         own = _own_earnings_fn(earnings.get(underlying.upper(), []))
 
-        for w in build_day(session_date, nodes, day_weight=day_weight, list_days=trading_days_in,
-                           own_earnings=own):
+        for w in build_day(underlying, session_date, nodes, day_weight=day_weight,
+                           list_days=trading_days_in, own_earnings=own):
             counts[w.status] += 1
             rows.append(_event_row(underlying, session_date, w, daytype_from, daytype_to))
             per_pair[(session_date, underlying.upper())] += 1
@@ -284,8 +289,8 @@ def _month_ranges(start: dt.date, end: dt.date) -> Iterator[Tuple[dt.date, dt.da
 
 
 def _summary(counts: Mapping[str, int]) -> str:
-    """`status=n status=n` ordered by the status ladder, for the one-line-per-month/day summary."""
-    return " ".join(f"{s}={counts.get(s, 0)}" for s in _STATUS_ORDER)
+    """`ok=n insufficient_windows=n dropped_tau0=n` for the one-line-per-month/day summary."""
+    return " ".join(f"{s}={counts.get(s, 0)}" for s in _SUMMARY_KEYS)
 
 
 def backfill(ch: Any, get_client: Callable[[], Any], start: dt.date, end: dt.date) -> "Counter[str]":
@@ -368,6 +373,6 @@ def daily(ch: Any) -> int:
         return -1
 
     counts = process_range(ch, newest_ledger, newest_curve)
-    n = sum(counts.values())
+    n = sum(counts[s] for s in _STATUS_ORDER)   # written rows only, not the dropped_tau0 diagnostic
     print(f"wrote {n} rows")
     return n

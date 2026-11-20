@@ -77,20 +77,25 @@ class _Raw:
 
 
 def select_nodes(expiries: Sequence[ExpiryNode], min_support: float = MIN_NODE_SUPPORT
-                 ) -> List[ExpiryNode]:
-    """Expiries with support >= min_support, ordered by τ; a run of consecutive equal fit_total_var is
-    one pooled block, collapsed to its LAST expiry (the only node that adds a non-zero window)."""
-    kept = sorted((e for e in expiries if e.support >= min_support), key=lambda e: e.tau)
+                 ) -> Tuple[List[ExpiryNode], int]:
+    """The nodes (sorted by τ) and the count of τ=0 expiries dropped. A node is an expiry with
+    support >= min_support and τ > 0: the anchor already represents τ=0, so an expiry with no trading
+    day before it (e.g. an unscheduled closure dated as the next session) adds no window and would make
+    a zero-length anchor window. A run of consecutive equal fit_total_var is one pooled block,
+    collapsed to its LAST expiry (the only node that adds a non-zero window)."""
+    supported = [e for e in expiries if e.support >= min_support]
+    dropped_tau0 = sum(1 for e in supported if e.tau == 0)
+    kept = sorted((e for e in supported if e.tau > 0), key=lambda e: e.tau)
     nodes: List[ExpiryNode] = []
     for e in kept:
         if nodes and nodes[-1].fit_total_var == e.fit_total_var:
             nodes[-1] = e   # same pooled block → advance the node to the block's last expiry
         else:
             nodes.append(e)
-    return nodes
+    return nodes, dropped_tau0
 
 
-def _raw_windows(session_date: date, nodes: Sequence[ExpiryNode], *,
+def _raw_windows(underlying: str, session_date: date, nodes: Sequence[ExpiryNode], *,
                  day_weight: Callable[[date], float],
                  list_days: Callable[[date, date], List[date]],
                  own_earnings: Callable[[date, date], Optional[Tuple[date, str]]]) -> List[_Raw]:
@@ -103,6 +108,11 @@ def _raw_windows(session_date: date, nodes: Sequence[ExpiryNode], *,
         start = prev_expiry if prev_expiry is not None else session_date
         days = list_days(start, n.expiry)           # after the start, up to and incl. the end
         eff_days = math.fsum(day_weight(d) for d in days)
+        if eff_days <= 0:   # no trading day in the window — never divide by it (select_nodes prevents it)
+            start_label = prev_expiry if prev_expiry is not None else "anchor"
+            raise ValueError(
+                f"iv_event {underlying} {session_date}: window {start_label}->{n.expiry} "
+                f"(tau {prev_tau}->{n.tau}) has eff_days={eff_days} <= 0 - no trading day in the window")
         oe = own_earnings(start, n.expiry)          # (start, end]: start exclusive, end inclusive
         raws.append(_Raw(
             start_expiry=prev_expiry, end_expiry=n.expiry, start_td=prev_tau, end_td=n.tau,
@@ -121,14 +131,14 @@ def _insufficient() -> Window:
         own_earnings_date=None, own_earnings_source=None, status=STATUS_INSUFFICIENT_WINDOWS)
 
 
-def build_day(session_date: date, nodes: Sequence[ExpiryNode], *,
+def build_day(underlying: str, session_date: date, nodes: Sequence[ExpiryNode], *,
               day_weight: Callable[[date], float],
               list_days: Callable[[date, date], List[date]],
               own_earnings: Callable[[date, date], Optional[Tuple[date, str]]]) -> List[Window]:
     """All window rows for one (underlying, session_date). Fewer than MIN_WINDOWS windows → a single
     insufficient_windows row. Otherwise the day's normal is the median per-effective-day variance, and
     each window's excess is measured against it (excess may be negative; the implied move clamps at 0)."""
-    raws = _raw_windows(session_date, nodes, day_weight=day_weight, list_days=list_days,
+    raws = _raw_windows(underlying, session_date, nodes, day_weight=day_weight, list_days=list_days,
                         own_earnings=own_earnings)
     if len(raws) < MIN_WINDOWS:
         return [_insufficient()]
