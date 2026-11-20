@@ -131,3 +131,31 @@ def trading_days_between(start_exclusive: date, end_inclusive: date) -> int:
             n += 1
         d += timedelta(days=1)
     return n
+
+
+def trading_days_in(start_exclusive: date, end_inclusive: date) -> list[date]:
+    """The trading days in (start_exclusive, end_inclusive], in ascending order — the list form of
+    trading_days_between. Empty if the range is empty or reversed."""
+    out: list[date] = []
+    d = start_exclusive + timedelta(days=1)
+    while d <= end_inclusive:
+        if is_trading_day(d):
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def previous_trading_day(d: date) -> date:
+    """The latest trading day strictly before `d` (used for the gap = calendar days since it)."""
+    p = d - timedelta(days=1)
+    while not is_trading_day(p):
+        p -= timedelta(days=1)
+    return p
+
+
+def next_trading_day(d: date) -> date:
+    """The earliest trading day strictly after `d`."""
+    n = d + timedelta(days=1)
+    while not is_trading_day(n):
+        n += timedelta(days=1)
+    return n
