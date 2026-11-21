@@ -15,18 +15,39 @@ a single statement small enough for drogon). Each statement, over all names at o
     return, and sets split_adjusted.
 
 A name's first complete session has no prior close and gets no row (no overnight return).
+
+Each row also carries four intraday risk-decomposition measures (same 5-minute grid; r_1..r_n are
+the intraday returns, n = n_bars; o is the signed overnight return, rv_overnight = o²):
+  - rs_down / rs_up: downside / upside realized semivariance — Σ r_i² over negative / positive r_i,
+    plus o² on the matching side of the overnight return. rs_down + rs_up = rv_total by construction.
+  - bv_intraday: bipower variation (π/2)·(n/(n−1))·Σ_{i=2..n} |r_i|·|r_{i−1}|, intraday only, NULL
+    when n < 2.
+  - tq_intraday: tri-power quarticity n·μ⁻³·(n/(n−2))·Σ_{i=3..n} (|r_i|·|r_{i−1}|·|r_{i−2}|)^(4/3)
+    with μ = 2^(2/3)·Γ(7/6)/Γ(1/2), intraday only, NULL when n < 3. Stored now so the jump test
+    (RV vs BV, scaled by TQ/BV²) needs no second backfill.
+These are Nullable(Float64) columns; the operator must add them with the ALTER TABLE named in
+_require_new_columns before this job runs — the job never adds them itself. The pure-Python oracle
+for all five intraday measures is rv/measures.py (checked by `python -m rv check`).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 
 log = logging.getLogger("rv.rv_daily")
 
 # A few trading days of overlap so the first day of each month can see the prior complete session's
 # close (lagInFrame over the partition); only rows on/after month start are emitted.
 _LOOKBACK_DAYS = 10
+
+# μ = 2^(2/3)·Γ(7/6)/Γ(1/2) ≈ 0.8309 — the bipower/tri-power scaling constant for tq_intraday.
+# Computed once here (and identically in rv/measures.py) so the constant is never transcribed.
+_MU = 2 ** (2 / 3) * math.gamma(7 / 6) / math.gamma(1 / 2)
+
+# The columns this extension adds; the operator must ALTER them in before the job runs.
+_NEW_COLUMNS = ("rs_down", "rs_up", "bv_intraday", "tq_intraday")
 
 
 def _symbol_filter(symbols) -> str:
@@ -146,18 +167,38 @@ def _insert_month(ch, ms: dt.date, me: dt.date, sym: str, extra_where: str = "")
     lookback = ms - dt.timedelta(days=_LOOKBACK_DAYS)
     sql = f"""
 INSERT INTO trading.rv_daily
-    (symbol, trading_date, rv_intraday, rv_overnight, rv_total, n_bars, expected_bars, split_adjusted, source, computed_at)
-{_with_core(lookback, me, sym)}
+    (symbol, trading_date, rv_intraday, rv_overnight, rv_total, rs_down, rs_up, bv_intraday, tq_intraday,
+     n_bars, expected_bars, split_adjusted, source, computed_at)
+{_with_core(lookback, me, sym)},
+arrs AS (
+    -- The intraday 5-minute log returns r_1..r_n (leading log-grid point dropped, NOT the leading 0
+    -- of arrayDifference) and the signed overnight return o (rv_overnight = o²), computed once here.
+    SELECT withsplit.*,
+           arrayPopFront(arrayDifference(arrayMap(p -> log(p), grid_px))) AS rets,
+           log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0))) AS overnight_ret
+    FROM withsplit
+)
 SELECT
     symbol, trading_date,
-    arraySum(arrayMap(x -> x * x, arrayDifference(arrayMap(p -> log(p), grid_px)))) AS rv_intraday,
-    pow(log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0))), 2) AS rv_overnight,
+    arraySum(arrayMap(x -> x * x, rets)) AS rv_intraday,          -- Σ r_i² (identical to arrayDifference form)
+    pow(overnight_ret, 2) AS rv_overnight,
     rv_intraday + rv_overnight AS rv_total,
+    arraySum(arrayMap(x -> if(x < 0, x * x, 0.0), rets)) + if(overnight_ret < 0, rv_overnight, 0.0) AS rs_down,
+    arraySum(arrayMap(x -> if(x > 0, x * x, 0.0), rets)) + if(overnight_ret > 0, rv_overnight, 0.0) AS rs_up,
+    if(n_bars < 2, NULL,
+       (pi() / 2) * (toFloat64(n_bars) / (toFloat64(n_bars) - 1))
+       * arraySum(arrayMap((a, b) -> abs(a) * abs(b), arrayPopFront(rets), arrayPopBack(rets)))) AS bv_intraday,
+    if(n_bars < 3, NULL,
+       toFloat64(n_bars) * pow({_MU!r}, -3) * (toFloat64(n_bars) / (toFloat64(n_bars) - 2))
+       * arraySum(arrayMap((a, b, c) -> pow(abs(a), 4.0 / 3) * pow(abs(b), 4.0 / 3) * pow(abs(c), 4.0 / 3),
+                           arrayPopFront(arrayPopFront(rets)),
+                           arrayPopFront(arrayPopBack(rets)),
+                           arrayPopBack(arrayPopBack(rets))))) AS tq_intraday,
     n_bars, expected_bars,
     toUInt8(split_ratio IS NOT NULL) AS split_adjusted,
     'har-rv' AS source,
     now64(3) AS computed_at
-FROM withsplit
+FROM arrs
 WHERE trading_date >= toDate('{ms.isoformat()}')
   AND prev_close > 0                              -- a previous complete session exists
   AND prev_complete_date = prev_trading_day       -- and it is the immediately previous trading day
@@ -183,14 +224,61 @@ SETTINGS join_use_nulls = 1
             f"rv_daily produced non-finite/negative rv_total for {ms}..{me} "
             f"({len(bad)}+ rows shown):\n{lines}"
         )
+    # Same fail-fast, by name and date, for the semivariance / bipower / quarticity columns: refuse a
+    # non-finite or negative value, a semivariance split that doesn't sum to rv_total, or a NULL
+    # bv/tq where n_bars >= 3 (both must be present there). Print up to 100 offenders and raise.
+    bad_new = ch.query(
+        f"SELECT symbol, toString(trading_date), rs_down, rs_up, bv_intraday, tq_intraday, rv_total, n_bars "
+        f"FROM trading.rv_daily FINAL "
+        f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}'{sym} AND ("
+        f"  NOT isFinite(rs_down) OR rs_down < 0"
+        f"  OR NOT isFinite(rs_up) OR rs_up < 0"
+        f"  OR (bv_intraday IS NOT NULL AND (NOT isFinite(bv_intraday) OR bv_intraday < 0))"
+        f"  OR (tq_intraday IS NOT NULL AND (NOT isFinite(tq_intraday) OR tq_intraday < 0))"
+        f"  OR abs(rs_down + rs_up - rv_total) > 1e-12 + 1e-9 * rv_total"
+        f"  OR ((bv_intraday IS NULL OR tq_intraday IS NULL) AND n_bars >= 3)"
+        f") ORDER BY symbol, trading_date LIMIT 100"
+    ).result_rows
+    if bad_new:
+        lines = "\n".join(
+            f"    {s:8s} {d}  rs_down={rd} rs_up={ru} bv={bv} tq={tq} rv_total={rv} n_bars={nb}"
+            for s, d, rd, ru, bv, tq, rv, nb in bad_new
+        )
+        raise RuntimeError(
+            f"rv_daily produced invalid semivariance/bipower/quarticity for {ms}..{me} "
+            f"({len(bad_new)}+ rows shown):\n{lines}"
+        )
     log.info("rv_daily %s..%s: %d rows", ms, me, n)
     print(f"[rv_daily] {ms} .. {me}: {n:,} rows")
     return n
 
 
+def _require_new_columns(ch) -> None:
+    """Fail fast if trading.rv_daily is missing the semivariance / bipower / quarticity columns. The
+    live table pre-dates them, so the operator adds them once with the ALTER TABLE below; CREATE
+    TABLE IF NOT EXISTS (schema.py) can't, and this job never adds them itself."""
+    quoted = ", ".join("'" + c + "'" for c in _NEW_COLUMNS)
+    present = {r[0] for r in ch.query(
+        f"SELECT name FROM system.columns WHERE database = 'trading' AND table = 'rv_daily' "
+        f"AND name IN ({quoted})"
+    ).result_rows}
+    missing = [c for c in _NEW_COLUMNS if c not in present]
+    if missing:
+        raise RuntimeError(
+            "trading.rv_daily is missing column(s): " + ", ".join(missing) + ".\n"
+            "Run this ALTER TABLE first (the operator runs all DDL — this job does not add them):\n"
+            "    ALTER TABLE trading.rv_daily\n"
+            "        ADD COLUMN IF NOT EXISTS rs_down     Nullable(Float64) AFTER rv_total,\n"
+            "        ADD COLUMN IF NOT EXISTS rs_up       Nullable(Float64) AFTER rs_down,\n"
+            "        ADD COLUMN IF NOT EXISTS bv_intraday Nullable(Float64) AFTER rs_up,\n"
+            "        ADD COLUMN IF NOT EXISTS tq_intraday Nullable(Float64) AFTER bv_intraday"
+        )
+
+
 def backfill(ch, start: dt.date, end: dt.date, symbols=None) -> int:
     """Compute rv_daily for every complete (symbol, day) in [start, end], one statement per month.
     `symbols` restricts to a targeted rerun (e.g. after a cut); None means all names."""
+    _require_new_columns(ch)
     sym = _symbol_filter(symbols)
     total = 0
     for ms, me in _month_ranges(start, end):
@@ -212,6 +300,7 @@ def incremental(ch, symbols=None) -> int:
     history, only recent days (or none) are missing, so the daily run is cheap again; the permanent
     non-rows (each name's first complete day, and days after a `failed` block) are not treated as a
     gap because they fail the overnight rule."""
+    _require_new_columns(ch)
     sym = _symbol_filter(symbols)
 
     end = ch.query(
@@ -278,7 +367,9 @@ def zero_rv_by_name(ch) -> list[tuple]:
 def stats(ch) -> dict:
     """Post-backfill summary: split-adjusted rows vs splits on these names, and rv_total spread."""
     row = ch.query(
-        "SELECT count(), min(rv_total), median(rv_total), max(rv_total), sum(split_adjusted) "
+        "SELECT count(), min(rv_total), median(rv_total), max(rv_total), sum(split_adjusted), "
+        "median(if(rv_intraday > 0 AND bv_intraday IS NOT NULL, bv_intraday / rv_intraday, NULL)), "
+        "avg(rs_down > rs_up) "
         "FROM trading.rv_daily FINAL WHERE source = 'har-rv'"
     ).result_rows[0]
     splits = ch.query(
@@ -288,6 +379,7 @@ def stats(ch) -> dict:
     return {
         "rows": row[0], "rv_min": row[1], "rv_median": row[2], "rv_max": row[3],
         "split_adjusted": row[4], "splits_in_table": splits,
+        "median_bv_rv": row[5], "share_rs_down_gt_up": row[6],
     }
 
 
@@ -329,3 +421,106 @@ WHERE (symbol = 'AAPL' AND trading_date = '2020-08-31')
 ORDER BY symbol
 """
     return ch.query(sql).result_rows
+
+
+# ── read-only verification: pure-Python oracle vs stored rv_daily rows (writes nothing) ──
+
+_CHECK_CASES = [
+    ("AAPL", dt.date(2024, 8, 5)),
+    ("SPY", dt.date(2024, 8, 5)),
+    ("SPY", dt.date(2025, 4, 9)),
+    ("LYFT", dt.date(2024, 2, 14)),
+    ("NVDA", dt.date(2024, 6, 10)),   # 10:1 split day
+]
+_CHECK_COLS = ("rv_intraday", "rs_down", "rs_up", "bv_intraday", "tq_intraday")
+
+
+def _agree(ref, stored) -> tuple[bool, float | None]:
+    """(agrees, relative diff). Agreement = within 1e-9 relative or 1e-15 absolute. rel is None for a
+    matching NULL on both sides; a one-sided NULL is a mismatch with rel = inf."""
+    if ref is None and stored is None:
+        return True, None
+    if ref is None or stored is None:
+        return False, float("inf")
+    diff = abs(float(ref) - float(stored))
+    rel = diff / abs(float(stored)) if stored != 0 else diff
+    return (diff <= 1e-15 or rel <= 1e-9), rel
+
+
+def _fmt(x) -> str:
+    return "NULL" if x is None else f"{float(x):.6e}"
+
+
+def check(ch) -> bool:
+    """Read-only (writes nothing). For a fixed set of (symbol, date) cases: rebuild the 5-minute grid
+    from the raw 1m bars the same way the insert does, recompute the five intraday measures with the
+    pure-Python oracle (rv/measures.py), and compare column by column to the stored rv_daily row.
+    Prints each case, the relative difference per column, and bv/rv_intraday and rs_down/rv_total so
+    the jump and sign behaviour is visible. Ends with one PASS/FAIL line. Returns True iff every
+    column on every case agrees to 1e-9 relative (or 1e-15 absolute)."""
+    from . import measures
+
+    cases = list(_CHECK_CASES)
+    # The three complete days with the fewest n_bars (>= 3) on 2024-08-05 — exercise the small-n tail.
+    for s, d in ch.query(
+        "SELECT symbol, trading_date FROM trading.rv_daily FINAL "
+        "WHERE source = 'har-rv' AND trading_date = '2024-08-05' AND n_bars >= 3 "
+        "ORDER BY n_bars ASC, symbol LIMIT 3"
+    ).result_rows:
+        cases.append((s, d))
+
+    worst = (0.0, None, None)  # (rel diff, "symbol date", column)
+    all_ok = True
+
+    for sym_name, date in cases:
+        symf = f" AND symbol IN ('{sym_name}')"
+        lo = date - dt.timedelta(days=_LOOKBACK_DAYS)
+        grid_rows = ch.query(
+            f"{_with_core(lo, date, symf)}"
+            f"SELECT grid_px, "
+            f"log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0))) AS overnight_ret, "
+            f"n_bars "
+            f"FROM withsplit "
+            f"WHERE trading_date = toDate('{date.isoformat()}') "
+            f"  AND prev_close > 0 AND prev_complete_date = prev_trading_day "
+            f"SETTINGS join_use_nulls = 1"
+        ).result_rows
+        stored_rows = ch.query(
+            f"SELECT rv_intraday, rs_down, rs_up, bv_intraday, tq_intraday, rv_total, n_bars "
+            f"FROM trading.rv_daily FINAL WHERE source = 'har-rv' AND symbol = '{sym_name}' "
+            f"AND trading_date = toDate('{date.isoformat()}')"
+        ).result_rows
+        if not grid_rows or not stored_rows:
+            missing = ", ".join(m for m, cond in (("no grid", grid_rows), ("no stored row", stored_rows)) if not cond)
+            print(f"[check] {sym_name} {date}: MISSING ({missing}) — cannot compare")
+            all_ok = False
+            continue
+
+        grid_px, overnight_ret, n_bars = grid_rows[0]
+        ref = measures.day_measures([float(p) for p in grid_px], float(overnight_ret))
+        s_rv, s_rs_down, s_rs_up, s_bv, s_tq, s_rv_total, _ = stored_rows[0]
+        refd = {"rv_intraday": ref.rv_intraday, "rs_down": ref.rs_down, "rs_up": ref.rs_up,
+                "bv_intraday": ref.bv_intraday, "tq_intraday": ref.tq_intraday}
+        stored = {"rv_intraday": s_rv, "rs_down": s_rs_down, "rs_up": s_rs_up,
+                  "bv_intraday": s_bv, "tq_intraday": s_tq}
+
+        print(f"[check] {sym_name} {date}  n_bars={n_bars}")
+        print(f"    {'column':12s} {'reference':>16s} {'stored':>16s} {'rel diff':>12s}")
+        for c in _CHECK_COLS:
+            ok, rel = _agree(refd[c], stored[c])
+            all_ok = all_ok and ok
+            rel_str = "null-match" if rel is None else f"{rel:.2e}"
+            flag = "" if ok else "  <-- MISMATCH"
+            print(f"    {c:12s} {_fmt(refd[c]):>16s} {_fmt(stored[c]):>16s} {rel_str:>12s}{flag}")
+            if rel is not None and rel > worst[0]:
+                worst = (rel, f"{sym_name} {date}", c)
+        bv_ratio = (s_bv / s_rv) if (s_bv is not None and s_rv) else None
+        down_ratio = (s_rs_down / s_rv_total) if s_rv_total else None
+        print(f"    bv/rv_intraday = {_fmt(bv_ratio)}   rs_down/rv_total = {_fmt(down_ratio)}")
+
+    if all_ok:
+        print("PASS — every column agrees to 1e-9 relative (or 1e-15 absolute)")
+    else:
+        where = f"{worst[1]} {worst[2]} (rel {worst[0]:.2e})" if worst[1] else "missing row(s)"
+        print(f"FAIL — worst: {where}")
+    return all_ok

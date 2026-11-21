@@ -3,6 +3,7 @@ HAR realized-variance commands (HAR edge spec §3–§5).
 
     python -m rv backfill [--start 2016-01-01] [--end YYYY-MM-DD]   # rv_daily from raw 1m bars
     python -m rv proof                                              # AAPL/NVDA split sanity
+    python -m rv check                                              # oracle vs stored rows (read-only)
     python -m rv forecast                                           # pooled fit + historical forecasts
     python -m rv all      [--start ...] [--end ...]                 # backfill, proof, forecast
 
@@ -49,6 +50,7 @@ def main() -> None:
         sp.add_argument("--end")
         sp.add_argument("--symbols", help="comma-separated names for a targeted rerun (default: all)")
     sub.add_parser("proof")
+    sub.add_parser("check")  # read-only: pure-Python oracle vs stored rv_daily rows for fixed cases
     sub.add_parser("forecast")
     sub.add_parser("daily")  # the daily-job body: catch rv_daily up from the data, weekly refit, write forecasts
     args = p.parse_args()
@@ -69,6 +71,10 @@ def main() -> None:
         print(f"[backfill] split_adjusted=1 on {st['split_adjusted']:,} rows "
               f"({st['splits_in_table']:,} splits on these names since 2016)")
         print(f"[backfill] rv_total  min={st['rv_min']:.3e}  median={st['rv_median']:.3e}  max={st['rv_max']:.3e}")
+        med_bv = st['median_bv_rv']
+        med_str = f"{med_bv:.4f}" if med_bv is not None else "n/a"
+        print(f"[backfill] bv_intraday/rv_intraday median={med_str} (rv_intraday>0 rows); "
+              f"rs_down>rs_up on {st['share_rs_down_gt_up'] * 100:.1f}% of rows")
         zeros = rv_daily.zero_rv_by_name(ch)
         total_zero = sum(n for _, n in zeros)
         print(f"[backfill] zero-RV days: {total_zero:,} across {len(zeros)} names (stored, excluded from the fit)")
@@ -76,6 +82,9 @@ def main() -> None:
             print(f"    {sym:8s} {n}")
     if args.cmd in ("proof", "all"):
         _run_proof(ch)
+    if args.cmd == "check":
+        ok = rv_daily.check(ch)
+        sys.exit(0 if ok else 1)
     if args.cmd in ("forecast", "all"):
         forecast.run(ch)
     if args.cmd == "daily":
