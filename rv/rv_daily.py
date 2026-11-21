@@ -436,15 +436,19 @@ _CHECK_COLS = ("rv_intraday", "rs_down", "rs_up", "bv_intraday", "tq_intraday")
 
 
 def _agree(ref, stored) -> tuple[bool, float | None]:
-    """(agrees, relative diff). Agreement = within 1e-9 relative or 1e-15 absolute. rel is None for a
-    matching NULL on both sides; a one-sided NULL is a mismatch with rel = inf."""
+    """(agrees, relative diff). Agreement = within 1e-6 relative or 1e-15 absolute. rel is None for a
+    matching NULL on both sides; a one-sided NULL is a mismatch with rel = inf. The tolerance is 1e-6
+    (not tighter) because ClickHouse's log and Python's math.log differ by ~1e-9 absolute per call
+    (e.g. log(201.37): CH 5.3051440126620895 vs Python 5.305144011890314), so each 5-minute return
+    carries ~1e-9 absolute error that the sums and the 4/3 powers in tq_intraday amplify (measured
+    worst: DFDV 2024-08-05 tq_intraday, 1.99e-07 relative)."""
     if ref is None and stored is None:
         return True, None
     if ref is None or stored is None:
         return False, float("inf")
     diff = abs(float(ref) - float(stored))
     rel = diff / abs(float(stored)) if stored != 0 else diff
-    return (diff <= 1e-15 or rel <= 1e-9), rel
+    return (diff <= 1e-15 or rel <= 1e-6), rel
 
 
 def _fmt(x) -> str:
@@ -457,7 +461,13 @@ def check(ch) -> bool:
     pure-Python oracle (rv/measures.py), and compare column by column to the stored rv_daily row.
     Prints each case, the relative difference per column, and bv/rv_intraday and rs_down/rv_total so
     the jump and sign behaviour is visible. Ends with one PASS/FAIL line. Returns True iff every
-    column on every case agrees to 1e-9 relative (or 1e-15 absolute)."""
+    column on every case agrees to 1e-6 relative (or 1e-15 absolute).
+
+    The tolerance is 1e-6, not tighter, because ClickHouse's log and Python's math.log differ by
+    ~1e-9 absolute per call (measured — e.g. log(201.37): CH 5.3051440126620895 vs Python
+    5.305144011890314), so each 5-minute return carries ~1e-9 absolute error that the squared sums
+    and the 4/3 powers in tq_intraday amplify (measured worst: DFDV 2024-08-05 tq_intraday,
+    1.99e-07 relative). This is a log-implementation difference, not a formula difference."""
     from . import measures
 
     cases = list(_CHECK_CASES)
@@ -519,7 +529,7 @@ def check(ch) -> bool:
         print(f"    bv/rv_intraday = {_fmt(bv_ratio)}   rs_down/rv_total = {_fmt(down_ratio)}")
 
     if all_ok:
-        print("PASS — every column agrees to 1e-9 relative (or 1e-15 absolute)")
+        print("PASS — every column agrees to 1e-6 relative (or 1e-15 absolute)")
     else:
         where = f"{worst[1]} {worst[2]} (rel {worst[0]:.2e})" if worst[1] else "missing row(s)"
         print(f"FAIL — worst: {where}")
