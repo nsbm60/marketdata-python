@@ -44,6 +44,7 @@ TRADING_DAYS_PER_YEAR = 252   # annualisation base for the vol prints
 STATUS_OK = "ok"
 STATUS_INSUFFICIENT_WINDOWS = "insufficient_windows"
 EARNINGS_HISTORY = "earnings_history"
+EARNINGS_HISTORY_UNRESOLVED = "earnings_history_unresolved"  # reaction day unknown → reported day OR next trading day
 EARNINGS_CALENDAR = "earnings_calendar"
 
 # Fully-qualified table names (Python stores names, never a second copy of the DDL).

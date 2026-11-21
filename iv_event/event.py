@@ -33,8 +33,9 @@ from ml.shared.calendar import (
 
 from . import (
     CURVE_KIND_EXPIRY, CURVE_STATUS_OK, EARNINGS_CALENDAR, EARNINGS_CALENDAR_TABLE, EARNINGS_HISTORY,
-    EARNINGS_HISTORY_TABLE, GAP_MAX_BUCKET, IV_CURVE_TABLE, IV_EVENT_DAYTYPE_TABLE, IV_EVENT_TABLE,
-    LEDGER_DATASET, LEDGER_TABLE, METHOD, SOURCE_METHOD, STATUS_INSUFFICIENT_WINDOWS, STATUS_OK,
+    EARNINGS_HISTORY_TABLE, EARNINGS_HISTORY_UNRESOLVED, GAP_MAX_BUCKET, IV_CURVE_TABLE,
+    IV_EVENT_DAYTYPE_TABLE, IV_EVENT_TABLE, LEDGER_DATASET, LEDGER_TABLE, METHOD, SOURCE_METHOD,
+    STATUS_INSUFFICIENT_WINDOWS, STATUS_OK,
 )
 from .fwd import (
     ExpiryNode, Window, build_day, calendar_reaction_session, earliest_in_window,
@@ -144,9 +145,12 @@ def _to_et(ts: datetime) -> datetime:
 
 def _load_earnings(ch: Any, underlyings: Set[str],
                    today: dt.date) -> Dict[str, List[Tuple[dt.date, str]]]:
-    """Each underlying's earnings reaction sessions: from earnings_history for past reports (reaction
-    day, else reported day), and from earnings_calendar for future reports (the session that reacts to
-    the report time). Read once; attributed to windows in Python."""
+    """Each underlying's earnings reaction sessions: from earnings_history for past reports, and from
+    earnings_calendar for future reports (the session that reacts to the report time). A resolved
+    history row contributes its reaction day (tagged earnings_history). A row whose reaction day could
+    not be found contributes BOTH the reported day and the next trading day (tagged
+    earnings_history_unresolved), so a window is attributed to it whichever of the two it spans. Read
+    once; attributed to windows in Python."""
     out: Dict[str, List[Tuple[dt.date, str]]] = defaultdict(list)
     if not underlyings:
         return out
@@ -157,9 +161,16 @@ def _load_earnings(ch: Any, underlyings: Set[str],
         sym = str(symbol).upper()
         if sym not in underlyings:
             continue
-        rs = history_reaction_session(reported, reaction)
-        if rs <= today:   # history is the source for past reports
-            out[sym].append((rs, EARNINGS_HISTORY))
+        if reaction is not None:
+            rs = history_reaction_session(reported, reaction)
+            if rs <= today:   # history is the source for past reports
+                out[sym].append((rs, EARNINGS_HISTORY))
+        else:
+            # Reaction day unknown: the report reacts on the reported day OR the next trading day.
+            # Both are candidates, each gated to the past, tagged so the window records the uncertainty.
+            for cand in (reported, next_trading_day(reported)):
+                if cand <= today:
+                    out[sym].append((cand, EARNINGS_HISTORY_UNRESOLVED))
 
     cres = ch.query(
         f"SELECT symbol, earnings_date, earnings_timestamp FROM {EARNINGS_CALENDAR_TABLE} FINAL")
