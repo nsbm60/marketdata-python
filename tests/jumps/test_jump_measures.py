@@ -3,7 +3,10 @@
 import datetime as dt
 import math
 
-from jumps import ON_MAX_AGE_DAYS, ON_MIN_HISTORY, THETA, Z_INTRADAY, Z_OVERNIGHT, measures
+from jumps import (
+    BETA_MIN_HISTORY, MED_CHI2_1, ON_MAX_AGE_DAYS, ON_MIN_HISTORY, THETA, Z_INTRADAY, Z_OVERNIGHT,
+    measures,
+)
 
 
 # ── intraday jump z and flags ─────────────────────────────────────────────────────────────────────
@@ -85,12 +88,21 @@ def test_overnight_z_null_after_gap_with_too_few_recent_sessions():
 
 
 def test_overnight_z_value_and_min_history():
-    prev = [0.04] * 30                 # median 0.04, sqrt = 0.2
-    assert math.isclose(measures.overnight_z(0.6, prev), 0.6 / 0.2)
+    prev = [0.04] * 30                 # median 0.04
+    expected = 0.6 / math.sqrt(0.04 / MED_CHI2_1)   # scaled to a σ multiple
+    assert math.isclose(measures.overnight_z(0.6, prev), expected)
     # Fewer than ON_MIN_HISTORY previous sessions → None.
     assert measures.overnight_z(0.6, [0.04] * (ON_MIN_HISTORY - 1)) is None
     # Exactly ON_MIN_HISTORY is enough.
     assert measures.overnight_z(0.6, [0.04] * ON_MIN_HISTORY) is not None
+
+
+def test_overnight_z_scale_makes_normal_returns_sit_near_one_sigma():
+    # If o ~ N(0, σ²), the median of o² is MED_CHI2_1·σ²; dividing by MED_CHI2_1 recovers σ², so a
+    # 1σ move scores ~1.0 (the pre-fix scale would score ~1/sqrt(MED_CHI2_1) ≈ 1.48).
+    sigma = 0.02
+    prev = [MED_CHI2_1 * sigma * sigma] * 40   # a window whose median is exactly MED_CHI2_1·σ²
+    assert math.isclose(measures.overnight_z(sigma, prev), 1.0)
 
 
 def test_overnight_z_zero_median_is_null():
@@ -100,24 +112,68 @@ def test_overnight_z_zero_median_is_null():
 
 
 def test_overnight_flag_uses_ge_threshold():
-    prev = [0.01] * 30                 # median 0.01, sqrt 0.1
-    z_at = measures.overnight_z(Z_OVERNIGHT * 0.1, prev)   # exactly Z_OVERNIGHT
+    prev = [0.01] * 30
+    ret_at = Z_OVERNIGHT * math.sqrt(0.01 / MED_CHI2_1)   # scores exactly Z_OVERNIGHT
+    z_at = measures.overnight_z(ret_at, prev)
     assert math.isclose(z_at, Z_OVERNIGHT)
-    assert measures.overnight_flag(z_at) == 1              # >= is a jump
-    assert measures.overnight_flag(measures.overnight_z(0.3, prev)) == 0
+    assert measures.overnight_flag(z_at) == 1                           # >= is a jump
+    assert measures.overnight_flag(measures.overnight_z(ret_at * 0.5, prev)) == 0
     assert measures.overnight_flag(None) is None
 
 
-# ── SPY adjustment ──────────────────────────────────────────────────────────────────────────────
+# ── beta market adjustment ────────────────────────────────────────────────────────────────────────
 
-def test_overnight_ret_adj_is_difference_and_null_rules():
-    assert math.isclose(measures.overnight_ret_adj(0.05, 0.02, is_spy=False), 0.03)
-    assert measures.overnight_ret_adj(0.05, 0.02, is_spy=True) is None    # SPY itself
-    assert measures.overnight_ret_adj(0.05, None, is_spy=False) is None   # SPY has no row that date
-    assert measures.overnight_ret_adj(None, 0.02, is_spy=False) is None
+def test_beta_recovers_known_slope():
+    base, today = dt.date(2023, 1, 1), dt.date(2024, 1, 1)
+    # o = 2·o_spy + 0.5 exactly → OLS slope 2.0 (intercept irrelevant to the slope).
+    pairs = [(base + dt.timedelta(days=3 * i), 2.0 * (0.01 * math.sin(i)) + 0.5, 0.01 * math.sin(i))
+             for i in range(80)]
+    assert math.isclose(measures.beta(pairs, today), 2.0, abs_tol=1e-9)
+
+
+def test_beta_null_below_min_history():
+    base, today = dt.date(2023, 6, 1), dt.date(2024, 1, 1)
+    pairs = [(base + dt.timedelta(days=i), 0.5 * (0.01 * math.cos(i)), 0.01 * math.cos(i))
+             for i in range(BETA_MIN_HISTORY - 1)]
+    assert measures.beta(pairs, today) is None
+
+
+def test_beta_null_when_spy_variance_zero():
+    base, today = dt.date(2023, 6, 1), dt.date(2024, 1, 1)
+    pairs = [(base + dt.timedelta(days=i), 0.01 * i, 0.0) for i in range(70)]  # o_spy flat → var 0
+    assert measures.beta(pairs, today) is None
+
+
+def test_beta_excludes_sessions_where_spy_absent():
+    base, today = dt.date(2023, 1, 1), dt.date(2024, 1, 1)
+    good = [(base + dt.timedelta(days=3 * i), 2.0 * (0.01 * math.sin(i)) + 0.1, 0.01 * math.sin(i))
+            for i in range(70)]
+    missing = [(base + dt.timedelta(days=3 * i + 1), 0.9, None) for i in range(70)]  # SPY absent → dropped
+    pairs = sorted(good + missing, key=lambda t: t[0])
+    assert math.isclose(measures.beta(pairs, today), 2.0, abs_tol=1e-9)
+
+
+def test_beta_age_limit_drops_old_sessions():
+    today = dt.date(2024, 1, 1)
+    old = [(dt.date(2020, 1, 1) + dt.timedelta(days=i), 3.0 * (0.01 * math.sin(i)), 0.01 * math.sin(i))
+           for i in range(70)]                                              # >400 days old → dropped
+    recent = [(today - dt.timedelta(days=5 * (70 - i)), 2.0 * (0.01 * math.cos(i)), 0.01 * math.cos(i))
+              for i in range(70)]                                           # within ~345 days → kept
+    assert math.isclose(measures.beta(old + recent, today), 2.0, abs_tol=1e-9)
+
+
+# ── overnight adjustment and null rules ─────────────────────────────────────────────────────────
+
+def test_overnight_ret_adj_uses_beta_and_null_rules():
+    assert math.isclose(measures.overnight_ret_adj(0.05, 0.02, beta_hat=1.5, is_spy=False), 0.05 - 1.5 * 0.02)
+    assert measures.overnight_ret_adj(0.05, 0.02, beta_hat=1.5, is_spy=True) is None    # SPY itself
+    assert measures.overnight_ret_adj(0.05, 0.02, beta_hat=None, is_spy=False) is None  # β not estimable
+    assert measures.overnight_ret_adj(0.05, None, beta_hat=1.5, is_spy=False) is None   # SPY absent today
+    assert measures.overnight_ret_adj(None, 0.02, beta_hat=1.5, is_spy=False) is None
 
 
 def test_constants():
     assert math.isclose(THETA, (math.pi / 2) ** 2 + math.pi - 5)
     assert math.isclose(Z_INTRADAY, 3.0902323, abs_tol=1e-6)   # Φ⁻¹(0.999)
     assert Z_OVERNIGHT == 4.0
+    assert math.isclose(MED_CHI2_1, 0.4549364, abs_tol=1e-6)   # median of χ²₁

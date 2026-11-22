@@ -3,10 +3,12 @@ Jump-day record (roadmap-2026-11-16 Stage 3b part 1): method bns_v1.
 
 One row per trading.rv_daily row (source har-rv) in trading.jump_daily — per (symbol, trading_date),
 whether an intraday jump and an overnight jump happened, their size, and the overnight move net of
-the market (SPY). The intraday test is the Barndorff-Nielsen–Shephard RV-vs-BV ratio statistic
+the market. The intraday test is the Barndorff-Nielsen–Shephard RV-vs-BV ratio statistic
 (Huang–Tauchen form); the overnight test is |return| against the trailing median of its own squared
-returns, raw and SPY-adjusted. Every z is stored so the thresholds (a first setting) can be tuned in
-Stage 3b part 3 against this record.
+returns (rescaled to a σ by the median of χ²₁, so Z_OVERNIGHT is in σ), raw and market-adjusted. The
+adjustment is beta-based: overnight_ret − β·spy_ret, with β = cov(o, o_spy)/var(o_spy) estimated over
+the name's trailing sessions (not β = 1). Every z is stored so the thresholds (a first setting) can
+be tuned in Stage 3b part 3 against this record.
 
 - jump_daily.py — the set-based SQL (one statement per month like rv_daily), the fail-fast checks,
   the backfill summaries, and the read-only `show`.
@@ -35,7 +37,11 @@ SPY_SYMBOL = "SPY"           # the market proxy subtracted for the adjusted over
 THETA = (math.pi / 2) ** 2 + math.pi - 5
 # Φ⁻¹(0.999) ≈ 3.0902 — the intraday-jump cutoff on the (one-sided) standard-normal ratio statistic.
 Z_INTRADAY = NormalDist().inv_cdf(0.999)
-Z_OVERNIGHT = 4.0           # the overnight-jump cutoff on |overnight return| / trailing-median scale
+Z_OVERNIGHT = 4.0           # the overnight-jump cutoff, in σ (see MED_CHI2_1)
+# The median of χ²₁: if X~N(0,1) then median(X²) = (Φ⁻¹(0.75))² ≈ 0.454936. The trailing median of
+# overnight_ret² estimates median(o²) = MED_CHI2_1·σ², so σ² = median/MED_CHI2_1; dividing by it makes
+# overnight_z a true σ multiple (without it the "4" cutoff was really ~2.7σ and over-flagged).
+MED_CHI2_1 = NormalDist().inv_cdf(0.75) ** 2
 ON_WINDOW = 66              # trailing sessions (with rv_daily rows) the overnight median is taken over
 ON_MIN_HISTORY = 22         # fewer than this many recent sessions → overnight z is NULL
 # Age limit, part of the definition: a trailing session counts only if it is within this many calendar
@@ -44,9 +50,18 @@ ON_MIN_HISTORY = 22         # fewer than this many recent sessions → overnight
 # sessions is wrong. The trailing set is the previous rv_daily sessions, at most ON_WINDOW of them,
 # and only those within ON_MAX_AGE_DAYS (excluding today).
 ON_MAX_AGE_DAYS = 200
-# The statement's read lookback = ON_MAX_AGE_DAYS, so each month reads exactly everything the
-# definition can use for its rows' trailing medians (nothing older can count).
-_JUMP_LOOKBACK_DAYS = ON_MAX_AGE_DAYS
+
+# Beta for the market adjustment: β = cov(o, o_spy)/var(o_spy) over the name's previous sessions on
+# which both have a value, at most BETA_WINDOW of them and only within BETA_MAX_AGE_DAYS calendar days
+# (excluding today). NULL below BETA_MIN_HISTORY such sessions or a zero var(o_spy). A longer window
+# than the median's because a stable beta needs more history than a scale estimate.
+BETA_WINDOW = 252
+BETA_MIN_HISTORY = 66
+BETA_MAX_AGE_DAYS = 400
+
+# The statement's read lookback = the largest age limit, so each month reads everything the
+# definition can use for its rows' trailing medians and betas (nothing older can count).
+_JUMP_LOOKBACK_DAYS = max(ON_MAX_AGE_DAYS, BETA_MAX_AGE_DAYS)
 
 # Fully-qualified table names (Python stores names, never a second copy of the DDL).
 JUMP_DAILY_TABLE = "trading.jump_daily"

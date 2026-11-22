@@ -8,11 +8,12 @@ rv_daily (the month loop only keeps each statement small); each statement, over 
     month_end] so the trailing overnight medians are complete;
   - INNER JOINs trading.rv_daily (source har-rv) — this fixes the row set (one row per rv_daily row,
     nothing more) and supplies rv_intraday / bv_intraday / tq_intraday / n_bars;
-  - LEFT JOINs SPY's overnight return that date for the market-adjusted move;
-  - the two trailing medians are quantileExactInclusive(0.5) over the previous rv_daily sessions —
-    at most ON_WINDOW of them (a ROWS window), and only those within ON_MAX_AGE_DAYS calendar days
-    (an arrayFilter on each frame row's date against the current row's date, which is exact: the age
-    limit and the row cap can't both live in one SQL frame);
+  - LEFT JOINs SPY's overnight return that date and estimates a trailing OLS beta (BETA_WINDOW /
+    BETA_MAX_AGE_DAYS) so the market-adjusted move is overnight_ret − β·spy_ret, not a β=1 difference;
+  - the trailing medians and the beta are computed the same way — a ROWS window emits the recent
+    (date, value) frame as an array, then an arrayFilter against the current row's date applies the
+    calendar-age limit (exact: the age limit and the row cap can't both live in one SQL frame). The
+    overnight z's are scaled by MED_CHI2_1 so Z_OVERNIGHT is a σ multiple;
   - inserts rows with trading_date on/after month_start.
 
 SPY is always recomputed (even on a targeted --symbols rerun) so the adjustment always has a market
@@ -27,13 +28,14 @@ import datetime as dt
 import logging
 from typing import Any, List, Optional
 
-from ml.shared.calendar import previous_trading_day
+from ml.shared.calendar import next_trading_day, previous_trading_day
 
 from rv.rv_daily import OVERNIGHT_RET_SQL, _with_core
 
 from . import (
-    EARNINGS_HISTORY_TABLE, JUMP_DAILY_TABLE, METHOD, ON_MAX_AGE_DAYS, ON_MIN_HISTORY, ON_WINDOW,
-    RV_DAILY_TABLE, RV_SOURCE, SPY_SYMBOL, THETA, Z_INTRADAY, Z_OVERNIGHT, _JUMP_LOOKBACK_DAYS,
+    BETA_MAX_AGE_DAYS, BETA_MIN_HISTORY, BETA_WINDOW, EARNINGS_HISTORY_TABLE, JUMP_DAILY_TABLE,
+    MED_CHI2_1, METHOD, ON_MAX_AGE_DAYS, ON_MIN_HISTORY, ON_WINDOW, RV_DAILY_TABLE, RV_SOURCE,
+    SPY_SYMBOL, THETA, Z_INTRADAY, Z_OVERNIGHT, _JUMP_LOOKBACK_DAYS,
 )
 
 log = logging.getLogger("jumps.jump_daily")
@@ -98,9 +100,10 @@ def _insert_month(ch: Any, ms: dt.date, me: dt.date, symbols, only_missing: bool
     jz = (f"if(bv_intraday IS NULL OR tq_intraday IS NULL OR rv_intraday = 0 OR bv_intraday = 0, NULL, "
           f"((rv_intraday - bv_intraday) / rv_intraday) "
           f"/ sqrt({THETA!r} * (1.0 / toFloat64(n_bars)) * greatest(1.0, tq_intraday / pow(bv_intraday, 2))))")
-    oz = f"if(med_on IS NULL OR med_on = 0, NULL, abs(overnight_ret) / sqrt(med_on))"
+    oz = (f"if(med_on IS NULL OR med_on = 0, NULL, "
+          f"abs(overnight_ret) / sqrt(med_on / {MED_CHI2_1!r}))")
     oza = (f"if(overnight_ret_adj IS NULL OR med_on_adj IS NULL OR med_on_adj = 0, NULL, "
-           f"abs(overnight_ret_adj) / sqrt(med_on_adj))")
+           f"abs(overnight_ret_adj) / sqrt(med_on_adj / {MED_CHI2_1!r}))")
 
     sql = f"""
 INSERT INTO {JUMP_DAILY_TABLE}
@@ -123,36 +126,75 @@ base AS (
     SELECT rvd.symbol AS symbol, rvd.trading_date AS trading_date, rvd.n_bars AS n_bars,
            rvd.rv_intraday AS rv_intraday, rvd.bv_intraday AS bv_intraday, rvd.tq_intraday AS tq_intraday,
            rvd.rv_overnight AS rv_overnight, ov.overnight_ret AS overnight_ret,
-           if(rvd.symbol = '{SPY_SYMBOL}', NULL, ov.overnight_ret - spy.spy_ret) AS overnight_ret_adj
+           spy.spy_ret AS spy_ret, (rvd.symbol = '{SPY_SYMBOL}') AS is_spy
     FROM rvd
     INNER JOIN ov ON rvd.symbol = ov.symbol AND rvd.trading_date = ov.trading_date
     LEFT JOIN spy ON rvd.trading_date = spy.trading_date
 ),
-wn AS (
-    -- The up-to-ON_WINDOW most-recent preceding sessions (a ROWS frame, excluding today), each as a
-    -- (date, squared return) pair so the age limit can be applied against the current row's date.
+w1 AS (
+    -- Recent frames (ROWS windows, excluding today) as arrays of (date, value) so the calendar-age
+    -- limits can be applied against the current row's date below: the overnight median over the last
+    -- ON_WINDOW sessions, and the beta over the last BETA_WINDOW sessions ((date, o, o_spy) triples).
     SELECT *,
-           groupArray((trading_date, pow(overnight_ret, 2))) OVER w AS prev_on,
-           groupArray((trading_date, pow(overnight_ret_adj, 2))) OVER w AS prev_adj
+           groupArray((trading_date, pow(overnight_ret, 2))) OVER won AS prev_on,
+           groupArray((trading_date, overnight_ret, spy_ret)) OVER wb AS prev_beta
     FROM base
-    WINDOW w AS (PARTITION BY symbol ORDER BY trading_date ROWS BETWEEN {ON_WINDOW} PRECEDING AND 1 PRECEDING)
+    WINDOW won AS (PARTITION BY symbol ORDER BY trading_date ROWS BETWEEN {ON_WINDOW} PRECEDING AND 1 PRECEDING),
+           wb  AS (PARTITION BY symbol ORDER BY trading_date ROWS BETWEEN {BETA_WINDOW} PRECEDING AND 1 PRECEDING)
 ),
-m AS (
-    -- Keep only the frame rows within ON_MAX_AGE_DAYS of this row (the age limit — exact: the row cap
-    -- is the ROWS frame above, the age cap is this filter). For the adjusted series also drop the
-    -- days SPY was absent (NULL o_adj²). Median over the survivors; NULL below ON_MIN_HISTORY of them.
+flt AS (
+    -- Apply the age limits (exact: the row cap is the ROWS frame, the age cap is this filter).
+    -- on_recent: o² within ON_MAX_AGE_DAYS. beta_pairs: sessions within BETA_MAX_AGE_DAYS on which
+    -- SPY was present (o is always present on a jump_daily row).
     SELECT *,
            arrayMap(t -> t.2, arrayFilter(t -> t.1 >= trading_date - {ON_MAX_AGE_DAYS}, prev_on)) AS on_recent,
-           arrayMap(t -> t.2, arrayFilter(t -> t.1 >= trading_date - {ON_MAX_AGE_DAYS} AND isNotNull(t.2), prev_adj)) AS adj_recent
-    FROM wn
+           arrayFilter(t -> t.1 >= trading_date - {BETA_MAX_AGE_DAYS} AND isNotNull(t.3), prev_beta) AS beta_pairs
+    FROM w1
+),
+bsum AS (
+    SELECT *,
+           length(beta_pairs) AS n_beta,
+           arraySum(arrayMap(t -> t.2, beta_pairs)) AS sum_o,
+           arraySum(arrayMap(t -> assumeNotNull(t.3), beta_pairs)) AS sum_s,
+           arraySum(arrayMap(t -> assumeNotNull(t.3) * assumeNotNull(t.3), beta_pairs)) AS sum_ss,
+           arraySum(arrayMap(t -> t.2 * assumeNotNull(t.3), beta_pairs)) AS sum_os
+    FROM flt
+),
+bt AS (
+    -- beta_hat = cov(o, o_spy)/var(o_spy) over the trailing pairs (population sums; the 1/n² factors
+    -- cancel in the ratio). NULL below BETA_MIN_HISTORY pairs or a zero var. med_on (the raw overnight
+    -- median) is ready here; the adjusted median needs overnight_ret_adj to exist first (below).
+    SELECT *,
+           if(n_beta < {BETA_MIN_HISTORY} OR (toFloat64(n_beta) * sum_ss - sum_s * sum_s) = 0, NULL,
+              (toFloat64(n_beta) * sum_os - sum_o * sum_s)
+              / (toFloat64(n_beta) * sum_ss - sum_s * sum_s)) AS beta_hat,
+           if(length(on_recent) < {ON_MIN_HISTORY}, NULL,
+              arrayReduce('quantileExactInclusive(0.5)', on_recent)) AS med_on
+    FROM bsum
+),
+adj AS (
+    SELECT *,
+           if(is_spy OR beta_hat IS NULL OR spy_ret IS NULL, NULL,
+              overnight_ret - beta_hat * spy_ret) AS overnight_ret_adj
+    FROM bt
+),
+w2 AS (
+    -- The adjusted move's own trailing frame, now that overnight_ret_adj exists as a column.
+    SELECT *, groupArray((trading_date, pow(overnight_ret_adj, 2))) OVER won AS prev_adj
+    FROM adj
+    WINDOW won AS (PARTITION BY symbol ORDER BY trading_date ROWS BETWEEN {ON_WINDOW} PRECEDING AND 1 PRECEDING)
+),
+ar AS (
+    SELECT *,
+           arrayMap(t -> assumeNotNull(t.2),
+                    arrayFilter(t -> t.1 >= trading_date - {ON_MAX_AGE_DAYS} AND isNotNull(t.2), prev_adj)) AS adj_recent
+    FROM w2
 ),
 md AS (
     SELECT *,
-           if(length(on_recent) < {ON_MIN_HISTORY}, NULL,
-              arrayReduce('quantileExactInclusive(0.5)', on_recent)) AS med_on,
            if(length(adj_recent) < {ON_MIN_HISTORY}, NULL,
               arrayReduce('quantileExactInclusive(0.5)', adj_recent)) AS med_on_adj
-    FROM m
+    FROM ar
 ),
 z AS (
     SELECT *, {jz} AS jump_z, {oz} AS overnight_z, {oza} AS overnight_z_adj FROM md
@@ -309,6 +351,31 @@ def summary_earnings_explains(ch: Any) -> tuple:
     return (total, explained, explained / total)
 
 
+def summary_earnings_recall(ch: Any) -> List[tuple]:
+    """Recall the earnings work needs: over earnings_history reports since 2016 for names that have
+    jump_daily rows, per report year — (year, reports, hits, share) where a hit is overnight_jump_adj
+    = 1 on the reported day or the next trading day. Read-only."""
+    reports = ch.query(
+        f"SELECT symbol, reported_date FROM {EARNINGS_HISTORY_TABLE} FINAL "
+        f"WHERE reported_date >= '2016-01-01' AND symbol IN "
+        f"(SELECT DISTINCT symbol FROM {JUMP_DAILY_TABLE} FINAL WHERE method = '{METHOD}')"
+    ).result_rows
+    flags: dict[str, set] = {}
+    for sym, d in ch.query(
+        f"SELECT symbol, trading_date FROM {JUMP_DAILY_TABLE} FINAL "
+        f"WHERE method = '{METHOD}' AND overnight_jump_adj = 1"
+    ).result_rows:
+        flags.setdefault(str(sym), set()).add(d)
+    by_year: dict[int, list] = {}
+    for sym, rd in reports:
+        fs = flags.get(str(sym), ())
+        hit = rd in fs or next_trading_day(rd) in fs
+        row = by_year.setdefault(rd.year, [0, 0])
+        row[0] += 1
+        row[1] += 1 if hit else 0
+    return [(y, n, h, (h / n if n else 0.0)) for y, (n, h) in sorted(by_year.items())]
+
+
 def summary_orphans(ch: Any, limit: int = 20) -> tuple:
     """(count, [up to `limit` (symbol, date)]) — jump_daily rows with no rv_daily row. Reports only."""
     where = (f"FROM {JUMP_DAILY_TABLE} FINAL WHERE method = '{METHOD}' "
@@ -343,6 +410,12 @@ def print_backfill_summary(ch: Any) -> None:
     print(f"[jumps] 4. orphan jump_daily rows (no rv_daily row): {count:,}")
     for s, d in listed:
         print(f"    {s:8s} {d}")
+
+    print("[jumps] 5. earnings recall — reports with overnight_jump_adj=1 on the report day or next "
+          "trading day, by year:")
+    print(f"    {'year':6s} {'recall':>18s}")
+    for y, n, h, share in summary_earnings_recall(ch):
+        print(f"    {y:<6d} {f'{share * 100:.1f}% ({h}/{n})':>18s}")
 
 
 # ── read-only inspection ──────────────────────────────────────────────────────────────────────────

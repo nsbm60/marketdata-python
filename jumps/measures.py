@@ -11,13 +11,15 @@ Intraday (RV = rv_intraday, BV = bv_intraday, TQ = tq_intraday, n = n_bars):
   jump_var = max(RV − BV, 0) if intraday_jump == 1 else 0;  cont_var = RV − jump_var;  both None when
              intraday_jump is None.
 Overnight (signed overnight log return o; rv_overnight = o²):
-  overnight_z = |o| / sqrt(median of the trailing sessions' o², excluding today);  None when fewer
-                than ON_MIN_HISTORY of them, or the median is 0. The trailing sessions are the name's
-                previous rv_daily sessions, at most ON_WINDOW of them, and only those within
-                ON_MAX_AGE_DAYS calendar days of the row (so a name returning after a long gap gets
-                None until it has ON_MIN_HISTORY recent sessions).
+  overnight_z = |o| / sqrt(median(trailing o²) / MED_CHI2_1), excluding today;  None when fewer than
+                ON_MIN_HISTORY trailing sessions, or the median is 0. Dividing the median by MED_CHI2_1
+                (the median of χ²₁) turns it into a variance estimate, so overnight_z is a σ multiple.
+                The trailing sessions are the name's previous rv_daily sessions, at most ON_WINDOW of
+                them, and only those within ON_MAX_AGE_DAYS calendar days of the row (so a name
+                returning after a long gap gets None until it has ON_MIN_HISTORY recent sessions).
   overnight_jump = 1 if overnight_z >= Z_OVERNIGHT else 0;  None when overnight_z is None.
-  overnight_ret_adj = o − SPY's o that date;  None for SPY itself and when SPY has no row.
+  overnight_ret_adj = o − β·o_spy that date, β a trailing OLS slope (see beta());  None for SPY
+                itself, when β is None, and when SPY has no row that date.
   overnight_z_adj / overnight_jump_adj: the same rule on overnight_ret_adj, median of its own o_adj².
 """
 
@@ -28,7 +30,10 @@ import math
 from statistics import median as _median
 from typing import Optional, Sequence
 
-from . import ON_MAX_AGE_DAYS, ON_MIN_HISTORY, ON_WINDOW, THETA, Z_INTRADAY, Z_OVERNIGHT
+from . import (
+    BETA_MAX_AGE_DAYS, BETA_MIN_HISTORY, BETA_WINDOW, MED_CHI2_1, ON_MAX_AGE_DAYS, ON_MIN_HISTORY,
+    ON_WINDOW, THETA, Z_INTRADAY, Z_OVERNIGHT,
+)
 
 
 def intraday_jump_z(rv: float, bv: Optional[float], tq: Optional[float], n: int) -> Optional[float]:
@@ -69,8 +74,8 @@ def recent_sq(dated_sqs: Sequence[tuple], today: dt.date, window: int = ON_WINDO
 
 
 def overnight_z(ret: Optional[float], prev_sqs: Sequence[float]) -> Optional[float]:
-    """|ret| over sqrt(median of the previous squared returns). None when `ret` is None, when there
-    are fewer than ON_MIN_HISTORY previous sessions, or when the median is 0."""
+    """|ret| over sqrt(median(prev squared returns) / MED_CHI2_1) — a σ multiple. None when `ret` is
+    None, when there are fewer than ON_MIN_HISTORY previous sessions, or when the median is 0."""
     if ret is None:
         return None
     if len(prev_sqs) < ON_MIN_HISTORY:
@@ -78,7 +83,29 @@ def overnight_z(ret: Optional[float], prev_sqs: Sequence[float]) -> Optional[flo
     m = _median(prev_sqs)
     if m == 0:
         return None
-    return abs(ret) / math.sqrt(m)
+    return abs(ret) / math.sqrt(m / MED_CHI2_1)
+
+
+def beta(dated_pairs: Sequence[tuple], today: dt.date, window: int = BETA_WINDOW,
+         max_age: int = BETA_MAX_AGE_DAYS) -> Optional[float]:
+    """Trailing OLS slope β = cov(o, o_spy)/var(o_spy) for the market adjustment. `dated_pairs` is
+    ascending (date, o, o_spy) with o_spy possibly None (SPY absent that date). Over the previous
+    sessions (excludes today), the most recent `window`, then those within `max_age` days on which
+    o_spy is present. None below BETA_MIN_HISTORY such sessions or var(o_spy) = 0."""
+    prev = [(d, o, s) for (d, o, s) in dated_pairs if d < today]
+    prev = prev[-window:]
+    pairs = [(o, s) for (d, o, s) in prev if (today - d).days <= max_age and s is not None]
+    n = len(pairs)
+    if n < BETA_MIN_HISTORY:
+        return None
+    sum_o = sum(o for o, _ in pairs)
+    sum_s = sum(s for _, s in pairs)
+    sum_ss = sum(s * s for _, s in pairs)
+    sum_os = sum(o * s for o, s in pairs)
+    var_num = n * sum_ss - sum_s * sum_s
+    if var_num == 0:
+        return None
+    return (n * sum_os - sum_o * sum_s) / var_num
 
 
 def overnight_flag(z: Optional[float]) -> Optional[int]:
@@ -88,9 +115,10 @@ def overnight_flag(z: Optional[float]) -> Optional[int]:
 
 
 def overnight_ret_adj(name_ret: Optional[float], spy_ret: Optional[float],
-                      is_spy: bool) -> Optional[float]:
-    """The market-adjusted overnight move: the name's overnight return less SPY's that date. None for
-    SPY itself (nothing to adjust against) and None when SPY has no row that date."""
-    if is_spy or name_ret is None or spy_ret is None:
+                      beta_hat: Optional[float], is_spy: bool) -> Optional[float]:
+    """The market-adjusted overnight move: the name's overnight return less β·SPY's that date. None
+    for SPY itself (nothing to adjust against), when β could not be estimated, and when SPY has no row
+    that date."""
+    if is_spy or name_ret is None or spy_ret is None or beta_hat is None:
         return None
-    return name_ret - spy_ret
+    return name_ret - beta_hat * spy_ret
