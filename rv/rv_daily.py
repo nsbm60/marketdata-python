@@ -49,6 +49,11 @@ _MU = 2 ** (2 / 3) * math.gamma(7 / 6) / math.gamma(1 / 2)
 # The columns this extension adds; the operator must ALTER them in before the job runs.
 _NEW_COLUMNS = ("rs_down", "rs_up", "bv_intraday", "tq_intraday")
 
+# The signed overnight log return, over withsplit's columns (split ratio and dividend applied);
+# rv_overnight is this, squared. Exposed as a constant so downstream jobs (jumps) read the SAME
+# return rv_daily squares via `_with_core`, never a second copy of the expression.
+OVERNIGHT_RET_SQL = "log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0)))"
+
 
 def _symbol_filter(symbols) -> str:
     """` AND symbol IN ('A','B')` for a targeted rerun, or '' for all names."""
@@ -175,7 +180,7 @@ arrs AS (
     -- of arrayDifference) and the signed overnight return o (rv_overnight = o²), computed once here.
     SELECT withsplit.*,
            arrayPopFront(arrayDifference(arrayMap(p -> log(p), grid_px))) AS rets,
-           log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0))) AS overnight_ret
+           {OVERNIGHT_RET_SQL} AS overnight_ret
     FROM withsplit
 )
 SELECT
@@ -488,7 +493,7 @@ def check(ch) -> bool:
         grid_rows = ch.query(
             f"{_with_core(lo, date, symf)}"
             f"SELECT grid_px, "
-            f"log(day_open / ((prev_close / coalesce(split_ratio, 1.0)) - coalesce(div_usd, 0.0))) AS overnight_ret, "
+            f"{OVERNIGHT_RET_SQL} AS overnight_ret, "
             f"n_bars "
             f"FROM withsplit "
             f"WHERE trading_date = toDate('{date.isoformat()}') "
