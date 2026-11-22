@@ -1,8 +1,9 @@
 """Offline tests for the jump_daily measures reference (jumps/measures.py) — no ClickHouse."""
 
+import datetime as dt
 import math
 
-from jumps import ON_MIN_HISTORY, THETA, Z_INTRADAY, Z_OVERNIGHT, measures
+from jumps import ON_MAX_AGE_DAYS, ON_MIN_HISTORY, THETA, Z_INTRADAY, Z_OVERNIGHT, measures
 
 
 # ── intraday jump z and flags ─────────────────────────────────────────────────────────────────────
@@ -54,14 +55,33 @@ def test_tq_over_bv2_branch_floors_at_one():
 
 # ── overnight trailing-median z ─────────────────────────────────────────────────────────────────
 
-def test_trailing_sq_excludes_today_and_bounds_window():
-    series = [float(i) for i in range(100)]
-    # i = 50, window 66 → indices 0..49 (today excluded).
-    w = measures.trailing_sq(series, 50, window=66)
-    assert w == series[0:50]
-    # i = 90, window 66 → the 66 before 90, i.e. 24..89.
-    w2 = measures.trailing_sq(series, 90, window=66)
-    assert w2 == series[24:90] and len(w2) == 66
+def test_recent_sq_excludes_today_and_bounds_window():
+    base = dt.date(2024, 6, 1)
+    dated = [(base + dt.timedelta(days=i), float(i)) for i in range(100)]  # dense, 1 day apart
+    today = dated[80][0]
+    r = measures.recent_sq(dated, today, window=66, max_age=10_000)  # age slack
+    # excludes today (index 80); the most recent 66 before it are indices 14..79.
+    assert r == [float(i) for i in range(14, 80)] and len(r) == 66
+
+
+def test_recent_sq_age_limit_drops_sessions_older_than_the_gap():
+    today = dt.date(2020, 1, 20)
+    old = [(dt.date(2018, 6, 1) + dt.timedelta(days=i), 0.09) for i in range(40)]      # >200 days old
+    recent = [(today - dt.timedelta(days=12 - i), 0.04) for i in range(10)]            # 10 within ~2 weeks
+    r = measures.recent_sq(old + recent, today, window=66, max_age=ON_MAX_AGE_DAYS)
+    # The 2018 sessions are all more than 200 days old → dropped; only the 10 recent remain.
+    assert r == [0.04] * 10
+
+
+def test_overnight_z_null_after_gap_with_too_few_recent_sessions():
+    # The SMCI case: 66 old sessions (2018) then only a handful of recent ones. The ROWS-66 frame is
+    # full of old sessions, but the age limit drops them, leaving fewer than ON_MIN_HISTORY → None.
+    today = dt.date(2020, 1, 20)
+    old = [(dt.date(2018, 6, 1) + dt.timedelta(days=i), 0.09) for i in range(66)]
+    recent = [(today - dt.timedelta(days=5 - i), 0.04) for i in range(5)]              # 5 < ON_MIN_HISTORY
+    r = measures.recent_sq(old + recent, today, window=66, max_age=ON_MAX_AGE_DAYS)
+    assert len(r) == 5
+    assert measures.overnight_z(0.3, r) is None
 
 
 def test_overnight_z_value_and_min_history():

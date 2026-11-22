@@ -11,8 +11,11 @@ Intraday (RV = rv_intraday, BV = bv_intraday, TQ = tq_intraday, n = n_bars):
   jump_var = max(RV − BV, 0) if intraday_jump == 1 else 0;  cont_var = RV − jump_var;  both None when
              intraday_jump is None.
 Overnight (signed overnight log return o; rv_overnight = o²):
-  overnight_z = |o| / sqrt(median of the previous ON_WINDOW sessions' o², excluding today);  None when
-                fewer than ON_MIN_HISTORY previous sessions, or the median is 0.
+  overnight_z = |o| / sqrt(median of the trailing sessions' o², excluding today);  None when fewer
+                than ON_MIN_HISTORY of them, or the median is 0. The trailing sessions are the name's
+                previous rv_daily sessions, at most ON_WINDOW of them, and only those within
+                ON_MAX_AGE_DAYS calendar days of the row (so a name returning after a long gap gets
+                None until it has ON_MIN_HISTORY recent sessions).
   overnight_jump = 1 if overnight_z >= Z_OVERNIGHT else 0;  None when overnight_z is None.
   overnight_ret_adj = o − SPY's o that date;  None for SPY itself and when SPY has no row.
   overnight_z_adj / overnight_jump_adj: the same rule on overnight_ret_adj, median of its own o_adj².
@@ -20,11 +23,12 @@ Overnight (signed overnight log return o; rv_overnight = o²):
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 from statistics import median as _median
 from typing import Optional, Sequence
 
-from . import ON_MIN_HISTORY, ON_WINDOW, THETA, Z_INTRADAY, Z_OVERNIGHT
+from . import ON_MAX_AGE_DAYS, ON_MIN_HISTORY, ON_WINDOW, THETA, Z_INTRADAY, Z_OVERNIGHT
 
 
 def intraday_jump_z(rv: float, bv: Optional[float], tq: Optional[float], n: int) -> Optional[float]:
@@ -52,10 +56,16 @@ def jump_cont_var(rv: float, bv: Optional[float], flag: Optional[int]
     return (jump_var, rv - jump_var)
 
 
-def trailing_sq(sq_series: Sequence[float], i: int, window: int = ON_WINDOW) -> list[float]:
-    """The up-to-`window` squared returns strictly before index i — the trailing window excludes
-    today (index i) and reaches back at most `window` sessions."""
-    return list(sq_series[max(0, i - window):i])
+def recent_sq(dated_sqs: Sequence[tuple], today: dt.date, window: int = ON_WINDOW,
+              max_age: int = ON_MAX_AGE_DAYS) -> list[float]:
+    """The squared returns that feed the overnight median: from `dated_sqs` (ascending (date, o²)
+    pairs), the sessions strictly before `today` (excludes today), the most recent `window` of them,
+    then only those within `max_age` calendar days of `today`. Taking the most-recent-window and then
+    age-filtering is exact — it equals age-filtering first and then the most-recent-window, because
+    any session dropped by age is older than every session kept."""
+    prev = [(d, s) for (d, s) in dated_sqs if d < today]
+    prev = prev[-window:]
+    return [s for (d, s) in prev if (today - d).days <= max_age]
 
 
 def overnight_z(ret: Optional[float], prev_sqs: Sequence[float]) -> Optional[float]:

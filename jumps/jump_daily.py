@@ -9,8 +9,10 @@ rv_daily (the month loop only keeps each statement small); each statement, over 
   - INNER JOINs trading.rv_daily (source har-rv) — this fixes the row set (one row per rv_daily row,
     nothing more) and supplies rv_intraday / bv_intraday / tq_intraday / n_bars;
   - LEFT JOINs SPY's overnight return that date for the market-adjusted move;
-  - the two trailing medians are window functions (quantileExactInclusive(0.5) over the 66 preceding
-    sessions, excluding today);
+  - the two trailing medians are quantileExactInclusive(0.5) over the previous rv_daily sessions —
+    at most ON_WINDOW of them (a ROWS window), and only those within ON_MAX_AGE_DAYS calendar days
+    (an arrayFilter on each frame row's date against the current row's date, which is exact: the age
+    limit and the row cap can't both live in one SQL frame);
   - inserts rows with trading_date on/after month_start.
 
 SPY is always recomputed (even on a targeted --symbols rerun) so the adjustment always has a market
@@ -30,8 +32,8 @@ from ml.shared.calendar import previous_trading_day
 from rv.rv_daily import OVERNIGHT_RET_SQL, _with_core
 
 from . import (
-    EARNINGS_HISTORY_TABLE, JUMP_DAILY_TABLE, METHOD, ON_MIN_HISTORY, ON_WINDOW, RV_DAILY_TABLE,
-    RV_SOURCE, SPY_SYMBOL, THETA, Z_INTRADAY, Z_OVERNIGHT, _JUMP_LOOKBACK_DAYS,
+    EARNINGS_HISTORY_TABLE, JUMP_DAILY_TABLE, METHOD, ON_MAX_AGE_DAYS, ON_MIN_HISTORY, ON_WINDOW,
+    RV_DAILY_TABLE, RV_SOURCE, SPY_SYMBOL, THETA, Z_INTRADAY, Z_OVERNIGHT, _JUMP_LOOKBACK_DAYS,
 )
 
 log = logging.getLogger("jumps.jump_daily")
@@ -96,10 +98,9 @@ def _insert_month(ch: Any, ms: dt.date, me: dt.date, symbols, only_missing: bool
     jz = (f"if(bv_intraday IS NULL OR tq_intraday IS NULL OR rv_intraday = 0 OR bv_intraday = 0, NULL, "
           f"((rv_intraday - bv_intraday) / rv_intraday) "
           f"/ sqrt({THETA!r} * (1.0 / toFloat64(n_bars)) * greatest(1.0, tq_intraday / pow(bv_intraday, 2))))")
-    oz = (f"if(n_prev < {ON_MIN_HISTORY} OR med_on IS NULL OR med_on = 0, NULL, "
-          f"abs(overnight_ret) / sqrt(med_on))")
-    oza = (f"if(overnight_ret_adj IS NULL OR n_prev_adj < {ON_MIN_HISTORY} OR med_on_adj IS NULL "
-           f"OR med_on_adj = 0, NULL, abs(overnight_ret_adj) / sqrt(med_on_adj))")
+    oz = f"if(med_on IS NULL OR med_on = 0, NULL, abs(overnight_ret) / sqrt(med_on))"
+    oza = (f"if(overnight_ret_adj IS NULL OR med_on_adj IS NULL OR med_on_adj = 0, NULL, "
+           f"abs(overnight_ret_adj) / sqrt(med_on_adj))")
 
     sql = f"""
 INSERT INTO {JUMP_DAILY_TABLE}
@@ -128,16 +129,33 @@ base AS (
     LEFT JOIN spy ON rvd.trading_date = spy.trading_date
 ),
 wn AS (
+    -- The up-to-ON_WINDOW most-recent preceding sessions (a ROWS frame, excluding today), each as a
+    -- (date, squared return) pair so the age limit can be applied against the current row's date.
     SELECT *,
-           quantileExactInclusive(0.5)(pow(overnight_ret, 2)) OVER w AS med_on,
-           count() OVER w AS n_prev,
-           quantileExactInclusive(0.5)(pow(overnight_ret_adj, 2)) OVER w AS med_on_adj,
-           count(overnight_ret_adj) OVER w AS n_prev_adj
+           groupArray((trading_date, pow(overnight_ret, 2))) OVER w AS prev_on,
+           groupArray((trading_date, pow(overnight_ret_adj, 2))) OVER w AS prev_adj
     FROM base
     WINDOW w AS (PARTITION BY symbol ORDER BY trading_date ROWS BETWEEN {ON_WINDOW} PRECEDING AND 1 PRECEDING)
 ),
+m AS (
+    -- Keep only the frame rows within ON_MAX_AGE_DAYS of this row (the age limit — exact: the row cap
+    -- is the ROWS frame above, the age cap is this filter). For the adjusted series also drop the
+    -- days SPY was absent (NULL o_adj²). Median over the survivors; NULL below ON_MIN_HISTORY of them.
+    SELECT *,
+           arrayMap(t -> t.2, arrayFilter(t -> t.1 >= trading_date - {ON_MAX_AGE_DAYS}, prev_on)) AS on_recent,
+           arrayMap(t -> t.2, arrayFilter(t -> t.1 >= trading_date - {ON_MAX_AGE_DAYS} AND isNotNull(t.2), prev_adj)) AS adj_recent
+    FROM wn
+),
+md AS (
+    SELECT *,
+           if(length(on_recent) < {ON_MIN_HISTORY}, NULL,
+              arrayReduce('quantileExactInclusive(0.5)', on_recent)) AS med_on,
+           if(length(adj_recent) < {ON_MIN_HISTORY}, NULL,
+              arrayReduce('quantileExactInclusive(0.5)', adj_recent)) AS med_on_adj
+    FROM m
+),
 z AS (
-    SELECT *, {jz} AS jump_z, {oz} AS overnight_z, {oza} AS overnight_z_adj FROM wn
+    SELECT *, {jz} AS jump_z, {oz} AS overnight_z, {oza} AS overnight_z_adj FROM md
 ),
 f AS (
     SELECT *,
@@ -167,17 +185,18 @@ SETTINGS join_use_nulls = 1
         f"SELECT count() FROM {JUMP_DAILY_TABLE} FINAL WHERE method = '{METHOD}' "
         f"AND trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}'{rv_sym}"
     ).result_rows[0][0]
-    _check_month(ch, ms, me, rv_sym, lo)
+    _check_month(ch, ms, me, rv_sym)
     log.info("jump_daily %s..%s: %d rows", ms, me, n)
     print(f"[jumps] {ms} .. {me}: {n:,} rows")
     return n
 
 
-def _check_month(ch: Any, ms: dt.date, me: dt.date, rv_sym: str, lo: str) -> None:
+def _check_month(ch: Any, ms: dt.date, me: dt.date, rv_sym: str) -> None:
     """Fail fast, by name and date: any non-finite value, a negative variance, cont_var+jump_var that
     doesn't equal rv_intraday (1e-12 + 1e-9·RV), or overnight_ret² that doesn't equal the stored
-    rv_overnight (1e-12 + 1e-6·rv_overnight). Then the lookback-truncation guard — a median must never
-    be taken over fewer than a row's true ON_WINDOW history because the month's lookback was too short."""
+    rv_overnight (1e-12 + 1e-6·rv_overnight). No lookback-truncation guard is needed: the age limit
+    (ON_MAX_AGE_DAYS) is part of the definition and the read lookback equals it, so nothing the
+    definition can use is ever outside the month's read range."""
     jsym = (" AND j.symbol IN (" + rv_sym.split("IN (", 1)[1]) if rv_sym else ""
     bad = ch.query(
         f"SELECT j.symbol, toString(j.trading_date), j.jump_z, j.jump_var, j.cont_var, j.overnight_z, "
@@ -206,27 +225,6 @@ def _check_month(ch: Any, ms: dt.date, me: dt.date, rv_sym: str, lo: str) -> Non
             for s, d, jz, jv, cv, oz, orr, oza_, ora, rvi, rvo in bad)
         raise RuntimeError(
             f"jump_daily produced invalid rows for {ms}..{me} ({len(bad)}+ shown):\n{lines}")
-
-    # Truncation guard: for each emitted row, how many of its true 66 preceding rv_daily rows fell
-    # inside this month's lookback (look_prev) vs the size of that true window (frame66). If any row
-    # saw fewer than frame66, the lookback was too short and that row's median was taken over fewer
-    # sessions than the rule requires — fail and say to raise _JUMP_LOOKBACK_DAYS. Reads rv_daily only.
-    trunc = ch.query(
-        f"SELECT symbol, toString(trading_date), look_prev, frame66 FROM ("
-        f"  SELECT symbol, trading_date, "
-        f"    sum(trading_date >= toDate('{lo}')) OVER w66 AS look_prev, count() OVER w66 AS frame66 "
-        f"  FROM {RV_DAILY_TABLE} FINAL WHERE source = '{RV_SOURCE}'{rv_sym} "
-        f"  WINDOW w66 AS (PARTITION BY symbol ORDER BY trading_date "
-        f"                 ROWS BETWEEN {ON_WINDOW} PRECEDING AND 1 PRECEDING)) "
-        f"WHERE trading_date >= '{ms.isoformat()}' AND trading_date <= '{me.isoformat()}' "
-        f"AND look_prev < frame66 ORDER BY symbol, trading_date LIMIT 100"
-    ).result_rows
-    if trunc:
-        lines = "\n".join(f"    {s:8s} {d}  saw {lp} of {f6} preceding sessions" for s, d, lp, f6 in trunc)
-        raise RuntimeError(
-            f"jump_daily lookback too short for {ms}..{me}: {len(trunc)}+ rows whose trailing median "
-            f"would be taken over fewer than their ON_WINDOW history — raise _JUMP_LOOKBACK_DAYS "
-            f"(currently {_JUMP_LOOKBACK_DAYS} days):\n{lines}")
 
 
 def backfill(ch: Any, start: dt.date, end: dt.date, symbols=None) -> int:

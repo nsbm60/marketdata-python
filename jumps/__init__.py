@@ -37,11 +37,16 @@ THETA = (math.pi / 2) ** 2 + math.pi - 5
 Z_INTRADAY = NormalDist().inv_cdf(0.999)
 Z_OVERNIGHT = 4.0           # the overnight-jump cutoff on |overnight return| / trailing-median scale
 ON_WINDOW = 66              # trailing sessions (with rv_daily rows) the overnight median is taken over
-ON_MIN_HISTORY = 22         # fewer than this many previous sessions → overnight z is NULL
-# Calendar lookback each month's statement reads so the ON_WINDOW trailing median is complete: ~138
-# trading sessions, comfortably over ON_WINDOW. A per-month guard fails by name/date if this is ever
-# too short to hold a row's ON_WINDOW history (so a median is never silently taken over fewer rows).
-_JUMP_LOOKBACK_DAYS = 200
+ON_MIN_HISTORY = 22         # fewer than this many recent sessions → overnight z is NULL
+# Age limit, part of the definition: a trailing session counts only if it is within this many calendar
+# days before the row's date. A name returning after a gap (e.g. SMCI, delisted 2018 → relisted Jan
+# 2020) gets NULL until it has ON_MIN_HISTORY sessions this recent — a median built from year-old
+# sessions is wrong. The trailing set is the previous rv_daily sessions, at most ON_WINDOW of them,
+# and only those within ON_MAX_AGE_DAYS (excluding today).
+ON_MAX_AGE_DAYS = 200
+# The statement's read lookback = ON_MAX_AGE_DAYS, so each month reads exactly everything the
+# definition can use for its rows' trailing medians (nothing older can count).
+_JUMP_LOOKBACK_DAYS = ON_MAX_AGE_DAYS
 
 # Fully-qualified table names (Python stores names, never a second copy of the DDL).
 JUMP_DAILY_TABLE = "trading.jump_daily"
