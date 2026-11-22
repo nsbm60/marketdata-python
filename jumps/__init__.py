@@ -59,9 +59,13 @@ BETA_WINDOW = 252
 BETA_MIN_HISTORY = 66
 BETA_MAX_AGE_DAYS = 400
 
-# The statement's read lookback = the largest age limit, so each month reads everything the
-# definition can use for its rows' trailing medians and betas (nothing older can count).
-_JUMP_LOOKBACK_DAYS = max(ON_MAX_AGE_DAYS, BETA_MAX_AGE_DAYS)
+# The statement's read lookback is the SUM of the two age limits, not the larger. A row's
+# overnight_z_adj takes the median of the previous days' overnight_ret_adj (back to ON_MAX_AGE_DAYS),
+# and each of those days' beta needs BETA_MAX_AGE_DAYS of history before it — so the oldest datum any
+# emitted row depends on is ON_MAX_AGE_DAYS + BETA_MAX_AGE_DAYS back. Reading only the larger limit
+# would build the oldest median days' betas on truncated history and the medians using them would be
+# silently off.
+_JUMP_LOOKBACK_DAYS = ON_MAX_AGE_DAYS + BETA_MAX_AGE_DAYS
 
 # Fully-qualified table names (Python stores names, never a second copy of the DDL).
 JUMP_DAILY_TABLE = "trading.jump_daily"

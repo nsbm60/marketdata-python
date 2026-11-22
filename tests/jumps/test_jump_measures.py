@@ -4,8 +4,8 @@ import datetime as dt
 import math
 
 from jumps import (
-    BETA_MIN_HISTORY, MED_CHI2_1, ON_MAX_AGE_DAYS, ON_MIN_HISTORY, THETA, Z_INTRADAY, Z_OVERNIGHT,
-    measures,
+    BETA_MAX_AGE_DAYS, BETA_MIN_HISTORY, MED_CHI2_1, ON_MAX_AGE_DAYS, ON_MIN_HISTORY, THETA,
+    Z_INTRADAY, Z_OVERNIGHT, _JUMP_LOOKBACK_DAYS, measures,
 )
 
 
@@ -177,3 +177,51 @@ def test_constants():
     assert math.isclose(Z_INTRADAY, 3.0902323, abs_tol=1e-6)   # Φ⁻¹(0.999)
     assert Z_OVERNIGHT == 4.0
     assert math.isclose(MED_CHI2_1, 0.4549364, abs_tol=1e-6)   # median of χ²₁
+
+
+# ── read lookback must be the SUM of the two age limits ─────────────────────────────────────────────
+
+def _z_adj_from_series(series, target_date):
+    """Compute one row's overnight_z_adj end to end from a (date, o, o_spy) series: the row's own
+    beta → its overnight_ret_adj, then the trailing median of the previous days' overnight_ret_adj²
+    (each previous day's o_adj uses that day's own beta). Mirrors the SQL's dependency chain."""
+    D, o_D, spy_D = next(t for t in series if t[0] == target_date)
+    o_adj_D = measures.overnight_ret_adj(o_D, spy_D, measures.beta(series, D), is_spy=False)
+    dated_sqs = []
+    for (d, o, s) in series:
+        if d >= D:
+            continue
+        oa = measures.overnight_ret_adj(o, s, measures.beta(series, d), is_spy=False)
+        if oa is not None:
+            dated_sqs.append((d, oa * oa))
+    recent = measures.recent_sq(dated_sqs, D)   # defaults: ON_WINDOW rows, ON_MAX_AGE_DAYS age
+    return measures.overnight_z(o_adj_D, recent)
+
+
+def test_adjusted_z_lookback_is_the_sum_of_age_limits():
+    # The constant must be the sum, not the larger.
+    assert _JUMP_LOOKBACK_DAYS == ON_MAX_AGE_DAYS + BETA_MAX_AGE_DAYS
+
+    # A series spaced so both age caps bind: the median reaches ~ON_MAX_AGE_DAYS back, and the oldest
+    # median day's beta reaches ~BETA_MAX_AGE_DAYS before it — so the row depends on data up to the
+    # sum (600 days) back. o = 1.2·o_spy + idiosyncratic, so beta depends on the full window.
+    series = []
+    d0 = dt.date(2018, 1, 1)
+    for i in range(300):                       # 4-day spacing → ~1196-day span
+        d = d0 + dt.timedelta(days=4 * i)
+        s = 0.01 * math.sin(0.3 * i)
+        o = 1.2 * s + 0.004 * math.cos(0.5 * i)
+        series.append((d, o, s))
+    D = series[-1][0]
+
+    z_full = _z_adj_from_series(series, D)
+    assert z_full is not None
+
+    lb = ON_MAX_AGE_DAYS + BETA_MAX_AGE_DAYS
+    trim_sum = [t for t in series if t[0] >= D - dt.timedelta(days=lb)]
+    assert _z_adj_from_series(trim_sum, D) == z_full      # the sum reads everything the row uses
+
+    # Trimming at only the larger age limit (BETA_MAX_AGE_DAYS) truncates the oldest median days'
+    # betas, so the adjusted z silently changes — this is the bug the sum fixes.
+    trim_short = [t for t in series if t[0] >= D - dt.timedelta(days=BETA_MAX_AGE_DAYS)]
+    assert _z_adj_from_series(trim_short, D) != z_full
