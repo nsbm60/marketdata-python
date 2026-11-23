@@ -25,6 +25,20 @@ SOURCE_METHOD = "iso_v1"              # the iv_curve_daily method the windows ar
 LEDGER_DATASET = "iv_event_fwd_v1"    # trading.option_archive_ledger dataset marking processed pairs
 RV_SOURCE = "har-rv"                  # the rv_daily source the day weights are measured from
 
+# Stage 3b part 3 — the event-outcome record (iv_event_outcome.method) and the methods it reads.
+OUTCOME_METHOD = "out_v1"             # this package's outcome method (iv_event_outcome.method)
+WINDOW_METHOD = METHOD               # the detector method an outcome scores (iv_event_outcome.window_method)
+JUMP_METHOD = "bns_v1"               # the jump_daily method the outcome reads
+# A date is market-wide when at least this many names carry overnight_jump_adj = 1 that day — the SAME
+# constant and definition as the Scala EarningsReaction reaction rule (MARKET_WIDE_MIN_NAMES); keep
+# the two in step.
+MARKET_WIDE_MIN_NAMES = 100
+# The outcome backfill-summary prints break windows into excess_days bands and require this much
+# window support before a band is reported (as `top`/`show` use SHOW_FLAG_SUPPORT).
+OUTCOME_SUMMARY_MIN_SUPPORT = 100.0
+# excess_days bands for proof item 2: [lo, hi) in normal-day units; the last is open-ended.
+OUTCOME_EXCESS_DAYS_BANDS = ((None, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, None))
+
 # The curve rows the windows read (iv_curve_daily's own kind/status vocabulary).
 CURVE_KIND_EXPIRY = "expiry"
 CURVE_STATUS_OK = "ok"
@@ -50,8 +64,12 @@ EARNINGS_CALENDAR = "earnings_calendar"
 # Fully-qualified table names (Python stores names, never a second copy of the DDL).
 IV_EVENT_TABLE = "trading.iv_event_window"
 IV_EVENT_DAYTYPE_TABLE = "trading.iv_event_daytype"
+IV_EVENT_OUTCOME_TABLE = "trading.iv_event_outcome"
 IV_CURVE_TABLE = "trading.iv_curve_daily"
 RV_DAILY_TABLE = "trading.rv_daily"
+JUMP_DAILY_TABLE = "trading.jump_daily"
+CORPORATE_ACTION_TABLE = "trading.corporate_action"
+SPLIT_EFFECTIVE_TABLE = "trading.split_effective"
 EARNINGS_HISTORY_TABLE = "trading.earnings_history"
 EARNINGS_CALENDAR_TABLE = "trading.earnings_calendar"
 LEDGER_TABLE = "trading.option_archive_ledger"

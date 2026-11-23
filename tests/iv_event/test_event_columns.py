@@ -11,6 +11,7 @@ import pytest
 
 from iv_event.daytype import _DAYTYPE_COLUMNS
 from iv_event.event import COLUMNS
+from iv_event.outcome_event import OUTCOME_COLUMNS
 
 
 def _canonical_ddl_path() -> Path:
@@ -54,3 +55,12 @@ def test_daytype_writer_columns_match_the_iv_event_daytype_ddl() -> None:
     assert set(ddl_cols) - {"computed_at"} == set(_DAYTYPE_COLUMNS)
     assert "computed_at" not in _DAYTYPE_COLUMNS
     assert "computed_at" in ddl_cols
+
+
+def test_outcome_writer_columns_match_the_iv_event_outcome_ddl() -> None:
+    ddl_cols = _table_columns(_ddl(), "trading.iv_event_outcome")
+    # The writer provides every DDL column, computed_at included (no DEFAULT on it in the DDL), and
+    # the insert order matches DDL order.
+    assert set(ddl_cols) == set(OUTCOME_COLUMNS)
+    assert "computed_at" in OUTCOME_COLUMNS
+    assert list(OUTCOME_COLUMNS) == ddl_cols
