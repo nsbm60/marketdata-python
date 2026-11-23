@@ -39,13 +39,13 @@ def test_start_td_band_boundaries() -> None:
     assert score.start_td_band(99) == "21+"
 
 
-def test_eff_days_band_boundaries() -> None:
-    assert score.eff_days_band(0.0) == "<=5"
-    assert score.eff_days_band(5.0) == "<=5"        # 5 is in the first band
-    assert score.eff_days_band(5.01) == "5-10"
-    assert score.eff_days_band(10.0) == "5-10"      # 10 is in the middle band
-    assert score.eff_days_band(10.01) == "10+"
-    assert score.eff_days_band(42.0) == "10+"
+def test_is_short_window_boundary() -> None:
+    assert score.is_short_window(0.0) is True
+    assert score.is_short_window(4.99) is True
+    assert score.is_short_window(5.0) is True        # exactly 5 is short
+    assert score.is_short_window(5.01) is False
+    assert score.is_short_window(10.0) is False
+    assert score.is_short_window(42.0) is False
 
 
 # ── the three-way group rule (own, start_expiry, session_date, end_expiry, reaction_days) ─────────────
@@ -119,6 +119,17 @@ def test_choose_cutoff_treats_a_missing_or_none_share_as_not_reaching() -> None:
     assert cutoff == 1.0 and reached is True
     # Nothing qualifies at all → fallback.
     assert score.choose_cutoff([(0.5, None)]) == (2.0, False)
+
+
+def test_choose_cutoff_fed_the_short_table_picks_on_short_hit_shares() -> None:
+    # The threshold is chosen on the OTHER group's SHORT table. Here the short windows reach 0.80 at
+    # cutoff 2; a long table (which fails the one-day test and never reaches 0.80) must not be the
+    # input. Feeding the short (cutoff, hit_share) rows yields the short-driven cutoff.
+    short_table = [(0.5, 0.52), (1.0, 0.68), (1.5, 0.74), (2.0, 0.83), (3.0, 0.9), (5.0, 0.95)]
+    long_table = [(0.5, 0.10), (1.0, 0.15), (1.5, 0.2), (2.0, 0.28), (3.0, 0.35), (5.0, 0.4)]
+    assert score.choose_cutoff(short_table) == (2.0, True)
+    # The long table would fall back; confirming the two differ, i.e. feeding the wrong one matters.
+    assert score.choose_cutoff(long_table) == (score.FALLBACK_CUTOFF, False)
 
 
 # ── dedupe rules ─────────────────────────────────────────────────────────────────────────────────────
