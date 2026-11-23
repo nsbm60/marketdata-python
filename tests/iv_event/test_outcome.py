@@ -69,12 +69,12 @@ def test_realized_empty_window_is_null_not_zero() -> None:
 
 # ── jump stats ─────────────────────────────────────────────────────────────────────────────────────
 
-def test_jump_stats_counts_either_flag_and_tracks_first_and_max_abs_adj() -> None:
+def test_jump_stats_counts_any_flag_and_tracks_first_and_max_abs_adj() -> None:
     days = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
     rows: Dict[date, JumpRow] = {
-        days[0]: JumpRow(overnight_jump_adj=0, intraday_jump=0, overnight_ret_adj=-0.01),
-        days[1]: JumpRow(overnight_jump_adj=1, intraday_jump=0, overnight_ret_adj=0.05),   # jump (overnight)
-        days[2]: JumpRow(overnight_jump_adj=0, intraday_jump=1, overnight_ret_adj=0.02),   # jump (intraday)
+        days[0]: JumpRow(overnight_jump=0, overnight_jump_adj=0, intraday_jump=0, overnight_ret_adj=-0.01),
+        days[1]: JumpRow(overnight_jump=1, overnight_jump_adj=1, intraday_jump=0, overnight_ret_adj=0.05),  # jump (overnight)
+        days[2]: JumpRow(overnight_jump=0, overnight_jump_adj=0, intraday_jump=1, overnight_ret_adj=0.02),  # jump (intraday)
         # days[3] has no jump_daily row at all
     }
     n, first, max_abs = oc.jump_stats(days, rows)
@@ -83,9 +83,25 @@ def test_jump_stats_counts_either_flag_and_tracks_first_and_max_abs_adj() -> Non
     assert abs(max_abs - 0.05) < 1e-12
 
 
+def test_jump_stats_counts_raw_overnight_jump_when_adj_is_null() -> None:
+    # The SPY case: overnight_jump = 1 but overnight_jump_adj is NULL (benchmark → no adjusted flag)
+    # and intraday_jump = 0. The raw overnight flag alone must make it a jump day and set first_jump.
+    days = [date(2024, 8, 2), date(2024, 8, 5), date(2024, 8, 6)]
+    rows = {
+        days[0]: JumpRow(overnight_jump=0, overnight_jump_adj=None, intraday_jump=0, overnight_ret_adj=None),
+        days[1]: JumpRow(overnight_jump=1, overnight_jump_adj=None, intraday_jump=0, overnight_ret_adj=None),
+        days[2]: JumpRow(overnight_jump=0, overnight_jump_adj=None, intraday_jump=0, overnight_ret_adj=None),
+    }
+    n, first, max_abs = oc.jump_stats(days, rows)
+    assert n == 1
+    assert first == days[1]
+    assert max_abs is None   # adj is NULL throughout (SPY) → max_abs_ret_adj stays NULL
+
+
 def test_jump_stats_max_abs_ret_adj_null_when_all_null() -> None:
     days = [date(2024, 1, 2), date(2024, 1, 3)]
-    rows = {d: JumpRow(overnight_jump_adj=0, intraday_jump=0, overnight_ret_adj=None) for d in days}
+    rows = {d: JumpRow(overnight_jump=0, overnight_jump_adj=0, intraday_jump=0, overnight_ret_adj=None)
+            for d in days}
     n, first, max_abs = oc.jump_stats(days, rows)
     assert n == 0 and first is None and max_abs is None
 

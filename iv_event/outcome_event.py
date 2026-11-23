@@ -141,14 +141,15 @@ def _read_jumps(ch: Any, underlyings: Set[str], lo: dt.date, hi: dt.date
     if not underlyings:
         return {}
     res = ch.query(
-        f"SELECT symbol, trading_date, overnight_jump_adj, intraday_jump, overnight_ret_adj "
-        f"FROM {JUMP_DAILY_TABLE} FINAL "
+        f"SELECT symbol, trading_date, overnight_jump, overnight_jump_adj, intraday_jump, "
+        f"overnight_ret_adj FROM {JUMP_DAILY_TABLE} FINAL "
         f"WHERE method = %(m)s AND symbol IN %(u)s AND trading_date BETWEEN %(a)s AND %(b)s",
         parameters={"m": JUMP_METHOD, "u": list(underlyings), "a": lo, "b": hi})
     return {(str(r[0]).upper(), r[1]): oc.JumpRow(
-        overnight_jump_adj=None if r[2] is None else int(r[2]),
-        intraday_jump=None if r[3] is None else int(r[3]),
-        overnight_ret_adj=None if r[4] is None else float(r[4])) for r in res.result_rows}
+        overnight_jump=None if r[2] is None else int(r[2]),
+        overnight_jump_adj=None if r[3] is None else int(r[3]),
+        intraday_jump=None if r[4] is None else int(r[4]),
+        overnight_ret_adj=None if r[5] is None else float(r[5])) for r in res.result_rows}
 
 
 def _read_curve(ch: Any, underlyings: Set[str], expiries: Set[dt.date], lo: dt.date, hi: dt.date

@@ -12,8 +12,10 @@ start_expiry S (None = anchor), end_expiry E, end_td, eff_days and normal_daily_
   - realized: n_rv_days = window days with an rv_daily row; realized_var = Σ rv_total over them, but
     NULL unless every window day has a row (no partial sums); realized_excess_var = realized_var −
     normal_daily_var·eff_days (NULL when realized_var is);
-  - jump_stats: n_jump_days / first_jump_date over window days flagged overnight_jump_adj=1 or
-    intraday_jump=1; max_abs_ret_adj = the largest |overnight_ret_adj| (NULL if all NULL);
+  - jump_stats: n_jump_days / first_jump_date over window days flagged overnight_jump=1 or
+    overnight_jump_adj=1 or intraday_jump=1 (the raw overnight flag counts too, so SPY and beta≈1
+    index ETFs still register their gaps); max_abs_ret_adj = the largest |overnight_ret_adj| (NULL if
+    all NULL, i.e. for SPY);
   - releases: for each window day d, release(d) = TV(d_prev, E) − TV(d, E) with TV(E, E) = 0, present
     only when both values exist; excess_release(d) = release(d) − normal_daily_var·w(d) with w the
     day's daytype weight; crush = the largest excess_release, earliest on a tie;
@@ -67,8 +69,9 @@ class Outcome:
 
 @dataclass(frozen=True)
 class JumpRow:
-    """A window day's jump_daily row, the only three fields the outcome uses (None = NULL)."""
+    """A window day's jump_daily row, the only fields the outcome uses (None = NULL)."""
 
+    overnight_jump: Optional[int]
     overnight_jump_adj: Optional[int]
     intraday_jump: Optional[int]
     overnight_ret_adj: Optional[float]
@@ -96,15 +99,18 @@ def jump_stats(days: Sequence[date],
                jump_by_date: Dict[date, JumpRow]
                ) -> "tuple[int, Optional[date], Optional[float]]":
     """(n_jump_days, first_jump_date, max_abs_ret_adj). A window day counts as a jump day when its
-    jump_daily row has overnight_jump_adj = 1 OR intraday_jump = 1; max_abs_ret_adj is the largest
-    |overnight_ret_adj| over the window days with a non-NULL value (None if all NULL/absent)."""
+    jump_daily row has overnight_jump = 1 OR overnight_jump_adj = 1 OR intraday_jump = 1 — the raw
+    overnight flag is included so SPY (whose overnight_jump_adj is always NULL, being the benchmark)
+    and beta≈1 index ETFs still count their overnight gaps. max_abs_ret_adj is unchanged: the largest
+    |overnight_ret_adj| over the window days with a non-NULL value (None if all NULL/absent, so NULL
+    for SPY)."""
     jump_dates: List[date] = []
     abs_adj: List[float] = []
     for d in days:
         row = jump_by_date.get(d)
         if row is None:
             continue
-        if row.overnight_jump_adj == 1 or row.intraday_jump == 1:
+        if row.overnight_jump == 1 or row.overnight_jump_adj == 1 or row.intraday_jump == 1:
             jump_dates.append(d)
         if row.overnight_ret_adj is not None:
             abs_adj.append(abs(row.overnight_ret_adj))
