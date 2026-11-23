@@ -8,6 +8,7 @@ Implied event detector commands (roadmap-2026-11-16 Stage 3, method fwd_v1).
     python -m iv_event top <from> <to> [--min-support N]
     python -m iv_event outcome-backfill <from> <to>   # event outcomes for passed windows, session_date from..to
     python -m iv_event outcome-show <date> <underlying>
+    python -m iv_event outcome-score                  # score fwd_v1 windows vs out_v1 outcomes (read-only)
 
 This package never creates tables: the trading.iv_event_window, trading.iv_event_daytype and
 trading.iv_event_outcome DDL lives in Scala's database_schema.sql and is applied by hand.
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ml.shared.clickhouse import get_ch_client  # noqa: E402
 from iv_event import (  # noqa: E402
-    TOP_DEFAULT_MIN_SUPPORT, daytype as daytype_mod, event, outcome_event, show as show_mod,
+    TOP_DEFAULT_MIN_SUPPORT, daytype as daytype_mod, event, outcome_event, score, show as show_mod,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -57,6 +58,7 @@ def main() -> None:
     os_ = sub.add_parser("outcome-show")
     os_.add_argument("date", help="session_date, YYYY-MM-DD")
     os_.add_argument("underlying", help="underlying ticker")
+    sub.add_parser("outcome-score")
     args = p.parse_args()
 
     ch: Any = get_ch_client()
@@ -110,6 +112,8 @@ def main() -> None:
         outcome_event.print_backfill_summary(ch)
     elif args.cmd == "outcome-show":
         show_mod.outcome_show(ch, dt.date.fromisoformat(args.date), args.underlying)
+    elif args.cmd == "outcome-score":
+        score.print_score_report(ch)
 
 
 if __name__ == "__main__":

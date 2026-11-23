@@ -375,11 +375,13 @@ def outcome_daily(ch: Any) -> int:
 def _joined_cte() -> str:
     return (
         f"o AS (SELECT * FROM {IV_EVENT_OUTCOME_TABLE} FINAL WHERE method = '{OUTCOME_METHOD}'), "
-        f"w AS (SELECT underlying, session_date, end_td, excess_days, excess_var, support, "
-        f"             own_earnings_date "
+        f"w AS (SELECT underlying, session_date, end_td, start_td, excess_days, excess_var, support, "
+        f"             normal_daily_var, own_earnings_date "
         f"      FROM {IV_EVENT_TABLE} FINAL WHERE method = '{WINDOW_METHOD}' AND status = '{STATUS_OK}'), "
-        f"j AS (SELECT o.*, w.excess_days AS w_excess_days, w.excess_var AS w_excess_var, "
-        f"             w.support AS w_support, w.own_earnings_date AS w_own_earnings_date "
+        f"j AS (SELECT o.*, w.start_td AS w_start_td, w.excess_days AS w_excess_days, "
+        f"             w.excess_var AS w_excess_var, w.support AS w_support, "
+        f"             w.normal_daily_var AS w_normal_daily_var, "
+        f"             w.own_earnings_date AS w_own_earnings_date "
         f"      FROM o INNER JOIN w "
         f"        ON o.underlying = w.underlying AND o.session_date = w.session_date "
         f"       AND o.end_td = w.end_td)")
