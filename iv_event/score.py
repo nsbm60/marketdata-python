@@ -22,7 +22,7 @@ earnings:
                      matched case-insensitively. Computed in SQL from earnings_history FINAL;
   - other          = the rest.
 
-Short vs long windows: a window is SHORT when eff_days <= SHORT_WINDOW_MAX_EFF_DAYS (5) — one weekly,
+Short vs long windows: a window is SHORT when eff_days <= EVENT_MAX_EFF_DAYS (5) — one weekly,
 the window that can date a one-day event. Long windows (eff_days > 5, typically monthly-to-monthly)
 carry excess from the curve's slope spread over weeks, not a datable event; they fail the one-day hit
 test by construction and dominate the false-alarm list. So the threshold is chosen on the OTHER group's
@@ -35,7 +35,7 @@ Definitions (in plain words):
   - realized_excess_days  = realized_excess_var / normal_daily_var;
   - hit                   = crush_excess_var >= 0.5 * excess_var — at least half the priced excess came
                             off on one day. A NULL crush_excess_var is NOT a hit;
-  - short window          = eff_days <= SHORT_WINDOW_MAX_EFF_DAYS (5);
+  - short window          = eff_days <= EVENT_MAX_EFF_DAYS (5);
   - cutoff grid (excess_days): 0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10.
 
 The threshold (part 2) is the smallest grid cutoff at which the OTHER group's SHORT windows reach a hit
@@ -51,8 +51,8 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import (
-    EARNINGS_HISTORY_TABLE, JUMP_DAILY_TABLE, JUMP_METHOD, MARKET_WIDE_MIN_NAMES,
-    OUTCOME_SUMMARY_MIN_SUPPORT,
+    EARNINGS_HISTORY_TABLE, EVENT_MAX_EFF_DAYS, EVENT_MAX_START_TD, EVENT_MIN_EXCESS_DAYS,
+    JUMP_DAILY_TABLE, JUMP_METHOD, MARKET_WIDE_MIN_NAMES, OUTCOME_SUMMARY_MIN_SUPPORT,
 )
 from . import outcome_event
 
@@ -69,10 +69,10 @@ TOP_DATES_FOR_MONDAY_SHARE = 20   # the top crush dates per year the Monday shar
 # before the window start or after end_expiry — the market pricing an event before the company confirms
 # it (reaction day outside the window, so own_earnings_date is NULL).
 NEAR_EARNINGS_DAYS = 14
-# A window is "short" when eff_days <= this (one weekly) — the window that can date a one-day event.
-# Long windows (monthly-to-monthly) carry curve-slope excess spread over weeks, fail the one-day hit
-# test by construction, and dominate the false-alarm list; the threshold is chosen on short only.
-SHORT_WINDOW_MAX_EFF_DAYS = 5.0
+# A window is "short" when eff_days <= EVENT_MAX_EFF_DAYS (one weekly) — the window that can date a
+# one-day event. Long windows (monthly-to-monthly) carry curve-slope excess spread over weeks, fail
+# the one-day hit test by construction, and dominate the false-alarm list; the threshold is chosen on
+# short only. The short-window cutoff IS the event rule's eff_days bound (iv_event.EVENT_MAX_EFF_DAYS).
 
 # The three group labels (match the SQL `grp` literals).
 GROUP_EARNINGS = "earnings"
@@ -109,9 +109,9 @@ def start_td_band(start_td: int) -> str:
 
 
 def is_short_window(eff_days: float) -> bool:
-    """A window is short when eff_days <= SHORT_WINDOW_MAX_EFF_DAYS (one weekly — datable). Long windows
+    """A window is short when eff_days <= EVENT_MAX_EFF_DAYS (one weekly — datable). Long windows
     (eff_days > 5) carry curve-slope excess over weeks and can't date a one-day event."""
-    return eff_days <= SHORT_WINDOW_MAX_EFF_DAYS
+    return eff_days <= EVENT_MAX_EFF_DAYS
 
 
 def window_start(start_expiry: Optional[date], session_date: date) -> date:
@@ -234,8 +234,8 @@ def _scored_cte() -> str:
 
 
 def _short_sql() -> str:
-    """The SQL predicate for a short window (eff_days <= SHORT_WINDOW_MAX_EFF_DAYS)."""
-    return f"w_eff_days <= {SHORT_WINDOW_MAX_EFF_DAYS!r}"
+    """The SQL predicate for a short window (eff_days <= EVENT_MAX_EFF_DAYS)."""
+    return f"w_eff_days <= {EVENT_MAX_EFF_DAYS!r}"
 
 
 def _run(ch: Any, name: str, sql: str, params: Optional[Dict[str, Any]] = None) -> List[tuple]:
@@ -280,6 +280,19 @@ def _part2_band(ch: Any, band_expr: str, order_expr: str, cutoff: float, name: s
         f"FROM s WHERE grp = '{GROUP_OTHER}' AND {_short_sql()} AND w_excess_days >= {cutoff!r} "
         f"GROUP BY band ORDER BY {order_expr}")
     return _run(ch, name, sql)
+
+
+def _event_rule(ch: Any) -> Dict[str, tuple]:
+    """Per group, (n, hit_share) for windows meeting the detector's fixed event rule: eff_days <=
+    EVENT_MAX_EFF_DAYS, start_td <= EVENT_MAX_START_TD, excess_days >= EVENT_MIN_EXCESS_DAYS. Keyed by
+    grp (groups with no matching window are absent)."""
+    sql = (
+        f"{_scored_cte()} "
+        f"SELECT grp, count() AS n, countIf(is_hit = 1) / count() AS hit_share "
+        f"FROM s WHERE w_eff_days <= {EVENT_MAX_EFF_DAYS!r} AND w_start_td <= {EVENT_MAX_START_TD!r} "
+        f"AND w_excess_days >= {EVENT_MIN_EXCESS_DAYS!r} "
+        f"GROUP BY grp")
+    return {str(r[0]): (int(r[1]), r[2]) for r in _run(ch, "part2 event rule", sql)}
 
 
 def _part3_by_year(ch: Any, cutoff: float) -> List[tuple]:
@@ -391,7 +404,7 @@ def print_score_report(ch: Any) -> None:
     print("Population: iv_event_outcome (out_v1) ⋈ iv_event_window (fwd_v1, ok); corporate_action=0, "
           "realized_var present, support >= {:g}.".format(OUTCOME_SUMMARY_MIN_SUPPORT))
     print("Unit: one window row — one window seen from one session.")
-    print(f"Short window = eff_days <= {SHORT_WINDOW_MAX_EFF_DAYS:g} (one weekly — the window that can "
+    print(f"Short window = eff_days <= {EVENT_MAX_EFF_DAYS:g} (one weekly — the window that can "
           "date a one-day event); long windows carry curve-slope excess over weeks and fail the one-day "
           "hit test, so the threshold is chosen on the other group's short windows only.")
 
@@ -403,8 +416,8 @@ def print_score_report(ch: Any) -> None:
     for label, rows in (
             ("earnings (own_earnings_date present)", earnings),
             ("near_earnings (reaction day within 14d of the window)", near),
-            (f"other, short (eff_days <= {SHORT_WINDOW_MAX_EFF_DAYS:g})", other_short),
-            (f"other, long (eff_days > {SHORT_WINDOW_MAX_EFF_DAYS:g})", other_long)):
+            (f"other, short (eff_days <= {EVENT_MAX_EFF_DAYS:g})", other_short),
+            (f"other, long (eff_days > {EVENT_MAX_EFF_DAYS:g})", other_long)):
         print(f"\n── Part 1. Hit rate by cutoff — {label} ──")
         print(f"    {'cutoff':>7s} {'n':>9s} {'hit':>8s} {'jump>0':>8s} {'fj=crush':>9s} "
               f"{'med crush/xs':>13s}")
@@ -431,6 +444,13 @@ def print_score_report(ch: Any) -> None:
     print(f"    Other group, short windows at cutoff {cutoff:g} — hit share by start_td band:")
     for band, n, hit in std:
         print(f"        {str(band):>6s} {int(n):>9,d} {_pct(hit):>8s}")
+    # The detector's fixed event rule (iv_event.EVENT_* constants), n and hit per group.
+    er = _event_rule(ch)
+    print(f"    Event rule (eff_days <= {EVENT_MAX_EFF_DAYS:g}, start_td <= {EVENT_MAX_START_TD}, "
+          f"excess_days >= {EVENT_MIN_EXCESS_DAYS:g}) — n and hit share by group:")
+    for grp in (GROUP_OTHER, GROUP_EARNINGS, GROUP_NEAR):
+        n, hit = er.get(grp, (0, None))
+        print(f"        {grp:>13s} {int(n):>9,d} {_pct(hit):>8s}")
 
     # Part 3 — missed events (surprises), other group short windows.
     print("\n── Part 3. Missed events (surprises) — other group, short windows, n_jump_days>0 and "

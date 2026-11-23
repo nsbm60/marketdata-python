@@ -39,6 +39,13 @@ OUTCOME_SUMMARY_MIN_SUPPORT = 100.0
 # excess_days bands for proof item 2: [lo, hi) in normal-day units; the last is open-ended.
 OUTCOME_EXCESS_DAYS_BANDS = ((None, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, None))
 
+# The detector's event rule, chosen from outcome-score 2026-11-23: other-group windows meeting all
+# three hit 80.6% (n 5,100); hit share is flat in excess size for short windows (74-77% from 0.5 to 10)
+# but falls with distance (6-20 td 59%, 21+ 48%).
+EVENT_MAX_EFF_DAYS = 5.0      # a dated event needs a short window: one weekly
+EVENT_MAX_START_TD = 5       # the window starts within 5 trading days of the session
+EVENT_MIN_EXCESS_DAYS = 2.0  # at least 2 normal days of excess
+
 # The curve rows the windows read (iv_curve_daily's own kind/status vocabulary).
 CURVE_KIND_EXPIRY = "expiry"
 CURVE_STATUS_OK = "ok"
