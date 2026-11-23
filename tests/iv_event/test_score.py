@@ -39,6 +39,57 @@ def test_start_td_band_boundaries() -> None:
     assert score.start_td_band(99) == "21+"
 
 
+def test_eff_days_band_boundaries() -> None:
+    assert score.eff_days_band(0.0) == "<=5"
+    assert score.eff_days_band(5.0) == "<=5"        # 5 is in the first band
+    assert score.eff_days_band(5.01) == "5-10"
+    assert score.eff_days_band(10.0) == "5-10"      # 10 is in the middle band
+    assert score.eff_days_band(10.01) == "10+"
+    assert score.eff_days_band(42.0) == "10+"
+
+
+# ── the three-way group rule (own, start_expiry, session_date, end_expiry, reaction_days) ─────────────
+
+# A non-anchor window: start_expiry 2026-01-20 (the window start), end_expiry 2026-02-20, on a session
+# well before the window.
+_S = date(2026, 1, 5)          # session_date (not the window start here)
+_START = date(2026, 1, 20)     # start_expiry = the window start
+_END = date(2026, 2, 20)       # end_expiry
+
+
+def test_group_earnings_when_own_earnings_date_is_set() -> None:
+    # own_earnings_date present → earnings, regardless of nearby reaction days.
+    assert score.group_of(date(2026, 2, 6), _START, _S, _END, []) == "earnings"
+    assert score.group_of(date(2026, 2, 6), _START, _S, _END, [date(2026, 1, 25)]) == "earnings"
+
+
+def test_group_other_when_no_own_and_no_nearby_reaction() -> None:
+    # own NULL, the one reaction day is far outside the 14-day bands → other.
+    assert score.group_of(None, _START, _S, _END, [date(2025, 11, 1)]) == "other"
+    assert score.group_of(None, _START, _S, _END, []) == "other"
+
+
+def test_group_near_earnings_14_days_before_window_start_boundary() -> None:
+    # window start = start_expiry (2026-01-20). Exactly 14 days before → near; 15 days before → other.
+    assert score.group_of(None, _START, _S, _END, [date(2026, 1, 6)]) == "near_earnings"  # start - 14
+    assert score.group_of(None, _START, _S, _END, [date(2026, 1, 5)]) == "other"          # start - 15
+
+
+def test_group_near_earnings_14_days_after_end_expiry_boundary() -> None:
+    # Exactly 14 days after end_expiry (2026-02-20) → near; 15 days after → other.
+    assert score.group_of(None, _START, _S, _END, [date(2026, 3, 6)]) == "near_earnings"  # end + 14
+    assert score.group_of(None, _START, _S, _END, [date(2026, 3, 7)]) == "other"          # end + 15
+
+
+def test_group_anchor_window_start_is_the_session_date() -> None:
+    # start_expiry NULL → the window start is the session_date; the near test uses the session_date.
+    session, end = date(2026, 1, 20), date(2026, 2, 20)
+    # a reaction exactly 14 days before the SESSION date is near for the anchor window …
+    assert score.group_of(None, None, session, end, [date(2026, 1, 6)]) == "near_earnings"
+    # … and 15 days before is not (confirming the anchor uses session_date, not some other start).
+    assert score.group_of(None, None, session, end, [date(2026, 1, 5)]) == "other"
+
+
 # ── the cutoff-choice rule ──────────────────────────────────────────────────────────────────────────
 
 def test_choose_cutoff_picks_the_smallest_cutoff_reaching_the_target() -> None:
@@ -92,8 +143,9 @@ def test_dedupe_smallest_start_td_keeps_one_per_underlying_and_first_jump() -> N
 
 
 def _alarm(underlying: str, end_expiry: date, exc: float, session: date) -> AlarmRow:
-    return AlarmRow(underlying=underlying, session_date=session, end_expiry=end_expiry,
-                    excess_days=exc, crush_days=0.1, support=150.0)
+    return AlarmRow(underlying=underlying, session_date=session, start_expiry=None,
+                    end_expiry=end_expiry, excess_days=exc, crush_days=0.1, support=150.0,
+                    eff_days=7.5)
 
 
 def test_dedupe_largest_excess_days_keeps_one_per_underlying_and_end_expiry() -> None:

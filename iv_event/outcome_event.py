@@ -370,15 +370,17 @@ def outcome_daily(ch: Any) -> int:
 
 # ── backfill summary (printed once at the end — the proof) ────────────────────────────────────────
 
-# The join of each outcome to its iv_event_window row (for excess_days / excess_var / support /
-# own_earnings_date, which the outcome table does not carry). Reused by several summary parts.
+# The join of each outcome to its iv_event_window row (for start_td / eff_days / excess_days /
+# excess_var / support / normal_daily_var / own_earnings_date, which the outcome table does not carry).
+# Reused by the summary parts and by the scoring report (iv_event/score.py).
 def _joined_cte() -> str:
     return (
         f"o AS (SELECT * FROM {IV_EVENT_OUTCOME_TABLE} FINAL WHERE method = '{OUTCOME_METHOD}'), "
-        f"w AS (SELECT underlying, session_date, end_td, start_td, excess_days, excess_var, support, "
-        f"             normal_daily_var, own_earnings_date "
+        f"w AS (SELECT underlying, session_date, end_td, start_td, eff_days, excess_days, excess_var, "
+        f"             support, normal_daily_var, own_earnings_date "
         f"      FROM {IV_EVENT_TABLE} FINAL WHERE method = '{WINDOW_METHOD}' AND status = '{STATUS_OK}'), "
-        f"j AS (SELECT o.*, w.start_td AS w_start_td, w.excess_days AS w_excess_days, "
+        f"j AS (SELECT o.*, w.start_td AS w_start_td, w.eff_days AS w_eff_days, "
+        f"             w.excess_days AS w_excess_days, "
         f"             w.excess_var AS w_excess_var, w.support AS w_support, "
         f"             w.normal_daily_var AS w_normal_daily_var, "
         f"             w.own_earnings_date AS w_own_earnings_date "

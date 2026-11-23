@@ -5,9 +5,22 @@ picks the detection threshold, and prints a six-part report. It writes NOTHING t
 
 Population (every part unless stated): iv_event_outcome FINAL (method out_v1) INNER JOINed to
 iv_event_window FINAL (method fwd_v1, status ok) on (underlying, session_date, end_td) — the shared
-_joined_cte in outcome_event, extended to carry the window's normal_daily_var and start_td. Kept:
-corporate_action = 0, realized_var IS NOT NULL, support >= OUTCOME_SUMMARY_MIN_SUPPORT (100). The unit
-is the window row — one window seen from one session; the report header says so.
+_joined_cte in outcome_event, extended to carry the window's normal_daily_var, start_td and eff_days.
+Kept: corporate_action = 0, realized_var IS NOT NULL, support >= OUTCOME_SUMMARY_MIN_SUPPORT (100). The
+unit is the window row — one window seen from one session; the report header says so.
+
+Three groups, because the market often prices an earnings event at its expected date before the company
+confirms it (META's 2026-01-13 session priced the event into the 2026-02-06 expiry; the report reacted
+2026-01-29, announced 2026-01-14). Such windows carry own_earnings_date NULL — the actual reaction day
+is outside them — so without a near test they would land in "other" as false alarms, when they are
+earnings:
+  - earnings       = own_earnings_date IS NOT NULL;
+  - near_earnings  = own_earnings_date IS NULL, and the underlying has an earnings_history reaction day
+                     (coalesce(reaction_date, reported_date)) within NEAR_EARNINGS_DAYS (14) calendar
+                     days before the window start or within 14 days after end_expiry. Window start =
+                     start_expiry, or session_date for the anchor window (start_expiry NULL). Symbols
+                     matched case-insensitively. Computed in SQL from earnings_history FINAL;
+  - other          = the rest.
 
 Definitions (in plain words):
   - crush_days            = crush_excess_var / normal_daily_var — the largest one-day excess release,
@@ -15,22 +28,24 @@ Definitions (in plain words):
   - realized_excess_days  = realized_excess_var / normal_daily_var;
   - hit                   = crush_excess_var >= 0.5 * excess_var — at least half the priced excess came
                             off on one day. A NULL crush_excess_var is NOT a hit;
-  - earnings group        = own_earnings_date IS NOT NULL; other group = own_earnings_date IS NULL;
-  - cutoff grid (excess_days): 0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10.
+  - cutoff grid (excess_days): 0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10;
+  - eff_days bands (window length): <= 5, 5-10, 10+.
 
 The threshold (part 2) is the smallest grid cutoff at which the OTHER group's hit share >= 0.80; if no
-cutoff reaches it, the report says so and uses 2 for parts 3-6. The band classifiers, the hit rule, the
-cutoff choice and the two list dedupe rules are pure functions (below), unit-tested without ClickHouse.
+cutoff reaches it, the report says so and uses 2 for parts 3-6. The group rule, the band classifiers,
+the hit rule, the cutoff choice and the two list dedupe rules are pure functions (below), unit-tested
+without ClickHouse.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import (
-    JUMP_DAILY_TABLE, JUMP_METHOD, MARKET_WIDE_MIN_NAMES, OUTCOME_SUMMARY_MIN_SUPPORT,
+    EARNINGS_HISTORY_TABLE, JUMP_DAILY_TABLE, JUMP_METHOD, MARKET_WIDE_MIN_NAMES,
+    OUTCOME_SUMMARY_MIN_SUPPORT,
 )
 from . import outcome_event
 
@@ -42,6 +57,17 @@ FALLBACK_CUTOFF = 2.0         # used for parts 3-6 when no cutoff reaches the ta
 RECENT_SINCE = date(2025, 1, 1)   # the "recent" lists (parts 3, 4) start here
 LIST_LIMIT = 30               # rows in the parts 3 / 4 lists
 TOP_DATES_PER_YEAR = 5        # the learned-calendar top dates per year (part 6)
+# A window is near_earnings when an earnings_history reaction day falls within this many calendar days
+# before the window start or after end_expiry — the market pricing an event before the company confirms
+# it (reaction day outside the window, so own_earnings_date is NULL).
+NEAR_EARNINGS_DAYS = 14
+# eff_days (window length) band cut points for the part-2 breakdown: <= 5, 5-10, 10+.
+EFF_DAYS_BANDS: Tuple[float, float] = (5.0, 10.0)
+
+# The three group labels (match the SQL `grp` literals).
+GROUP_EARNINGS = "earnings"
+GROUP_NEAR = "near_earnings"
+GROUP_OTHER = "other"
 
 
 # ── pure rules (unit-tested, no ClickHouse) ────────────────────────────────────────────────────────
@@ -70,6 +96,40 @@ def start_td_band(start_td: int) -> str:
     if start_td <= 20:
         return "6-20"
     return "21+"
+
+
+def eff_days_band(eff_days: float) -> str:
+    """The eff_days (window-length) band label: <=5, 5-10 or 10+."""
+    if eff_days <= EFF_DAYS_BANDS[0]:
+        return "<=5"
+    if eff_days <= EFF_DAYS_BANDS[1]:
+        return "5-10"
+    return "10+"
+
+
+def window_start(start_expiry: Optional[date], session_date: date) -> date:
+    """The window's start date: its start_expiry, or the session_date for the anchor window."""
+    return session_date if start_expiry is None else start_expiry
+
+
+def is_near_earnings(win_start: date, end_expiry: date, reaction_days: Sequence[date],
+                     near_days: int = NEAR_EARNINGS_DAYS) -> bool:
+    """True when some reaction day is within `near_days` calendar days before the window start or
+    within `near_days` days after end_expiry (both bounds inclusive). Mirrors the SQL arrayExists."""
+    lo = win_start - timedelta(days=near_days)
+    hi = end_expiry + timedelta(days=near_days)
+    return any((lo <= rd <= win_start) or (end_expiry <= rd <= hi) for rd in reaction_days)
+
+
+def group_of(own_earnings_date: Optional[date], start_expiry: Optional[date], session_date: date,
+             end_expiry: date, reaction_days: Sequence[date]) -> str:
+    """The window's group: 'earnings' when own_earnings_date is set, else 'near_earnings' when a
+    reaction day is near the window (is_near_earnings), else 'other'. Mirrors the SQL `grp`."""
+    if own_earnings_date is not None:
+        return GROUP_EARNINGS
+    if is_near_earnings(window_start(start_expiry, session_date), end_expiry, reaction_days):
+        return GROUP_NEAR
+    return GROUP_OTHER
 
 
 def choose_cutoff(other_hit_shares: Sequence[Tuple[float, Optional[float]]]) -> Tuple[float, bool]:
@@ -103,10 +163,12 @@ class AlarmRow:
 
     underlying: str
     session_date: date
+    start_expiry: Optional[date]
     end_expiry: date
     excess_days: float
     crush_days: Optional[float]
     support: float
+    eff_days: float
 
 
 def dedupe_smallest_start_td(rows: Sequence[SurpriseRow]) -> List[SurpriseRow]:
@@ -138,16 +200,28 @@ def dedupe_largest_excess_days(rows: Sequence[AlarmRow]) -> List[AlarmRow]:
 
 def _scored_cte() -> str:
     """The full `WITH … s AS (…)` prefix: the shared join, filtered to the scoring population, with the
-    derived columns (is_earnings, is_hit, crush_days, realized_excess_days). Queries select FROM s."""
+    derived columns (grp, is_hit, crush_days, realized_excess_days). `grp` is the three-way group:
+    'earnings' when own_earnings_date is set, else 'near_earnings' when an earnings_history reaction day
+    (coalesce(reaction_date, reported_date), per upper(symbol)) is within NEAR_EARNINGS_DAYS calendar
+    days before the window start (start_expiry, or session_date for the anchor) or after end_expiry,
+    else 'other'. Queries select FROM s."""
+    near = NEAR_EARNINGS_DAYS
     return (
         f"WITH {outcome_event._joined_cte()}, "
-        f"s AS (SELECT *, "
-        f"(w_own_earnings_date IS NOT NULL) AS is_earnings, "
+        f"eh AS (SELECT upper(symbol) AS u, "
+        f"groupArray(coalesce(reaction_date, reported_date)) AS rdays "
+        f"FROM {EARNINGS_HISTORY_TABLE} FINAL GROUP BY u), "
+        f"s AS (SELECT j.*, "
+        f"multiIf(w_own_earnings_date IS NOT NULL, '{GROUP_EARNINGS}', "
+        f"arrayExists(rd -> "
+        f"(rd >= coalesce(start_expiry, session_date) - {near} AND rd <= coalesce(start_expiry, session_date)) "
+        f"OR (rd >= end_expiry AND rd <= end_expiry + {near}), eh.rdays), '{GROUP_NEAR}', "
+        f"'{GROUP_OTHER}') AS grp, "
         f"toUInt8(crush_excess_var IS NOT NULL AND crush_excess_var >= {HIT_FRACTION!r} * w_excess_var) "
         f"  AS is_hit, "
         f"crush_excess_var / w_normal_daily_var AS crush_days, "
         f"realized_excess_var / w_normal_daily_var AS realized_excess_days "
-        f"FROM j "
+        f"FROM j LEFT JOIN eh ON upper(j.underlying) = eh.u "
         f"WHERE corporate_action = 0 AND realized_var IS NOT NULL "
         f"AND w_support >= {OUTCOME_SUMMARY_MIN_SUPPORT!r})")
 
@@ -162,9 +236,9 @@ def _run(ch: Any, name: str, sql: str, params: Optional[Dict[str, Any]] = None) 
 
 # ── part queries ────────────────────────────────────────────────────────────────────────────────────
 
-def _part1(ch: Any, is_earnings: int) -> List[tuple]:
+def _part1(ch: Any, group: str) -> List[tuple]:
     """(cutoff, n, hit_share, jump_share, fj_eq_crush, med_crush_over_excess) over windows with
-    excess_days >= cutoff, one row per cutoff that has windows."""
+    excess_days >= cutoff, one row per cutoff that has windows, for one group."""
     grid = ", ".join(repr(float(c)) for c in CUTOFF_GRID)
     sql = (
         f"{_scored_cte()} "
@@ -174,9 +248,9 @@ def _part1(ch: Any, is_earnings: int) -> List[tuple]:
         f"countIf(first_jump_date = crush_date) / count() AS fj_eq_crush, "
         f"medianIf(crush_days / w_excess_days, crush_days IS NOT NULL AND w_excess_days != 0) AS med_ratio "
         f"FROM s ARRAY JOIN [{grid}] AS cutoff "
-        f"WHERE is_earnings = {is_earnings} AND w_excess_days >= cutoff "
+        f"WHERE grp = '{group}' AND w_excess_days >= cutoff "
         f"GROUP BY cutoff ORDER BY cutoff")
-    return _run(ch, f"part1 hit-rate-by-cutoff (is_earnings={is_earnings})", sql)
+    return _run(ch, f"part1 hit-rate-by-cutoff (grp={group})", sql)
 
 
 def _part2_band(ch: Any, band_expr: str, order_expr: str, cutoff: float, name: str) -> List[tuple]:
@@ -184,7 +258,7 @@ def _part2_band(ch: Any, band_expr: str, order_expr: str, cutoff: float, name: s
     sql = (
         f"{_scored_cte()} "
         f"SELECT {band_expr} AS band, count() AS n, countIf(is_hit = 1) / count() AS hit_share "
-        f"FROM s WHERE is_earnings = 0 AND w_excess_days >= {cutoff!r} "
+        f"FROM s WHERE grp = '{GROUP_OTHER}' AND w_excess_days >= {cutoff!r} "
         f"GROUP BY band ORDER BY {order_expr}")
     return _run(ch, name, sql)
 
@@ -195,7 +269,7 @@ def _part3_by_year(ch: Any, cutoff: float) -> List[tuple]:
         f"{_scored_cte()} "
         f"SELECT toYear(session_date) AS y, count() AS n, "
         f"countIf(w_excess_days < {cutoff!r}) / count() AS miss_share "
-        f"FROM s WHERE is_earnings = 0 AND n_jump_days > 0 AND explained = 'none' "
+        f"FROM s WHERE grp = '{GROUP_OTHER}' AND n_jump_days > 0 AND explained = 'none' "
         f"GROUP BY y ORDER BY y")
     return _run(ch, "part3 surprise miss-share by year", sql)
 
@@ -205,7 +279,7 @@ def _part3_list(ch: Any) -> List[SurpriseRow]:
         f"{_scored_cte()} "
         f"SELECT underlying, first_jump_date, max_abs_ret_adj, w_excess_days, session_date, end_td, "
         f"w_start_td "
-        f"FROM s WHERE is_earnings = 0 AND n_jump_days > 0 AND explained = 'none' "
+        f"FROM s WHERE grp = '{GROUP_OTHER}' AND n_jump_days > 0 AND explained = 'none' "
         f"AND first_jump_date >= %(since)s")
     rows = _run(ch, "part3 recent surprises", sql, {"since": RECENT_SINCE})
     return [SurpriseRow(str(r[0]).upper(), r[1], None if r[2] is None else float(r[2]),
@@ -219,7 +293,7 @@ def _part4_by_year(ch: Any, cutoff: float) -> List[tuple]:
         f"{_scored_cte()} "
         f"SELECT toYear(session_date) AS y, count() AS n, "
         f"countIf(is_hit = 0 AND n_jump_days = 0) / count() AS fa_share "
-        f"FROM s WHERE is_earnings = 0 AND w_excess_days >= {cutoff!r} "
+        f"FROM s WHERE grp = '{GROUP_OTHER}' AND w_excess_days >= {cutoff!r} "
         f"GROUP BY y ORDER BY y")
     return _run(ch, "part4 false-alarm share by year", sql)
 
@@ -227,26 +301,28 @@ def _part4_by_year(ch: Any, cutoff: float) -> List[tuple]:
 def _part4_list(ch: Any, cutoff: float) -> List[AlarmRow]:
     sql = (
         f"{_scored_cte()} "
-        f"SELECT underlying, session_date, end_expiry, w_excess_days, crush_days, w_support "
-        f"FROM s WHERE is_earnings = 0 AND w_excess_days >= {cutoff!r} AND is_hit = 0 "
+        f"SELECT underlying, session_date, start_expiry, end_expiry, w_excess_days, crush_days, "
+        f"w_support, w_eff_days "
+        f"FROM s WHERE grp = '{GROUP_OTHER}' AND w_excess_days >= {cutoff!r} AND is_hit = 0 "
         f"AND n_jump_days = 0 AND session_date >= %(since)s")
     rows = _run(ch, "part4 recent false alarms", sql, {"since": RECENT_SINCE})
-    return [AlarmRow(str(r[0]).upper(), r[1], r[2], float(r[3]),
-                     None if r[4] is None else float(r[4]), float(r[5])) for r in rows]
+    return [AlarmRow(str(r[0]).upper(), r[1], r[2], r[3], float(r[4]),
+                     None if r[5] is None else float(r[5]), float(r[6]), float(r[7]))
+            for r in rows]
 
 
 def _part5(ch: Any, cutoff: float) -> List[tuple]:
-    """(is_earnings, year, n, median, p25, p75 of realized_excess_days/excess_days, share realized
-    excess > priced excess) for windows at the chosen cutoff, per group per year."""
+    """(grp, year, n, median, p25, p75 of realized_excess_days/excess_days, share realized excess >
+    priced excess) for windows at the chosen cutoff, per group per year (all three groups)."""
     sql = (
         f"{_scored_cte()} "
-        f"SELECT is_earnings, toYear(session_date) AS y, count() AS n, "
+        f"SELECT grp, toYear(session_date) AS y, count() AS n, "
         f"quantileExact(0.5)(realized_excess_days / w_excess_days) AS med, "
         f"quantileExact(0.25)(realized_excess_days / w_excess_days) AS p25, "
         f"quantileExact(0.75)(realized_excess_days / w_excess_days) AS p75, "
         f"countIf(realized_excess_var > w_excess_var) / count() AS over_share "
         f"FROM s WHERE w_excess_days >= {cutoff!r} "
-        f"GROUP BY is_earnings, y ORDER BY is_earnings DESC, y")
+        f"GROUP BY grp, y ORDER BY grp, y")
     return _run(ch, "part5 priced vs realized", sql)
 
 
@@ -255,7 +331,7 @@ def _part6_counts(ch: Any, cutoff: float) -> List[tuple]:
     sql = (
         f"{_scored_cte()} "
         f"SELECT crush_date, toYear(crush_date) AS y, uniqExact(underlying) AS names "
-        f"FROM s WHERE is_earnings = 0 AND w_excess_days >= {cutoff!r} AND is_hit = 1 "
+        f"FROM s WHERE grp = '{GROUP_OTHER}' AND w_excess_days >= {cutoff!r} AND is_hit = 1 "
         f"GROUP BY crush_date")
     return _run(ch, "part6 crush-date name counts", sql)
 
@@ -293,10 +369,12 @@ def print_score_report(ch: Any) -> None:
     print("Unit: one window row — one window seen from one session.")
 
     # Part 1 — hit rate by cutoff, one table per group.
-    earnings = _part1(ch, 1)
-    other = _part1(ch, 0)
+    earnings = _part1(ch, GROUP_EARNINGS)
+    near = _part1(ch, GROUP_NEAR)
+    other = _part1(ch, GROUP_OTHER)
     for label, rows in (("earnings (own_earnings_date present)", earnings),
-                        ("other (no own earnings)", other)):
+                        ("near_earnings (reaction day within 14d of the window)", near),
+                        ("other (no own or nearby earnings)", other)):
         print(f"\n── Part 1. Hit rate by cutoff — {label} ──")
         print(f"    {'cutoff':>7s} {'n':>9s} {'hit':>8s} {'jump>0':>8s} {'fj=crush':>9s} "
               f"{'med crush/xs':>13s}")
@@ -317,11 +395,18 @@ def print_score_report(ch: Any) -> None:
                       "min(w_support)", cutoff, "part2 hit share by support band")
     std = _part2_band(ch, "multiIf(w_start_td <= 5, '0-5', w_start_td <= 20, '6-20', '21+')",
                       "min(w_start_td)", cutoff, "part2 hit share by start_td band")
+    eff = _part2_band(
+        ch, f"multiIf(w_eff_days <= {EFF_DAYS_BANDS[0]!r}, '<=5', w_eff_days <= {EFF_DAYS_BANDS[1]!r}, "
+            f"'5-10', '10+')",
+        "min(w_eff_days)", cutoff, "part2 hit share by eff_days band")
     print(f"    Other group at cutoff {cutoff:g} — hit share by support band:")
     for band, n, hit in sup:
         print(f"        {str(band):>10s} {int(n):>9,d} {_pct(hit):>8s}")
     print(f"    Other group at cutoff {cutoff:g} — hit share by start_td band:")
     for band, n, hit in std:
+        print(f"        {str(band):>6s} {int(n):>9,d} {_pct(hit):>8s}")
+    print(f"    Other group at cutoff {cutoff:g} — hit share by eff_days (window length) band:")
+    for band, n, hit in eff:
         print(f"        {str(band):>6s} {int(n):>9,d} {_pct(hit):>8s}")
 
     # Part 3 — missed events (surprises).
@@ -351,21 +436,22 @@ def print_score_report(ch: Any) -> None:
     alarms.sort(key=lambda r: r.excess_days, reverse=True)
     print(f"    {LIST_LIMIT} largest by excess_days since {RECENT_SINCE} "
           f"(one per underlying+end_expiry, largest excess_days):")
-    print(f"        {'underlying':>10s} {'session':>11s} {'end_expiry':>11s} {'excess_d':>9s} "
-          f"{'crush_d':>9s} {'support':>9s}")
+    print(f"        {'underlying':>10s} {'session':>11s} {'start_expiry':>12s} {'end_expiry':>11s} "
+          f"{'excess_d':>9s} {'crush_d':>9s} {'support':>9s} {'eff_days':>9s}")
     for ar in alarms[:LIST_LIMIT]:
-        print(f"        {ar.underlying:>10s} {str(ar.session_date):>11s} {str(ar.end_expiry):>11s} "
-              f"{_f(ar.excess_days, '{:.2f}'):>9s} {_f(ar.crush_days, '{:.2f}'):>9s} "
-              f"{_f(ar.support, '{:.0f}'):>9s}")
+        start_s = str(ar.start_expiry) if ar.start_expiry is not None else "anchor"
+        print(f"        {ar.underlying:>10s} {str(ar.session_date):>11s} {start_s:>12s} "
+              f"{str(ar.end_expiry):>11s} {_f(ar.excess_days, '{:.2f}'):>9s} "
+              f"{_f(ar.crush_days, '{:.2f}'):>9s} {_f(ar.support, '{:.0f}'):>9s} "
+              f"{_f(ar.eff_days, '{:.2f}'):>9s}")
 
     # Part 5 — priced vs realized.
     print("\n── Part 5. Priced vs realized — windows with excess_days>=cutoff, per group, by year ──")
-    print(f"    {'group':>9s} {'year':>6s} {'n':>8s} {'median':>8s} {'p25':>8s} {'p75':>8s} "
+    print(f"    {'group':>13s} {'year':>6s} {'n':>8s} {'median':>8s} {'p25':>8s} {'p75':>8s} "
           f"{'over':>8s}  (ratio = realized_excess_days / excess_days; over = realized > priced)")
-    for is_earn, y, n, med, p25, p75, over in _part5(ch, cutoff):
-        grp = "earnings" if int(is_earn) == 1 else "other"
-        print(f"    {grp:>9s} {int(y):>6d} {int(n):>8,d} {_f(med):>8s} {_f(p25):>8s} {_f(p75):>8s} "
-              f"{_pct(over):>8s}")
+    for grp, y, n, med, p25, p75, over in _part5(ch, cutoff):
+        print(f"    {str(grp):>13s} {int(y):>6d} {int(n):>8,d} {_f(med):>8s} {_f(p25):>8s} "
+              f"{_f(p75):>8s} {_pct(over):>8s}")
 
     # Part 6 — learned macro calendar.
     print("\n── Part 6. Learned macro calendar — other group, excess_days>=cutoff, hit ──")
