@@ -23,6 +23,11 @@ dependencies = [
   # packaging: the connector needs it even though the batch env-override path
   # (CLICKHOUSE_HOST set) never reaches discovery at runtime.
   "pyzmq>=25.0",
+  # vol_dataset builds/read Parquet via pandas + pyarrow. The deploy reinstalls with `pip install -e .`
+  # (pyproject deps, not requirements.txt), so these must be declared here to land on drogon; both ship
+  # manylinux wheels, so no toolchain is needed.
+  "pandas>=2.0.0",
+  "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +45,7 @@ tier2 = [
 include = ["greeks*", "option_archive*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server", "tests/solver", "tests/iv_term", "tests/iv_curve", "tests/iv_event", "tests/service", "tests/jumps"]
+testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server", "tests/solver", "tests/iv_term", "tests/iv_curve", "tests/iv_event", "tests/service", "tests/jumps", "tests/vol_dataset"]
 pythonpath = ["."]
 
 [tool.mypy]

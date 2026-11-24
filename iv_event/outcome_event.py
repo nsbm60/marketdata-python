@@ -167,7 +167,7 @@ def _read_curve(ch: Any, underlyings: Set[str], expiries: Set[dt.date], lo: dt.d
     return {(str(r[0]).upper(), r[1], r[2]): float(r[3]) for r in res.result_rows}
 
 
-def _read_corp_actions(ch: Any, underlyings: Set[str]) -> Dict[str, List[dt.date]]:
+def read_corp_actions(ch: Any, underlyings: Set[str]) -> Dict[str, List[dt.date]]:
     """Per underlying, the coalesce(ex_date, event_date) of every corporate_action row whose kind is
     not cash_dividend or name_change. Not date-filtered in SQL — each window tests its own [s, E]."""
     if not underlyings:
@@ -184,7 +184,7 @@ def _read_corp_actions(ch: Any, underlyings: Set[str]) -> Dict[str, List[dt.date
     return out
 
 
-def _read_splits(ch: Any, underlyings: Set[str]) -> Dict[str, List[dt.date]]:
+def read_splits(ch: Any, underlyings: Set[str]) -> Dict[str, List[dt.date]]:
     """Per underlying, every split_effective execution_date."""
     if not underlyings:
         return {}
@@ -198,7 +198,7 @@ def _read_splits(ch: Any, underlyings: Set[str]) -> Dict[str, List[dt.date]]:
     return out
 
 
-def _read_market_wide(ch: Any, lo: dt.date, hi: dt.date) -> Set[dt.date]:
+def read_market_wide(ch: Any, lo: dt.date, hi: dt.date) -> Set[dt.date]:
     """The dates in [lo, hi] on which at least MARKET_WIDE_MIN_NAMES names carry overnight_jump_adj=1
     in jump_daily (bns_v1) — the same count rule as the Scala market-wide definition."""
     res = ch.query(
@@ -235,9 +235,9 @@ def process_outcome_month(ch: Any, ms: dt.date, me: dt.date, pmax: dt.date, weig
     rv = _read_rv(ch, underlyings, span_lo, span_hi)
     jumps = _read_jumps(ch, underlyings, span_lo, span_hi)
     curve = _read_curve(ch, underlyings, expiries, span_lo, span_hi)
-    corp = _read_corp_actions(ch, underlyings)
-    splits = _read_splits(ch, underlyings)
-    market_wide = _read_market_wide(ch, span_lo, span_hi)
+    corp = read_corp_actions(ch, underlyings)
+    splits = read_splits(ch, underlyings)
+    market_wide = read_market_wide(ch, span_lo, span_hi)
 
     # Group the per-day reads by underlying once (not once per window).
     rv_by_u: Dict[str, Dict[dt.date, float]] = defaultdict(dict)
