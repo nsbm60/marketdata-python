@@ -1,23 +1,69 @@
 #!/usr/bin/env bash
-# Ship the committed tree to drogon and restart only the named services. Run on the Mac, from the
-# repo. Mirrors ./deploy-jar in the Scala repo.
+# Ship the committed tree to a chosen machine and restart only the named services. Run on the Mac,
+# from the repo. Mirrors ./deploy-jar in the Scala repo.
 #
-#   ./deploy-python                              # copy + reinstall + refresh units (no restart)
-#   ./deploy-python --restart pubsub-broker      # ...and restart these
-#   ./deploy-python --restart-all                # ...and restart all managed
+#   ./deploy-python <host> [--restart <svc>...] [--restart-all]
+#
+#   ./deploy-python drogon                          # copy + reinstall + refresh units (no restart)
+#   ./deploy-python drogon --restart pubsub-broker  # ...and restart these
+#   ./deploy-python drogon --restart-all            # ...and restart all of drogon's services
+#   ./deploy-python balerion                         # the GPU box: copy + reinstall (no services)
+#
+# <host> is required; accepted hosts and each host's services/extras live in deploy/hosts.sh (sourced
+# here and by the remote script, so they never drift). A missing or unknown host exits non-zero with
+# the accepted list.
 #
 # Packs HEAD with `git archive` — the COMMITTED tree only, never a dirty working copy — records the
-# commit, scps the pack + the remote script to ~/deploy-staging on drogon, then runs the remote
-# script there under sudo (unpack into /opt/marketdata-python/app, reinstall into the venv, refresh
-# units, write the deploy record, restart named services). The drogon home checkout is not involved.
-# The managed-service list and all deploy mechanics live in deploy/deploy-python-remote.sh — one
-# implementation, on the remote side.
+# commit, scps the pack + the remote script + hosts.sh to ~/deploy-staging on the host, then runs the
+# remote script there under sudo (unpack into /opt/marketdata-python/app, reinstall into the venv,
+# refresh that host's units, write the deploy record, restart named services). The home checkout on
+# the host is not involved. All deploy mechanics live in deploy/deploy-python-remote.sh.
 set -euo pipefail
 
-HOST=drogon
 STAGING='~/deploy-staging'
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "${HERE}"
+source "${HERE}/deploy/hosts.sh"
+
+# --- host (required) ---
+host="${1:-}"
+if [[ -z "${host}" ]]; then
+  echo "usage: ./deploy-python <host> [--restart <svc>...] [--restart-all]" >&2
+  echo "accepted hosts: ${ACCEPTED_HOSTS}" >&2
+  exit 2
+fi
+shift
+if ! host_config "${host}"; then
+  echo "unknown host: ${host} (accepted: ${ACCEPTED_HOSTS})" >&2
+  exit 2
+fi
+
+# --- validate the restart flags against THIS host's services (fail fast on the Mac; the remote
+#     script re-checks). Parse by index so an empty restart list never trips `set -u` on bash 3.2. ---
+i=1
+while [[ ${i} -le $# ]]; do
+  a="${!i}"
+  case "${a}" in
+    --restart)
+      j=$((i + 1))
+      while [[ ${j} -le $# ]]; do
+        nxt="${!j}"; [[ "${nxt}" == --* ]] && break
+        svc_in_host "${nxt}" || {
+          echo "not a managed service on ${host}: ${nxt} (host services: ${HOST_SERVICES[*]:-none})" >&2
+          exit 2; }
+        j=$((j + 1))
+      done
+      i=${j} ;;
+    --restart-all) i=$((i + 1)) ;;   # expands (on the host) to this host's own services — always valid
+    *) echo "unknown arg: ${a} (expected --restart <svc>... or --restart-all)" >&2; exit 2 ;;
+  esac
+done
+
+# --- dry run: argument handling only, no git/ssh (used by the arg-handling test) ---
+if [[ -n "${DEPLOY_PYTHON_DRY_RUN:-}" ]]; then
+  echo "[dry-run] host=${host} services=[${HOST_SERVICES[*]:-}] extras=[${HOST_EXTRAS}] restart=[$*]"
+  exit 0
+fi
 
 # Refuse unless HEAD is a real commit (an unborn branch / empty repo has nothing to ship).
 commit="$(git rev-parse --verify --short HEAD 2>/dev/null)" || {
@@ -35,10 +81,11 @@ git archive --format=tar.gz -o "${pack}" HEAD
 { echo "commit ${full} (${commit})  ${desc}"; echo "deployed ${deployed} from $(hostname)"; } > "${rec}"
 cp "${HERE}/deploy/deploy-python-remote.sh" "${remote}"
 
-echo "deploying ${commit} to ${HOST}:/opt/marketdata-python/app"
+echo "deploying ${commit} to ${host}:/opt/marketdata-python/app"
 echo "  ${desc}"
-ssh "${HOST}" "mkdir -p ${STAGING}"
-scp -q "${pack}" "${HOST}:${STAGING}/app.tar.gz"
-scp -q "${rec}" "${HOST}:${STAGING}/deploy-record"
-scp -q "${remote}" "${HOST}:${STAGING}/deploy-python-remote.sh"
-ssh -t "${HOST}" "sudo bash ${STAGING}/deploy-python-remote.sh ${STAGING} $*"
+ssh "${host}" "mkdir -p ${STAGING}"
+scp -q "${pack}" "${host}:${STAGING}/app.tar.gz"
+scp -q "${rec}" "${host}:${STAGING}/deploy-record"
+scp -q "${remote}" "${host}:${STAGING}/deploy-python-remote.sh"
+scp -q "${HERE}/deploy/hosts.sh" "${host}:${STAGING}/hosts.sh"
+ssh -t "${host}" "sudo bash ${STAGING}/deploy-python-remote.sh ${STAGING} ${host} $*"

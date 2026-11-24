@@ -1,8 +1,23 @@
-# drogon Python services — deployment convention
+# Python deployment convention — hosts, services
 
-This is the pattern for long-running Python **services** on drogon: the pub/sub
-broker now, the greeks server and optimizer next. Follow it so each new service is a
-drop-in, not a redesign.
+This is the pattern for shipping the `marketdata-python` tree to its deploy targets and running the
+long-running Python **services**. Follow it so each new service (and host) is a drop-in, not a redesign.
+
+## Deploy targets (hosts)
+
+`./deploy-python <host>` ships the committed tree to one of two machines. Each host's managed services
+and pip extras live in **`deploy/hosts.sh`** — the one place, sourced by both `./deploy-python` (Mac)
+and `deploy/deploy-python-remote.sh` (the target), so they never drift. A missing or unknown host exits
+non-zero with the accepted list.
+
+| Host | Role | Services | pip extras | Bootstrap |
+|------|------|----------|------------|-----------|
+| `drogon`   | the ClickHouse-side box — long-running services **and** the ClickHouse-side batch/ML jobs (rv, jumps, iv_curve, iv_event, vol_dataset builds) | `pubsub-broker`, `greeks-server` | none | `sudo ./deploy/setup-drogon-services.sh` |
+| `balerion` | the GPU box — ML training and GPU batch work; **no services** | none | `ml` (GPU XGBoost) | `sudo PYTHON=/path/to/python3.14 ./deploy/setup-balerion.sh` |
+
+Both hosts share the same `/opt/marketdata-python/{app,venv}` layout and the `mdapps` user. balerion
+additionally points `app/data` at the big `/data` disk (`/data/marketdata-python`) for dataset/model
+output, and installs no systemd unit.
 
 ## The one fact everything follows from
 
@@ -32,24 +47,34 @@ as `User=mdapps` (shared with the Scala batch and the archive).
 
 ## The scripts
 
-- **`setup-drogon-services.sh`** — one-time bootstrap, run as root on drogon from a
+- **`deploy/hosts.sh`** — the single source of per-host settings (`ACCEPTED_HOSTS`, and
+  `host_config <host>` setting `HOST_SERVICES` + `HOST_EXTRAS`). Sourced by `./deploy-python` and by
+  `deploy/deploy-python-remote.sh`. Adding a host or changing a host's services/extras happens here.
+- **`setup-drogon-services.sh`** — one-time bootstrap for drogon, run as root from a
   checkout. Creates the user/dirs/venv, lays down the first plain copy of the checkout into
   `app/` (no `.git`), `pip install -e .[dev]`, installs every managed unit, `daemon-reload`,
   then **certifies each service**. It does **not** enable or start anything (don't start
   before you look). Idempotent.
-- **`./deploy-python`** — ongoing update, run **on the Mac from the repo** (mirrors the
+- **`setup-balerion.sh`** — one-time bootstrap for balerion (the GPU box), run as root from a
+  checkout with `PYTHON=/path/to/python3.14` set (**no default** — it exits if unset). Same
+  user/dirs/venv, `pip install -e .[dev,ml]`, points `app/data` at `/data/marketdata-python`, checks
+  the C++ toolchain, and as its FINAL ACT certifies CUDA is available to XGBoost (trains a tiny GPU
+  `reg:quantileerror` model) and runs the `vol_dataset` tests. Installs **no** systemd unit. Idempotent.
+- **`./deploy-python <host>`** — ongoing update, run **on the Mac from the repo** (mirrors the
   Scala `./deploy-jar`). Packs the committed tree with `git archive HEAD` (refuses if HEAD
   isn't a commit; a dirty working copy is never shipped), records the commit, scps the pack
-  + the remote script to `~/deploy-staging` on drogon, then over `ssh -t … sudo` runs
+  + the remote script + `hosts.sh` to `~/deploy-staging` on the host, then over `ssh -t … sudo` runs
   **`deploy/deploy-python-remote.sh`** there: unpack into `app/` (overlay copy, no `.git` in
-  `/opt`), `pip install -e`, refresh the unit files, `daemon-reload`, write the deploy record
-  next to `app/`, and restart only the named services. The drogon home checkout is not used.
+  `/opt`), `pip install -e .[<extras>]`, refresh that host's unit files, `daemon-reload` (skipped on a
+  host with no services), write the deploy record next to `app/`, and restart only the named services.
+  The host's home checkout is not used.
 - **`deploy/deploy-python-remote.sh`** — the one implementation of the deploy mechanics,
-  staged and run on drogon by `./deploy-python`. It carries the `SERVICES=(…)` array and
-  validates `--restart` names against it.
+  staged and run on the host by `./deploy-python`. It takes the host as an argument and reads the
+  host's services/extras from `hosts.sh`; `--restart` / `--restart-all` accept only that host's services.
 
-`setup-drogon-services.sh` and `deploy-python-remote.sh` each carry a `SERVICES=(…)` array —
-bootstrap and deploy are separate concerns. Keep them in sync.
+The deploy path reads services from `hosts.sh`; `setup-drogon-services.sh` carries its own
+`SERVICES=(…)` list for the bootstrap/certification concern (a separate step). Keep the drogon entries
+consistent between the two.
 
 ## Adding a service (greeks, optimizer, …)
 
@@ -59,8 +84,8 @@ bootstrap and deploy are separate concerns. Keep them in sync.
    `/opt/marketdata-python/{app,venv}` paths, `Restart=always`, `WantedBy=multi-user.target`.
 3. If it needs config/secrets, add `deploy/<name>.env.example` (template only, never
    real keys). `setup` installs it to `/etc/marketdata-python/<name>.env` at `0600`.
-4. Add `<name>` to the `SERVICES=(…)` array in **both** `setup-drogon-services.sh` and
-   `deploy/deploy-python-remote.sh`.
+4. Add `<name>` to the host's `HOST_SERVICES` in **`deploy/hosts.sh`** (the deploy path) and to the
+   `SERVICES=(…)` array in **`setup-drogon-services.sh`** (the bootstrap/certification path).
 5. Add a certification command for it in `certify_service()` in `setup` (e.g.
    greeks → `scripts/check_greeks.sh`). The commented stubs are there.
 
@@ -90,21 +115,27 @@ copy-paste-safe command.
 # one-time bootstrap, as root, ON drogon from a checkout of this repo:
 sudo ./deploy/setup-drogon-services.sh
 
+# one-time bootstrap, as root, ON balerion from a checkout (pinned interpreter required, no default):
+sudo PYTHON=/usr/bin/python3.14 ./deploy/setup-balerion.sh
+
 # enable the broker on boot and start it now (on drogon):
 sudo systemctl enable --now pubsub-broker
 
 # watch it (on drogon):
 journalctl -u pubsub-broker -f
 
-# ongoing update — on the MAC, from the repo (commit first; ships committed HEAD):
+# ongoing update — on the MAC, from the repo (commit first; ships committed HEAD). <host> is required:
 # copy -> /opt + reinstall, restart nothing:
-./deploy-python
+./deploy-python drogon
 
 # ...and restart the broker (stateless, lossless):
-./deploy-python --restart pubsub-broker
+./deploy-python drogon --restart pubsub-broker
 
-# ...and restart every managed service:
-./deploy-python --restart-all
+# ...and restart every managed service on the host:
+./deploy-python drogon --restart-all
+
+# ship to the GPU box (no services, installs the ml extra):
+./deploy-python balerion
 ```
 
 ## greeks-server
@@ -128,5 +159,5 @@ sudo systemctl enable --now greeks-server
 journalctl -u greeks-server -f
 
 # later updates (on the Mac, from the repo):
-./deploy-python --restart greeks-server
+./deploy-python drogon --restart greeks-server
 ```

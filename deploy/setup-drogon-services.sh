@@ -121,5 +121,5 @@ Next steps — each command is on its own line, copy-paste as a single line:
      systemctl enable --now greeks-server
 
   Ongoing updates run on the Mac from the repo (no drogon checkout):
-     ./deploy-python --restart pubsub-broker
+     ./deploy-python drogon --restart pubsub-broker
 NEXT

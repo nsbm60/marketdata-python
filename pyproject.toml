@@ -40,12 +40,16 @@ dev = [
 tier2 = [
   "QuantLib>=1.32",
 ]
+# GPU/ML training stack, installed on balerion (deploy/hosts.sh: balerion extras = ml).
+ml = [
+  "xgboost>=2.1",
+]
 
 [tool.setuptools.packages.find]
 include = ["greeks*", "option_archive*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server", "tests/solver", "tests/iv_term", "tests/iv_curve", "tests/iv_event", "tests/service", "tests/jumps", "tests/vol_dataset"]
+testpaths = ["tests/greeks", "tests/option_archive", "tests/greeks_server", "tests/solver", "tests/iv_term", "tests/iv_curve", "tests/iv_event", "tests/service", "tests/jumps", "tests/vol_dataset", "tests/deploy"]
 pythonpath = ["."]
 
 [tool.mypy]
