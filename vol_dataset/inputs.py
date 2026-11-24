@@ -111,12 +111,13 @@ def _read_frames(ch: Any, start: dt.date, end: dt.date) -> Frames:
     outcomes = pd.DataFrame(_q(
         ch,
         f"SELECT o.underlying, o.end_expiry, o.realized_excess_var, w.excess_var, w.normal_daily_var "
-        f"FROM {IV_EVENT_OUTCOME_TABLE} FINAL o "
-        f"INNER JOIN {IV_EVENT_TABLE} FINAL w "
-        f"  ON w.method = %(wm)s AND w.underlying = o.underlying "
-        f"     AND w.session_date = o.session_date AND w.end_td = o.end_td "
-        f"WHERE o.method = %(om)s AND o.explained = %(e)s AND o.end_expiry <= %(b)s",
-        {"wm": WINDOW_METHOD, "om": OUTCOME_METHOD, "e": OUTCOME_OWN_EARNINGS, "b": end}),
+        f"FROM {IV_EVENT_OUTCOME_TABLE} AS o FINAL "
+        f"INNER JOIN {IV_EVENT_TABLE} AS w FINAL "
+        f"  ON w.underlying = o.underlying AND w.session_date = o.session_date AND w.end_td = o.end_td "
+        f"WHERE o.method = %(om)s AND o.explained = %(e)s AND o.underlying IN %(u)s "
+        f"AND o.end_expiry <= %(b)s AND w.method = %(wm)s AND w.status = %(ws)s",
+        {"om": OUTCOME_METHOD, "e": OUTCOME_OWN_EARNINGS, "u": names_l, "b": end,
+         "wm": WINDOW_METHOD, "ws": WINDOW_STATUS_OK}),
         columns=["underlying", "end_expiry", "realized_excess_var", "excess_var", "normal_daily_var"])
 
     from iv_event.outcome_event import read_market_wide
