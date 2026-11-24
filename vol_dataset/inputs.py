@@ -156,7 +156,14 @@ def _daily(rv: pd.DataFrame, jump: pd.DataFrame, market_wide: Set[dt.date],
     # The vectorised C/J split — identical semantics to rules.cj_split (which the tests pin), done
     # columnwise here for speed over the trailing window.
     ij, oj, oja = d["intraday_jump"], d["overnight_jump"], d["overnight_jump_adj"]
-    intraday_part = np.where(ij == 1, d["jump_var"].fillna(0.0), 0.0)
+    # A flagged day with a NULL jump_var contradicts jump_daily's definition — fail, never fill.
+    flagged_null = (ij == 1) & d["jump_var"].isna()
+    if bool(flagged_null.any()):
+        bad = d.loc[flagged_null, ["symbol", "trading_date"]].iloc[0]
+        raise ValueError(
+            f"jump_daily {bad['symbol']} {bad['trading_date']}: intraday_jump = 1 but jump_var is "
+            "NULL — contradicts jump_daily's definition (jump_var is set on a flagged day)")
+    intraday_part = np.where(ij == 1, d["jump_var"], 0.0)
     overnight_part = np.where((oj == 1) | (oja == 1), d["rv_overnight"], 0.0)
     d["j"] = intraday_part + overnight_part
     d["c"] = d["rv_total"] - d["j"]
@@ -168,8 +175,10 @@ def _daily(rv: pd.DataFrame, jump: pd.DataFrame, market_wide: Set[dt.date],
         for w in MEAN_WINDOWS:
             d[f"{col}_mean_{w}"] = (
                 g[col].rolling(w, min_periods=w).mean().reset_index(level=0, drop=True))
+    # Same lookback rule as the other 22-day inputs: NULL with fewer than UNSPLIT_WINDOW sessions.
     d["n_unsplit_days_22"] = (
-        g["unsplit"].rolling(UNSPLIT_WINDOW, min_periods=1).sum().reset_index(level=0, drop=True))
+        g["unsplit"].rolling(UNSPLIT_WINDOW, min_periods=UNSPLIT_WINDOW).sum()
+        .reset_index(level=0, drop=True))
     # Each day's own trailing-22 continuous mean, for the surprise jump ratio J_d / C_22.
     c22 = g["c"].rolling(UNSPLIT_WINDOW, min_periods=UNSPLIT_WINDOW).mean().reset_index(level=0, drop=True)
 
@@ -304,7 +313,11 @@ def assemble_inputs(frames: Frames, start: dt.date, end: dt.date) -> pd.DataFram
         ev = events_pairs.get((u, t), [])
         for h in sorted(cu["ok"]):
             rows.append(_expand_h(base, cu, ev, h))
-    return pd.DataFrame(rows, columns=_COLUMNS)
+    df = pd.DataFrame(rows, columns=_COLUMNS)
+    # n_unsplit_days_22 is a nullable count (NULL when fewer than UNSPLIT_WINDOW sessions, or no rv
+    # row at t): a true nullable integer, never 0 as a stand-in for unknown.
+    df["n_unsplit_days_22"] = df["n_unsplit_days_22"].astype("Int64")
+    return df
 
 
 def _base_row(u: str, t: dt.date, cu: dict, drow: Any, name_reports: Sequence[tuple],
@@ -318,7 +331,7 @@ def _base_row(u: str, t: dt.date, cu: dict, drow: Any, name_reports: Sequence[tu
     for col in _MEAN_COLS:
         for w in MEAN_WINDOWS:
             row[f"{col}_mean_{w}"] = _get(drow, f"{col}_mean_{w}")
-    row["n_unsplit_days_22"] = int(_get(drow, "n_unsplit_days_22") or 0)
+    row["n_unsplit_days_22"] = _nullable_int(_get(drow, "n_unsplit_days_22"))
     row["surprise_count_252"] = _get(drow, "surprise_count_252")
     row["surprise_mean_jump_ratio"] = _get(drow, "surprise_mean_jump_ratio")
 
@@ -375,6 +388,13 @@ def _get(drow: Any, attr: str) -> Any:
 
 def _isnan(x: Any) -> bool:
     return isinstance(x, float) and np.isnan(x)
+
+
+def _nullable_int(x: Any) -> Any:
+    """An integer, or pd.NA when the value is unknown (NaN/None) — never 0 as a stand-in."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return pd.NA
+    return int(round(x))
 
 
 # The frozen output column order (recorded in the manifest).

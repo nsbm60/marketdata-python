@@ -38,8 +38,12 @@ def cj_split(rv_total: float, rv_overnight: float, intraday_jump: Optional[int],
     (jump_var when intraday_jump = 1) plus the overnight variance when the overnight move jumped
     (overnight_jump = 1 OR overnight_jump_adj = 1); the continuous part is the rest of rv_total. A day
     whose intraday_jump is NULL has NO intraday split — its intraday variance stays in the continuous
-    part (unsplit = True) — so this is visible via n_unsplit_days, not hidden in the jump part."""
-    intraday_part = float(jump_var) if (intraday_jump == 1 and jump_var is not None) else 0.0
+    part (unsplit = True) — so this is visible via n_unsplit_days, not hidden in the jump part. A
+    flagged day (intraday_jump = 1) with a NULL jump_var contradicts jump_daily's definition and
+    raises, rather than being filled (mirrors the vectorised split in inputs._daily)."""
+    if intraday_jump == 1 and jump_var is None:
+        raise ValueError("intraday_jump = 1 but jump_var is NULL — contradicts jump_daily's definition")
+    intraday_part = float(jump_var) if intraday_jump == 1 else 0.0
     overnight_part = float(rv_overnight) if (overnight_jump == 1 or overnight_jump_adj == 1) else 0.0
     jump = intraday_part + overnight_part
     return rv_total - jump, jump, intraday_jump is None

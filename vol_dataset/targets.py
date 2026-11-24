@@ -61,14 +61,15 @@ def compute(ch: Any, start: dt.date, end: dt.date
         f"SELECT symbol, trading_date, rs_down, rs_up FROM {RV_DAILY_TABLE} FINAL "
         f"WHERE source = %(s)s AND symbol IN %(u)s AND trading_date BETWEEN %(a)s AND %(b)s",
         {"s": RV_SOURCE, "u": names, "a": start, "b": fwd_hi})
-    rs_down: Dict[Tuple[str, dt.date], float] = {}
-    rs_up: Dict[Tuple[str, dt.date], float] = {}
+    # Store the raw values (None allowed); a NULL on a used day is caught at the sum, not filled with 0.
+    rs_down: Dict[Tuple[str, dt.date], Any] = {}
+    rs_up: Dict[Tuple[str, dt.date], Any] = {}
     present: Set[Tuple[str, dt.date]] = set()
     for sym, d, rd, ru in rv_rows:
         key = (str(sym).upper(), _as_date(d))
         present.add(key)
-        rs_down[key] = float(rd) if rd is not None else 0.0
-        rs_up[key] = float(ru) if ru is not None else 0.0
+        rs_down[key] = None if rd is None else float(rd)
+        rs_up[key] = None if ru is None else float(ru)
 
     uni = {str(r[0]).upper() for r in curve}
     corp = read_corp_actions(ch, uni)
@@ -93,8 +94,16 @@ def compute(ch: Any, start: dt.date, end: dt.date
                                       t + dt.timedelta(days=1), end_date):
             dropped["corporate_action"] += 1
             continue
-        down = sum(rs_down[(u, d)] for d in days)
-        up = sum(rs_up[(u, d)] for d in days)
+        down = 0.0
+        up = 0.0
+        for d in days:
+            rd, ru = rs_down[(u, d)], rs_up[(u, d)]
+            if rd is None or ru is None:
+                raise ValueError(
+                    f"rv_daily {u} {d}: rs_down/rs_up is NULL on a har-rv row — contradicts rv_daily "
+                    "(rs_down + rs_up = rv_total); the realized target cannot be summed")
+            down += rd
+            up += ru
         implied = float(ftv)
         td, tu, reason = rules.compute_targets(down, up, implied)
         if reason is not None:

@@ -116,6 +116,36 @@ def test_assemble_shape_and_key_inputs() -> None:
     assert (df["event_rule_count"] >= 1).all()
 
 
+def test_curve_row_without_rv_row_gives_null_realized_inputs() -> None:
+    # AAA has an ok curve row at t but NO rv/jump row anywhere; SPY carries the regime. The AAA rows
+    # must build without error, with every realized input and n_unsplit_days_22 NULL (not 0).
+    days = _days_ending(T, 30)
+    frames = Frames(
+        rv=pd.DataFrame(_rv_rows("SPY", days), columns=["symbol", "trading_date", "rv_total",
+                                                        "rv_overnight", "rs_down", "rs_up"]),
+        jump=pd.DataFrame(_jump_rows("SPY", days), columns=["symbol", "trading_date", "intraday_jump",
+                                                           "jump_var", "overnight_jump",
+                                                           "overnight_jump_adj"]),
+        curve=pd.DataFrame(_curve_rows("AAA", T) + _curve_rows("SPY", T),
+                           columns=["underlying", "session_date", "horizon_td", "status",
+                                    "fit_total_var", "support"]),
+        events=pd.DataFrame([], columns=["underlying", "session_date", "end_td", "eff_days",
+                                         "start_td", "excess_days"]),
+        earnings=pd.DataFrame([], columns=["symbol", "reported_date", "reaction_date",
+                                           "vendor_report_time"]),
+        outcomes=pd.DataFrame([], columns=["underlying", "end_expiry", "realized_excess_var",
+                                           "excess_var", "normal_daily_var"]),
+        market_wide=set())
+    df = assemble_inputs(frames, T, T)
+    aaa = df[df["underlying"] == "AAA"]
+    assert len(aaa) == len(HORIZONS_TD)
+    for col in ("c_mean_1", "c_mean_5", "c_mean_22", "j_mean_22", "rs_down_mean_1", "rs_up_mean_22"):
+        assert aaa[col].isna().all()
+    assert aaa["n_unsplit_days_22"].isna().all()               # NULL, not 0
+    assert str(aaa["n_unsplit_days_22"].dtype) == "Int64"       # nullable integer
+    assert (aaa["earnings_date_status"] == "unknown").all()
+
+
 def test_look_ahead_inputs_do_not_change_when_future_rows_change() -> None:
     base = _aaa_rows(_make_frames(perturb=False))
     perturbed = _aaa_rows(_make_frames(perturb=True))
