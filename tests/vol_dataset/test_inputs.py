@@ -114,6 +114,11 @@ def test_assemble_shape_and_key_inputs() -> None:
     assert df["surprise_count_252"].isna().all()
     # the event rule window (end_td 5, eff 3, start 2, excess 3) counts for every H >= 5.
     assert (df["event_rule_count"] >= 1).all()
+    # jump scaled is a PLAIN ratio (j_mean / iv_perday_H); C scaled is a LOG ratio.
+    import numpy as np
+    r = df[df["H"] == 21].iloc[0]
+    assert abs(r["j_mean_22_scaled"] - r["j_mean_22"] / r["iv_perday_21"]) < 1e-12
+    assert abs(r["c_mean_22_scaled"] - np.log(r["c_mean_22"] / r["iv_perday_21"])) < 1e-12
 
 
 def test_curve_row_without_rv_row_gives_null_realized_inputs() -> None:
@@ -171,6 +176,57 @@ def test_build_inputs_uses_assemble(monkeypatch) -> None:
     out = inputs_mod.build_inputs(object(), T, T)
     expected = assemble_inputs(frames, T, T)
     pd.testing.assert_frame_equal(out.reset_index(drop=True), expected.reset_index(drop=True))
+
+
+# ── surprise_mean_jump_ratio (the rolling-sum bug) ──────────────────────────────────────────────────
+
+def _daily_rows(spec):
+    """Build rv/jump rows for one symbol from (rv_total, rv_overnight, ij, jv, oj, oja) per day."""
+    rv, jump = [], []
+    for i, (rt, ov, ij, jv, oj, oja) in enumerate(spec):
+        d = dt.date(2024, 1, 1) + dt.timedelta(days=i)
+        rv.append(("AAA", d, rt, ov, 0.0, 0.0))
+        jump.append(("AAA", d, ij, jv, oj, oja))
+    rv_df = pd.DataFrame(rv, columns=["symbol", "trading_date", "rv_total", "rv_overnight",
+                                      "rs_down", "rs_up"])
+    jump_df = pd.DataFrame(jump, columns=["symbol", "trading_date", "intraday_jump", "jump_var",
+                                          "overnight_jump", "overnight_jump_adj"])
+    return rv_df, jump_df
+
+
+def test_surprise_mean_jump_ratio_computed(monkeypatch) -> None:
+    # Small windows so the trailing stats resolve on a tiny fixture.
+    monkeypatch.setattr(inputs_mod, "SURPRISE_WINDOW", 4)
+    monkeypatch.setattr(inputs_mod, "UNSPLIT_WINDOW", 2)
+    # 6 days, rv_total 1.0, no overnight jumps; intraday jumps (surprises) on d2 (0.5) and d4 (0.3).
+    spec = [
+        (1.0, 0.0, 0, 0.0, 0, 0),   # d0  C=1.0
+        (1.0, 0.0, 0, 0.0, 0, 0),   # d1  C=1.0
+        (1.0, 0.0, 1, 0.5, 0, 0),   # d2  J=0.5 C=0.5  (surprise)
+        (1.0, 0.0, 0, 0.0, 0, 0),   # d3  C=1.0
+        (1.0, 0.0, 1, 0.3, 0, 0),   # d4  J=0.3 C=0.7  (surprise)
+        (1.0, 0.0, 0, 0.0, 0, 0),   # d5  C=1.0
+    ]
+    rv_df, jump_df = _daily_rows(spec)
+    d = inputs_mod._daily(rv_df, jump_df, market_wide=set(), own_reaction=set())
+    last = d.iloc[-1]   # d5
+    # trailing-2 C means: c22(d2)=mean(1.0,0.5)=0.75, c22(d4)=mean(1.0,0.7)=0.85
+    # window = last 4 sessions d2..d5; surprise days d2, d4; mean of J_d / c22(d):
+    expected = ((0.5 / 0.75) + (0.3 / 0.85)) / 2
+    assert last["surprise_count_252"] == 2
+    assert abs(last["surprise_mean_jump_ratio"] - expected) < 1e-12
+
+
+def test_surprise_mean_jump_ratio_null_when_count_zero(monkeypatch) -> None:
+    monkeypatch.setattr(inputs_mod, "SURPRISE_WINDOW", 4)
+    monkeypatch.setattr(inputs_mod, "UNSPLIT_WINDOW", 2)
+    # 6 days, no jumps -> no surprise days -> count 0 and the ratio is NULL (not 0).
+    spec = [(1.0, 0.0, 0, 0.0, 0, 0) for _ in range(6)]
+    rv_df, jump_df = _daily_rows(spec)
+    d = inputs_mod._daily(rv_df, jump_df, market_wide=set(), own_reaction=set())
+    last = d.iloc[-1]
+    assert last["surprise_count_252"] == 0
+    assert pd.isna(last["surprise_mean_jump_ratio"])
 
 
 if __name__ == "__main__":

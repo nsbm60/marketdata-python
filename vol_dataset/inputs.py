@@ -187,9 +187,13 @@ def _daily(rv: pd.DataFrame, jump: pd.DataFrame, market_wide: Set[dt.date],
     is_mw = d["trading_date"].isin(market_wide).to_numpy()
     is_surprise = (d["is_jump"] == 1).to_numpy() & ~is_own & ~is_mw
     ratio = np.where(c22 > 0, d["j"] / c22, np.nan)
+    valid = is_surprise & ~np.isnan(ratio)   # a surprise day with a usable trailing-22 C mean
     d["_surprise"] = is_surprise.astype(int)
-    d["_ratio_contrib"] = np.where(is_surprise, ratio, np.nan)
-    d["_ratio_n"] = (is_surprise & ~np.isnan(ratio)).astype(int)
+    # The contribution is 0 (not NaN) on non-surprise / no-C_22 days so the trailing-252 rolling sum is
+    # not killed by its min_periods (a mostly-NaN column never reaches 252 non-NaN observations — the
+    # bug that left surprise_mean_jump_ratio NULL on every row); _ratio_n carries the real denominator.
+    d["_ratio_contrib"] = np.where(valid, ratio, 0.0)
+    d["_ratio_n"] = valid.astype(int)
 
     gg = d.groupby("symbol", sort=False)
     scount = gg["_surprise"].rolling(SURPRISE_WINDOW, min_periods=SURPRISE_WINDOW).sum()
@@ -360,16 +364,28 @@ def _base_row(u: str, t: dt.date, cu: dict, drow: Any, name_reports: Sequence[tu
 
 def _expand_h(base: dict, cu: dict, events: List[tuple], h: int) -> dict:
     """One output row: the per-(underlying, t) base plus the H-specific fields — the scaled means, the
-    priced-event sums over end_td <= H, and whether the earnings reaction falls within H."""
+    priced-event sums over end_td <= H, and whether the earnings reaction falls within H.
+
+    Scaling puts each realized mean on the target's per-day-implied-variance scale (iv_perday at H).
+    The jump means use a PLAIN ratio (j_mean / iv_perday): 0 jumps is a real 0, not missing, so a log
+    would drop most days. The C, rs_down and rs_up means use a log ratio (log(mean / iv_perday)); each
+    is NULL only when its mean or the implied value is NULL (and, for the logs, when the mean is 0)."""
     row = dict(base)
     row["H"] = h
     iv_h = cu["iv"].get(h, np.nan)
+    iv_ok = (not _isnan(iv_h)) and iv_h > 0
     for col in _MEAN_COLS:
         for w in MEAN_WINDOWS:
             m = base[f"{col}_mean_{w}"]
-            row[f"{col}_mean_{w}_scaled"] = (
-                float(np.log(m / iv_h)) if (m is not None and not _isnan(m) and m > 0
-                                            and not _isnan(iv_h) and iv_h > 0) else np.nan)
+            key = f"{col}_mean_{w}_scaled"
+            if m is None or _isnan(m) or not iv_ok:
+                row[key] = np.nan
+            elif col == "j":
+                row[key] = float(m / iv_h)              # plain ratio — 0 jumps is a real 0
+            elif m > 0:
+                row[key] = float(np.log(m / iv_h))      # C / rs_down / rs_up stay logs (need m > 0)
+            else:
+                row[key] = np.nan
     rule_n, rule_exc, other_exc = rules.event_window_sums(events, h)
     row["event_rule_count"] = rule_n
     row["event_rule_excess_days"] = rule_exc
