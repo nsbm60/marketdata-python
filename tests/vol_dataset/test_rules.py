@@ -104,6 +104,31 @@ def test_earnings_expected_prefers_the_earliest_future_candidate() -> None:
     assert e.report_time == "post-market"
 
 
+def test_earnings_expected_skips_phantom_when_this_years_report_already_came() -> None:
+    # This year's report already came (2024-01-20). Last year's 2023-01-29 projects to 2024-01-28,
+    # only 8 days after it — a phantom. The view must move to the next quarter's projection
+    # (2023-04-25 + 364 = 2024-04-23).
+    t = date(2024, 1, 25)
+    reports = [
+        (date(2023, 1, 29), "pre-market"),   # +364 -> 2024-01-28 (phantom, <= 45d after 2024-01-20)
+        (date(2024, 1, 20), "pre-market"),   # this year's actual report (latest past)
+        (date(2023, 4, 25), "pre-market"),   # +364 -> 2024-04-23 (next quarter)
+    ]
+    e = rules.earnings_as_of(t, reports, _next, _between)
+    assert e.status == "expected"
+    assert e.earnings_date == date(2024, 4, 23)
+
+
+def test_earnings_expected_normal_case_unchanged_when_this_years_report_not_yet() -> None:
+    # This year's report has not happened yet; last year's Jan report projects to 2024-01-28, which is
+    # far enough past the latest past report (2023-04-25) to stand — the normal projection, unchanged.
+    t = date(2024, 1, 25)
+    reports = [(date(2023, 1, 29), "pre-market"), (date(2023, 4, 25), "pre-market")]
+    e = rules.earnings_as_of(t, reports, _next, _between)
+    assert e.status == "expected"
+    assert e.earnings_date == date(2024, 1, 28)
+
+
 def test_earnings_unknown_when_no_future_candidate() -> None:
     t = date(2024, 6, 14)
     reports = [(t - timedelta(days=400), "pre-market")]   # +364 = t-36 <= t -> no future candidate

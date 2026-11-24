@@ -53,6 +53,10 @@ REGIME_WINDOW = 22              # SPY C/J means and the market-wide count cover 
 # ── the earnings-date rule (as known at t; look-ahead-safe except the confirmed date, published ahead) ─
 EARNINGS_CONFIRMED_DAYS = 21    # a report with reported_date within this many calendar days ahead of t is confirmed
 EARNINGS_YEAR_DAYS = 364        # expected date = a past report's reported_date + this (52 weeks, weekday-stable)
+# An expected candidate (reported_date + EARNINGS_YEAR_DAYS) counts only if it is more than this many
+# calendar days after the latest report already past at t — otherwise it is a phantom projection of a
+# report that already happened this year (last year's date lands a few days before this year's actual).
+EARNINGS_MIN_GAP_DAYS = 45
 EARNINGS_HISTORY_N = 8          # own-earnings outcomes (end_expiry < t) the history medians cover
 
 # Read lookback: enough calendar days to cover SURPRISE_WINDOW trading sessions (252 * 7/5 ≈ 353) with

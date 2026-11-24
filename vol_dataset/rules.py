@@ -22,9 +22,10 @@ from ml.shared.calendar import next_trading_day as _next_trading_day
 from ml.shared.calendar import trading_days_between as _trading_days_between
 
 from . import (
-    EARNINGS_CONFIRMED_DAYS, EARNINGS_STATUS_CONFIRMED, EARNINGS_STATUS_EXPECTED,
-    EARNINGS_STATUS_UNKNOWN, EARNINGS_YEAR_DAYS, EVENT_MAX_EFF_DAYS, EVENT_MAX_START_TD,
-    EVENT_MIN_EXCESS_DAYS, REPORT_TIME_POST, REPORT_TIME_PRE, REPORT_TIME_UNKNOWN,
+    EARNINGS_CONFIRMED_DAYS, EARNINGS_MIN_GAP_DAYS, EARNINGS_STATUS_CONFIRMED,
+    EARNINGS_STATUS_EXPECTED, EARNINGS_STATUS_UNKNOWN, EARNINGS_YEAR_DAYS, EVENT_MAX_EFF_DAYS,
+    EVENT_MAX_START_TD, EVENT_MIN_EXCESS_DAYS, REPORT_TIME_POST, REPORT_TIME_PRE,
+    REPORT_TIME_UNKNOWN,
 )
 
 
@@ -89,8 +90,11 @@ def earnings_as_of(t: date, reports: Sequence[Tuple[date, Optional[str]]],
         (reported_date - 21 <= t) whose reaction session is after t — the vendor publishes a confirmed
         date ahead, so this is known at t;
       - else expected: over the reports already past at t (reported_date <= t), each reported_date +
-        EARNINGS_YEAR_DAYS; the earliest of those after t, with that report's time — never looks at the
-        upcoming report, so it is look-ahead-safe;
+        EARNINGS_YEAR_DAYS; the earliest of those that is after t AND more than EARNINGS_MIN_GAP_DAYS
+        after the latest report already past at t — the gap drops a phantom projection of a report that
+        already happened this year (last year's date lands a few days before this year's actual), so
+        the view moves to the next quarter's projection. Never looks at the upcoming report, so it is
+        look-ahead-safe;
       - else unknown.
     Then the reaction session and the trading days from t to it."""
     chosen_date: Optional[date] = None
@@ -111,17 +115,20 @@ def earnings_as_of(t: date, reports: Sequence[Tuple[date, Optional[str]]],
         chosen_date, chosen_time = min(confirmed, key=lambda r: r[0])
         status = EARNINGS_STATUS_CONFIRMED
     else:
-        # expected — the earliest year-ago-plus-364 date after t, from reports already past at t.
-        expected: List[Tuple[date, str]] = []
-        for reported_date, vendor_time in reports:
-            if reported_date > t:
-                continue
-            cand = reported_date + _days(EARNINGS_YEAR_DAYS)
-            if cand > t:
-                expected.append((cand, _report_time(vendor_time)))
-        if expected:
-            chosen_date, chosen_time = min(expected, key=lambda r: r[0])
-            status = EARNINGS_STATUS_EXPECTED
+        # expected — the earliest year-ago-plus-364 date after t, from reports already past at t, that
+        # clears the latest past report by more than EARNINGS_MIN_GAP_DAYS (else it is a phantom of a
+        # report that already happened this year — fall through to the next quarter's projection).
+        past = [(rd, vt) for rd, vt in reports if rd <= t]
+        if past:
+            latest_past = max(rd for rd, _vt in past)
+            expected: List[Tuple[date, str]] = []
+            for reported_date, vendor_time in past:
+                cand = reported_date + _days(EARNINGS_YEAR_DAYS)
+                if cand > t and (cand - latest_past).days > EARNINGS_MIN_GAP_DAYS:
+                    expected.append((cand, _report_time(vendor_time)))
+            if expected:
+                chosen_date, chosen_time = min(expected, key=lambda r: r[0])
+                status = EARNINGS_STATUS_EXPECTED
 
     rs = reaction_session(chosen_date, chosen_time, next_trading_day)
     td = trading_days_between(t, rs) if (rs is not None and rs > t) else None

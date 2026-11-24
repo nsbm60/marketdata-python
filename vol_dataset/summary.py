@@ -55,12 +55,18 @@ def summary(root: Path = DATASET_DIR) -> None:
     manifest_path = root / MANIFEST_NAME
     if manifest_path.exists():
         man = json.loads(manifest_path.read_text())
-        print("\n  dropped rows (manifest):")
-        for reason, n in man.get("dropped_rows", {}).items():
-            print(f"    {reason:<24s} {int(n):>10,d}")
-        print("  coverage — ok curve, incomplete H rv days (year:H -> count):")
-        for key, n in man.get("coverage_incomplete_rv", {}).items():
-            print(f"    {key:<12s} {int(n):>10,d}")
+        years = man.get("years", {})
+        print("\n  dropped rows per year (manifest):")
+        for year in sorted(years):
+            dr = years[year].get("dropped_rows", {})
+            parts = " ".join(f"{reason}={int(n):,}" for reason, n in sorted(dr.items())) or "none"
+            print(f"    {year}: {parts}  (built {years[year].get('git_commit', '?')[:12]} "
+                  f"{years[year].get('build_time', '?')})")
+        print("  coverage per year — ok curve, incomplete H rv days (H -> count):")
+        for year in sorted(years):
+            cov = years[year].get("coverage_incomplete_rv", {})
+            parts = " ".join(f"H{h}={int(n):,}" for h, n in sorted(cov.items(), key=lambda kv: int(kv[0]))) or "none"
+            print(f"    {year}: {parts}")
     else:
         print("\n  (no manifest.json — dropped rows and coverage unavailable)")
 
